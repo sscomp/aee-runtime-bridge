@@ -8,6 +8,13 @@ AEE-1 only provided the package skeleton. AEE-2 ships the routers:
                 /jobs/{id}/heartbeat, /jobs/{id}/logs,
                 /jobs/{id}/complete, /jobs/{id}/fail,
                 /jobs/{id}/cancel, GET /jobs/_claimable
+  * `runtimes` (AEE-5) — POST /runtimes, GET /runtimes,
+                GET /runtimes/{id}, PATCH /runtimes/{id},
+                DELETE /runtimes/{id}, POST /runtimes/{id}/enable,
+                POST /runtimes/{id}/disable,
+                POST /runtimes/{id}/health-check,
+                PATCH /runtimes/{id}/health,
+                GET /runtimes/{id}/dispatches
 
 AEE-4 adds `/v1/...` aliases (see ADR-007). The same handlers are
 re-mounted under a `prefix="/v1"` router so:
@@ -30,12 +37,17 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from .jobs import router as jobs_router
+from .runtimes import router as runtimes_router
 from .workers import router as workers_router
 
 # Combined router. FastAPI handles prefix merging.
 api_router = APIRouter()
 api_router.include_router(jobs_router)
 api_router.include_router(workers_router)
+# AEE-5: Runtime management + query endpoints. Mounted
+# under both `/runtimes` and `/v1/runtimes` (the v1
+# alias is added below).
+api_router.include_router(runtimes_router)
 
 # AEE-4: `/v1/...` aliases (ADR-007). Re-include the same routers
 # under a prefix; FastAPI re-uses the same handler objects, so the
@@ -46,6 +58,7 @@ api_router.include_router(workers_router)
 v1_router = APIRouter(prefix="/v1")
 v1_router.include_router(jobs_router)
 v1_router.include_router(workers_router)
+v1_router.include_router(runtimes_router)
 
 # Wire the v1 prefix into the combined router. Now both
 # `api_router` and the `v1_router` are mounted by `app.py`.

@@ -198,7 +198,7 @@ class TestWorkersAPIAEE4(unittest.TestCase):
         body = {
             "worker_name": "aee-runtime-aee4-01",
             "worker_type": "aee_lightweight",
-            "capabilities": ["runtime.pi", "tool.shell"],
+            "capabilities": ["runtime.aee_runtime", "tool.shell"],
             "workdir_allowlist": ["/tmp"],
             "runtime_name": "pi",
             "runtime_version": "0.1.0",

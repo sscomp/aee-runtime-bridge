@@ -291,6 +291,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status)"
     )
+    # AEE-5: Runtime Registry tables (`runtimes`, `dispatch_records`)
+    # + their indexes. The migration lives in
+    # `aee.runtimes.repository.ensure_aee5_schema` to keep the
+    # dispatcher package runtime-neutral; we just call it here
+    # so the schema is created on first DB open. Idempotent
+    # (CREATE TABLE IF NOT EXISTS + IF NOT EXISTS indexes).
+    from aee.runtimes.repository import ensure_aee5_schema
+    ensure_aee5_schema(conn)
     conn.commit()
 
 

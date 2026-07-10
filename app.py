@@ -159,6 +159,24 @@ WATCHER_TICK_SEC = float(os.getenv("DISPATCHER_WATCHER_TICK", "2.0"))
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Start/stop the background watcher that polls Hermes 8642."""
+    # AEE-5: bootstrap the built-in `aee-lightweight-local`
+    # Runtime descriptor (idempotent) so a fresh bridge
+    # has a working default Runtime at first request.
+    # Also load a `runtimes:` YAML config if `AEE_RUNTIME_CONFIG`
+    # points at one. The config loader is fail-fast; a
+    # malformed file aborts startup with a clear error.
+    from aee.runtimes.registry import bootstrap_default_runtimes
+    bootstrap_default_runtimes(force=False)
+    cfg_path = os.getenv("AEE_RUNTIME_CONFIG")
+    if cfg_path:
+        from aee.config import load_runtime_config, apply_runtime_config, RuntimeConfigError
+        from aee.runtimes.registry import runtime_registry
+        try:
+            parsed = load_runtime_config(cfg_path)
+            apply_runtime_config(parsed, runtime_registry)
+        except RuntimeConfigError as exc:
+            # Fail fast — let the operator see the misconfig.
+            raise
     watcher = Watcher(tick_sec=WATCHER_TICK_SEC)
     await watcher.start()
     app.state.watcher = watcher
