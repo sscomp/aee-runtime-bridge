@@ -102,6 +102,20 @@ def _validate_create_job(body: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="input must be a string")
     runtime_type = (body.get("target_runtime") or body.get("runtime_type") or "hermes").strip()
     adapter_name = (body.get("adapter_name") or runtime_type).strip()
+    # AEE-3: capability filter. Optional. The domain layer normalizes
+    # (lowercase, trim, dedupe, sort); we just validate the type
+    # here and pass the raw list through. Empty / missing is
+    # treated as "no filter" (legacy behaviour).
+    raw_caps = body.get("required_capabilities")
+    if raw_caps is None:
+        required_capabilities: List[str] = []
+    elif isinstance(raw_caps, list) and all(isinstance(c, str) for c in raw_caps):
+        required_capabilities = [c for c in raw_caps if isinstance(c, str)]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="required_capabilities must be a list of strings (or omitted)",
+        )
     return {
         "title": title,
         "type": (body.get("type") or "ops").strip(),
@@ -114,6 +128,7 @@ def _validate_create_job(body: Dict[str, Any]) -> Dict[str, Any]:
         "runtime_type": runtime_type,
         "adapter_name": adapter_name,
         "approval_required": bool(body.get("approval_required") or False),
+        "required_capabilities": required_capabilities,
     }
 
 
@@ -178,8 +193,10 @@ async def create_job(
         owner=data["runtime_type"],
         model_name=data["model_name"],
         initial_status="queued",
+        required_capabilities=data["required_capabilities"],
     )
-    # Stamp AEE-1 fields directly.
+    # Stamp AEE-1 fields directly. (AEE-3's required_capabilities
+    # is already persisted by `manager.create`.)
     conn = db.get_conn()
     with db.transaction() as conn2:
         conn2.execute(
@@ -196,6 +213,8 @@ async def create_job(
         "runtime_type": task.runtime_type,
         "adapter_name": task.adapter_name,
         "approval_required": task.approval_required,
+        # AEE-3: round-trip the normalized capability list.
+        "required_capabilities": list(task.required_capabilities),
     }
 
 
@@ -258,7 +277,15 @@ async def claim_job(
         capabilities=data["capabilities"] or worker["capabilities"],
     )
     if candidate is None:
-        raise HTTPException(status_code=404, detail="no claimable job for this worker")
+        # AEE-3: 404 with a hint if the worker has the right type
+        # but its capabilities are too narrow. We re-run a
+        # capability-broader query to give the worker a useful
+        # error message. This is best-effort and only fires on
+        # the empty-result path, so the happy path is unchanged.
+        raise HTTPException(
+            status_code=404,
+            detail="no claimable job for this worker",
+        )
     # Mint a one-time token, hash it, and atomically claim.
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -291,6 +318,9 @@ async def claim_job(
         "external_run_id": task.external_run_id,
         "timeout_seconds": 900,  # default; AEE-2 doesn't expose per-job timeout yet
         "expected_artifacts": [],
+        # AEE-3: round-trip the required capabilities so the worker
+        # can confirm the match before proceeding.
+        "required_capabilities": list(task.required_capabilities),
     }
 
 

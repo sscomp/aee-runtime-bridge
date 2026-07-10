@@ -77,6 +77,12 @@ class Task:
     claim_token_hash: Optional[str] = None
     approval_required: bool = False
     approval_state: str = "not_required"
+    # AEE-3: capability-based routing. The job requires a worker
+    # whose `capabilities` is a superset of this list. Defaults to
+    # an empty list, which means "no capability filter" (any
+    # worker with the right `adapter_name` can claim). Values are
+    # always stored normalized: lowercase, trimmed, deduped, sorted.
+    required_capabilities: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)

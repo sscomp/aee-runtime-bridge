@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import ids
+from . import db, ids
 from .db import get_conn, transaction
 from .models import (
     LEGAL_TRANSITIONS,
@@ -83,7 +83,19 @@ _COLUMNS = (
 
 
 def _row_to_task(row) -> Task:
-    return Task(**{c: row[c] for c in _COLUMNS if c in row.keys()})
+    """Build a `Task` from a SQLite row.
+
+    AEE-3: the `required_capabilities_json` storage column is
+    decoded here into the `required_capabilities: list[str]`
+    domain field. Callers that pass through the dataclass
+    never see the JSON suffix. The raw `*_json` column is
+    NOT in `_COLUMNS` — it's a storage-only detail.
+    """
+    raw = {c: row[c] for c in _COLUMNS if c in row.keys()}
+    raw["required_capabilities"] = db.decode_capabilities(
+        row["required_capabilities_json"]
+    )
+    return Task(**raw)
 
 
 def _row_to_event(row) -> TaskEvent:
@@ -134,13 +146,22 @@ class TaskManager:
         model_name: Optional[str] = None,
         workdir: Optional[Path] = None,
         initial_status: str = "queued",
+        required_capabilities: Optional[List[str]] = None,
     ) -> Task:
-        """Create a new task. Generates the task_id, sets status, records event."""
+        """Create a new task. Generates the task_id, sets status, records event.
+
+        AEE-3: `required_capabilities` is normalized (lowercased,
+        trimmed, deduped, sorted) and persisted in the
+        `required_capabilities_json` column. A `None` or empty
+        input is stored as '[]' (no capability filter).
+        """
         if initial_status not in {"pending", "queued"}:
             raise ValueError(f"initial_status must be pending or queued, got {initial_status}")
         task_id = ids.next_task_id()
         created_at = ids.now_iso()
         commit, branch = _git_info(workdir)
+        normalized_caps = db.normalize_capabilities(required_capabilities)
+        caps_blob = db.encode_capabilities(normalized_caps)
         with transaction() as conn:
             conn.execute(
                 """
@@ -148,14 +169,16 @@ class TaskManager:
                   task_id, title, type, priority, owner, status,
                   progress_pct, created_at,
                   input_text, openai_run_id, session_id, mode,
-                  prompt_version, model_name, git_commit, git_branch
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  prompt_version, model_name, git_commit, git_branch,
+                  required_capabilities_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, title, type, priority, owner, initial_status,
                     5 if initial_status == "queued" else 0, created_at,
                     input_text, openai_run_id, session_id, mode,
                     prompt_version, model_name, commit, branch,
+                    caps_blob,
                 ),
             )
         _append_log(task_id, "INFO", f"created title={title!r} type={type} priority={priority}")
@@ -163,6 +186,10 @@ class TaskManager:
             "title": title, "type": type, "priority": priority, "owner": owner,
             "session_id": session_id, "mode": mode, "openai_run_id": openai_run_id,
             "prompt_version": prompt_version, "model_name": model_name,
+            # AEE-3: capability filter is part of the create event so
+            # downstream consumers (audit, scheduler) see what was
+            # required without having to re-fetch the task.
+            "required_capabilities": normalized_caps,
         })
         if initial_status == "queued":
             _append_log(task_id, "INFO", "queued — waiting for dispatcher worker")

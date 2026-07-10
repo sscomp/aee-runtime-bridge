@@ -50,6 +50,11 @@ class Job:
     # Optional artifact paths the dispatcher should stat() at
     # completion (Phase 4 delivery).
     expected_artifacts: List[str] = field(default_factory=list)
+    # AEE-3: capability-based routing. Subset of worker capabilities
+    # that this job requires. Default `[]` means "no capability
+    # filter" (legacy AEE-2 behaviour). Values are persisted
+    # normalized (lowercase, trimmed, deduped, sorted).
+    required_capabilities: List[str] = field(default_factory=list)
 
     # -- Convenience -----------------------------------------------------
 
@@ -69,6 +74,7 @@ class Job:
             "worker_id": self.worker_id,
             "spec": dict(self.spec),
             "expected_artifacts": list(self.expected_artifacts),
+            "required_capabilities": list(self.required_capabilities),
         }
 
 
@@ -90,6 +96,7 @@ class JobCreate:
     adapter_name: str = "hermes"
     expected_artifacts: List[str] = field(default_factory=list)
     spec: Dict[str, Any] = field(default_factory=dict)
+    required_capabilities: List[str] = field(default_factory=list)
 
     def to_job(self) -> Job:
         return Job(
@@ -105,6 +112,7 @@ class JobCreate:
             adapter_name=self.adapter_name,
             spec=dict(self.spec),
             expected_artifacts=list(self.expected_artifacts),
+            required_capabilities=list(self.required_capabilities),
         )
 
 

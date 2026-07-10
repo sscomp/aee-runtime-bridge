@@ -449,5 +449,234 @@ class TestReaperTimeoutSplit(unittest.TestCase):
         self.assertIn("worker_id=w-1", t.error_message)
 
 
+class TestCapabilityMatching(unittest.TestCase):
+    """AEE-3: capability-based job matching.
+
+    A job is claimable by a worker iff:
+      * adapter_name == worker_type (existing AEE-2 rule)
+      * required_capabilities ⊆ worker.capabilities  (AEE-3)
+
+    Tests below cover:
+      * a single-capability match succeeds
+      * a missing capability makes the job invisible to the worker
+      * multi-capability match succeeds
+      * existing /jobs tests still pass with NO required_capabilities
+        (backward compat: empty list is a no-op)
+      * capability strings are stored normalized (lowercase, sorted,
+        deduped)
+      * registration normalizes the worker's capabilities
+    """
+
+    def setUp(self) -> None:
+        _fresh_db()
+        from aee.adapters.fake_adapter import FakeAdapter as _FA
+        try:
+            adapter_registry.unregister("fake")
+        except KeyError:
+            pass
+        adapter_registry.register(_FA(), replace=True)
+        self.client = _build_client()
+        self.headers = {"Authorization": "Bearer test-key"}
+
+    # ---- helpers -----------------------------------------------------
+
+    def _register_worker(
+        self,
+        *,
+        worker_id: str,
+        capabilities,
+    ) -> dict:
+        return self.client.post(
+            "/workers/register",
+            json={
+                "worker_id": worker_id,
+                "worker_name": worker_id,
+                "worker_type": "fake",
+                "capabilities": capabilities,
+            },
+            headers=self.headers,
+        ).json()
+
+    def _create_job(
+        self, *, required_capabilities, target_runtime: str = "fake"
+    ) -> str:
+        r = self.client.post(
+            "/jobs",
+            json={
+                "title": "cap-test",
+                "type": "ops",
+                "input": "echo hi",
+                "target_runtime": target_runtime,
+                "required_capabilities": required_capabilities,
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["job_id"]
+
+    def _create_job_no_caps(self, *, target_runtime: str = "fake") -> str:
+        r = self.client.post(
+            "/jobs",
+            json={
+                "title": "no-cap",
+                "type": "ops",
+                "input": "echo hi",
+                "target_runtime": target_runtime,
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["job_id"]
+
+    def _claim(self, *, worker_id: str, capabilities) -> "Response | None":
+        r = self.client.post(
+            "/jobs/claim",
+            json={
+                "worker_id": worker_id,
+                "worker_type": "fake",
+                "capabilities": capabilities,
+            },
+            headers=self.headers,
+        )
+        return r
+
+    # ---- matching rules ---------------------------------------------
+
+    def test_single_capability_match_succeeds(self):
+        # Job requires ["shell"]; worker has ["shell", "python"].
+        self._register_worker(worker_id="w-shell", capabilities=["shell", "python"])
+        jid = self._create_job(required_capabilities=["shell"])
+        r = self._claim(worker_id="w-shell", capabilities=["shell", "python"])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["job_id"], jid)
+
+    def test_missing_capability_keeps_job_invisible(self):
+        # Job requires ["shell"]; worker has only ["python"].
+        self._register_worker(worker_id="w-py", capabilities=["python"])
+        self._create_job(required_capabilities=["shell"])
+        r = self._claim(worker_id="w-py", capabilities=["python"])
+        self.assertEqual(r.status_code, 404)
+
+    def test_multi_capability_match_requires_all(self):
+        # Job requires ["shell", "python"]; worker has only ["shell"].
+        self._register_worker(worker_id="w-shell-only", capabilities=["shell"])
+        self._create_job(required_capabilities=["shell", "python"])
+        r = self._claim(worker_id="w-shell-only", capabilities=["shell"])
+        self.assertEqual(r.status_code, 404)
+        # A worker with both capabilities claims successfully.
+        self._register_worker(worker_id="w-both", capabilities=["shell", "python"])
+        # The job is still queued (no successful claim yet), so claimable.
+        r2 = self._claim(worker_id="w-both", capabilities=["shell", "python"])
+        self.assertEqual(r2.status_code, 200, r2.text)
+
+    def test_empty_required_capabilities_is_no_filter(self):
+        # Backward compat: a job with no required_capabilities is
+        # claimable by any worker with the right adapter_name.
+        self._register_worker(worker_id="w-any", capabilities=["python"])
+        jid = self._create_job_no_caps()
+        r = self._claim(worker_id="w-any", capabilities=["python"])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["job_id"], jid)
+
+    def test_capabilities_are_normalized_on_create(self):
+        # Mixed case, whitespace, duplicates — should be stored
+        # lowercased, trimmed, deduped, sorted.
+        self._register_worker(worker_id="w-norm", capabilities=["shell", "python"])
+        r = self.client.post(
+            "/jobs",
+            json={
+                "title": "norm",
+                "type": "ops",
+                "input": "x",
+                "target_runtime": "fake",
+                "required_capabilities": ["  Shell ", "PYTHON", "shell", "git"],
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            r.json()["required_capabilities"], ["git", "python", "shell"]
+        )
+        # And the stored row, fetched via GET, agrees.
+        jid = r.json()["job_id"]
+        g = self.client.get(f"/jobs/{jid}", headers=self.headers).json()
+        self.assertEqual(g["required_capabilities"], ["git", "python", "shell"])
+
+    def test_worker_capabilities_are_normalized_on_register(self):
+        # Same normalization rule for worker capabilities.
+        r = self.client.post(
+            "/workers/register",
+            json={
+                "worker_id": "w-rcap",
+                "worker_name": "w-rcap",
+                "worker_type": "fake",
+                "capabilities": ["  Shell ", "PYTHON", "python", "git"],
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        rec = self.client.get(
+            "/workers/w-rcap", headers=self.headers
+        ).json()
+        self.assertEqual(rec["capabilities"], ["git", "python", "shell"])
+
+    def test_capability_mismatch_returns_404_with_no_job(self):
+        # The worker has the right type but not the right caps; the
+        # bridge returns 404 ("no claimable job") — it does NOT
+        # claim a non-matching job. We verify by registering a
+        # second worker with the right caps and confirming the
+        # first worker did NOT silently get the job.
+        self._register_worker(worker_id="w-weak", capabilities=["python"])
+        self._create_job(required_capabilities=["shell"])
+        r1 = self._claim(worker_id="w-weak", capabilities=["python"])
+        self.assertEqual(r1.status_code, 404)
+        # Now register a strong worker; it should claim.
+        self._register_worker(worker_id="w-strong", capabilities=["shell"])
+        r2 = self._claim(worker_id="w-strong", capabilities=["shell"])
+        self.assertEqual(r2.status_code, 200, r2.text)
+        # And the weak worker trying again now gets 404 (job is taken).
+        r3 = self._claim(worker_id="w-weak", capabilities=["python"])
+        self.assertEqual(r3.status_code, 404)
+
+    def test_claim_response_includes_required_capabilities(self):
+        self._register_worker(worker_id="w-x", capabilities=["shell"])
+        self._create_job(required_capabilities=["shell"])
+        r = self._claim(worker_id="w-x", capabilities=["shell"])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["required_capabilities"], ["shell"])
+
+    def test_existing_jobs_without_required_capabilities_still_claimable(self):
+        # Simulate a legacy / pre-AEE-3 job by writing directly to
+        # the DB and leaving required_capabilities_json at DEFAULT '[]'.
+        # The decoder turns the empty blob into an empty list, and
+        # any worker should still be able to claim it.
+        from dispatcher import db as _db
+        task_id = mgr.TaskManager().create(
+            title="legacy",
+            type="ops",
+            input_text="x",
+            owner="fake",
+            initial_status="queued",
+        ).task_id
+        with _db.transaction() as conn2:
+            conn2.execute(
+                "UPDATE tasks SET adapter_name='fake' WHERE task_id=?",
+                (task_id,),
+            )
+        self._register_worker(worker_id="w-legacy", capabilities=["anything"])
+        r = self.client.post(
+            "/jobs/claim",
+            json={
+                "worker_id": "w-legacy",
+                "worker_type": "fake",
+                "capabilities": ["anything"],
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["job_id"], task_id)
+        self.assertEqual(r.json()["required_capabilities"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,7 +46,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   prompt_version   TEXT,
   model_name       TEXT,
   git_commit       TEXT,
-  git_branch       TEXT
+  git_branch       TEXT,
+  -- AEE-3: capability-based routing. JSON-encoded list of lowercase,
+  -- trimmed, deduped, sorted strings. Empty list '[]' = no filter
+  -- (worker_type + adapter + status + lease rules still apply).
+  required_capabilities_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -118,6 +122,68 @@ _AEE1_MIGRATIONS: list[tuple[str, str]] = [
     ("approval_state",   "ALTER TABLE tasks ADD COLUMN approval_state TEXT DEFAULT 'not_required'"),
 ]
 
+# AEE-3: capability-based job routing. Same idempotent pattern as
+# AEE-1. The `*_json` suffix is a storage-only detail — the domain
+# model (`dispatcher.models.Task`, `aee.core.job_models.Job`) exposes
+# `required_capabilities: List[str]`. The repository layer handles
+# encode/decode so callers never see the suffix.
+_AEE3_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "required_capabilities_json",
+        "ALTER TABLE tasks ADD COLUMN required_capabilities_json TEXT NOT NULL DEFAULT '[]'",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Capability normalization (used by both the API and the manager)
+# ---------------------------------------------------------------------------
+
+
+def normalize_capabilities(values: Optional[List[str]]) -> List[str]:
+    """Canonicalize a capability list: lowercase, trim, drop empties,
+    dedupe, sort. Returns a fresh list (does not mutate input).
+
+    This is the single point where capability strings are
+    sanitized before persisting. Adapters and the matching code
+    can rely on the output being a stable, comparable form.
+    """
+    if not values:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in values:
+        if not isinstance(v, str):
+            continue
+        norm = v.strip().lower()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    out.sort()
+    return out
+
+
+def encode_capabilities(values: Optional[List[str]]) -> str:
+    """Storage helper: normalize then JSON-encode."""
+    return _json.dumps(normalize_capabilities(values))
+
+
+def decode_capabilities(blob: Optional[str]) -> List[str]:
+    """Storage helper: JSON-decode a `required_capabilities_json`
+    blob. Defensive against NULL, empty string, and malformed
+    payloads — all collapse to an empty list.
+    """
+    if not blob:
+        return []
+    try:
+        data = _json.loads(blob)
+    except _json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return normalize_capabilities(data)
+
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -158,6 +224,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
                     conn.execute(stmt)
     # AEE-1: additive columns on `tasks`. Same idempotent pattern.
     _apply_aee1_migrations(conn)
+    # AEE-3: capability matching column. Idempotent via pragma check.
+    _apply_aee3_migrations(conn)
     # AEE-1: index for the new lookup path. Idempotent via IF NOT EXISTS.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_run_id ON tasks(external_run_id)"
@@ -184,6 +252,25 @@ def _apply_aee1_migrations(conn: sqlite3.Connection) -> None:
             print(f"[db] AEE-1 migration: added tasks.{col}", file=sys.stderr)
 
 
+def _apply_aee3_migrations(conn: sqlite3.Connection) -> None:
+    """AEE-3: capability-based routing column.
+
+    Same idempotent pragma check as AEE-1. Re-running on an
+    already-migrated DB is a no-op. The column is `NOT NULL
+    DEFAULT '[]'`, so existing rows are filled with the empty
+    list automatically — no backfill required.
+    """
+    import sys
+    for col, stmt in _AEE3_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(f"[db] AEE-3 migration: added tasks.{col}", file=sys.stderr)
+
+
 def run_migrations() -> list[str]:
     """Public entry point: applies all pending migrations.
 
@@ -202,6 +289,16 @@ def run_migrations() -> list[str]:
         if row is None:
             conn.execute(stmt)
             print(f"[db] AEE-1 migration: added tasks.{col}", file=sys.stderr)
+            added.append(col)
+    # AEE-3: capability matching column. Same idempotent pattern.
+    for col, stmt in _AEE3_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(f"[db] AEE-3 migration: added tasks.{col}", file=sys.stderr)
             added.append(col)
     # Index too (idempotent).
     conn.execute(
@@ -308,6 +405,10 @@ def upsert_worker(
         "SELECT registered_at FROM workers WHERE worker_id = ?", (worker_id,)
     ).fetchone()
     registered_at = existing["registered_at"] if existing else _now_iso()
+    # AEE-3: normalize the worker's capability list the same way
+    # job requirements are normalized, so the matcher's subset
+    # check is comparing strings in the same canonical form.
+    normalized_caps = normalize_capabilities(capabilities)
     with transaction() as conn2:
         conn2.execute(
             """
@@ -326,7 +427,7 @@ def upsert_worker(
             """,
             (
                 worker_id, worker_name, worker_type, hostname,
-                _json.dumps(capabilities),
+                _json.dumps(normalized_caps),
                 _json.dumps(workdir_allowlist),
                 int(max_concurrent),
                 registered_at,
@@ -423,31 +524,48 @@ def _task_claim_eligible_where(
       * worker_id IS NULL (nobody has claimed it yet)
       * NOT cancelled
       * approval_required = 0 OR approval_state = 'approved'
-      * adapter_name/runtime_type either matches the worker_type or is
-        empty/'hermes' (which any worker that registers with the
-        matching name can claim).
-
-    Capabilities filter is intentionally loose for AEE-2: we record
-    the worker's capabilities but the actual gate is "did the
-    client_submit populate a `required_capabilities` blob?". For
-    AEE-2 we accept any capability overlap (or the worker having
-    none and the job requiring none). Tighter matching lands in
-    AEE-3.
+      * adapter_name == worker_type (runtime routing; 'hermes'-typed
+        workers claim 'hermes'-typed jobs, 'pi_agent' claims
+        'pi_agent', etc.)
+      * required_capabilities ⊆ worker_capabilities  (AEE-3)
+        An empty required_capabilities list always satisfies the
+        subset check, so the legacy "any worker can claim" behaviour
+        is preserved for jobs created without a capability filter.
     """
-    # For AEE-2 we keep matching simple: worker_type == adapter_name
-    # OR adapter_name is the legacy default 'hermes' which any
-    # worker with type 'hermes' or 'fake' can claim.
     where = (
         "status = 'queued' "
         "AND worker_id IS NULL "
         "AND (approval_required = 0 OR approval_state = 'approved')"
+        " AND adapter_name = ?"
     )
-    params: list = []
-    # adapter_name match. We use LIKE so a worker_type of "pi_agent"
-    # can claim a job whose adapter_name is "pi_agent".
-    where += " AND adapter_name = ?"
-    params.append(worker_type)
+    params: list = [worker_type]
+    # AEE-3: capability subset filter. We do the gating in Python
+    # (after fetching a candidate) rather than in SQL, because
+    # required_capabilities is a JSON blob and SQLite has no
+    # native array contains/superset operator. The WHERE clause
+    # filters by the cheap predicates first; `find_claimable_job`
+    # then post-filters by the JSON contents. Worst case: a
+    # busy queue with many jobs whose JSON doesn't match, the
+    # post-filter just looks at the top-1 candidate (LIMIT 1).
     return where, params
+
+
+def _capability_subset_match(
+    required: List[str], worker_caps: List[str]
+) -> bool:
+    """True iff `required ⊆ worker_caps`.
+
+    AEE-3 matching rule. An empty `required` always matches
+    (no filter). Capability strings are assumed pre-normalized
+    (lowercase, deduped); we still defensively call
+    `normalize_capabilities` here so the matcher is robust
+    against direct-DB writes.
+    """
+    req = set(normalize_capabilities(required))
+    if not req:
+        return True
+    have = set(normalize_capabilities(worker_caps))
+    return req.issubset(have)
 
 
 def find_claimable_job(
@@ -458,27 +576,41 @@ def find_claimable_job(
     """Return the next claimable job for this worker, or None.
 
     Picks the highest-priority, oldest queued job matching the worker's
-    type and capabilities. Does NOT update anything — that's
-    `claim_job()`'s job.
+    type AND whose required_capabilities are a subset of the worker's
+    capabilities. Does NOT update anything — that's `claim_job()`'s job.
     """
     conn = get_conn()
     where, params = _task_claim_eligible_where(
         worker_type=worker_type, capabilities=capabilities,
     )
-    row = conn.execute(
+    # Iterate up to N candidates so the post-filter can skip rows
+    # whose required_capabilities are not a subset of the worker's.
+    # N is small (5) to keep the worst case bounded; in practice the
+    # queue is short and a single LIMIT 1 suffices.
+    rows = conn.execute(
         f"SELECT * FROM tasks WHERE {where} "
-        "ORDER BY priority DESC, created_at ASC LIMIT 1",
+        "ORDER BY priority DESC, created_at ASC LIMIT 5",
         params,
-    ).fetchone()
-    if row is None:
-        return None
-    return _row_to_task_dict(row)
+    ).fetchall()
+    for row in rows:
+        candidate = _row_to_task_dict(row)
+        if _capability_subset_match(
+            decode_capabilities(candidate.get("required_capabilities_json")),
+            capabilities,
+        ):
+            return candidate
+    return None
 
 
 def _row_to_task_dict(row) -> Dict[str, Any]:
     """Lightweight row→dict for the claim path. The canonical
     `dispatcher.models.Task` is what the API layer ultimately
     returns; this helper is for the claim select and tests.
+
+    AEE-3: we also expose `required_capabilities` as a plain
+    list (decoded from the JSON blob) so callers don't have to
+    know about the storage suffix. The raw `*_json` column is
+    kept in the dict for direct DB access where useful.
     """
     keys = (
         "task_id", "title", "type", "priority", "owner", "status",
@@ -488,8 +620,13 @@ def _row_to_task_dict(row) -> Dict[str, Any]:
         "prompt_version", "model_name", "git_commit", "git_branch",
         "runtime_type", "adapter_name", "external_run_id", "worker_id",
         "heartbeat_at", "claim_token_hash", "approval_required", "approval_state",
+        "required_capabilities_json",
     )
     out: Dict[str, Any] = {k: row[k] for k in keys if k in row.keys()}
+    # Domain-level view: list[str], not the JSON blob.
+    out["required_capabilities"] = decode_capabilities(
+        out.get("required_capabilities_json")
+    )
     return out
 
 

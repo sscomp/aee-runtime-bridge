@@ -155,9 +155,12 @@ class TestManagerAEE1(unittest.TestCase):
         )
         self.assertEqual(rec["worker_id"], "w-1")
         self.assertTrue(rec["registered"])
-        # get_worker returns JSON-decoded lists.
+        # get_worker returns JSON-decoded lists. AEE-3: the
+        # repository normalizes the worker's capabilities
+        # (lowercase, trimmed, deduped, sorted), so the loaded
+        # list is the canonical form, not the input order.
         loaded = db.get_worker("w-1")
-        self.assertEqual(loaded["capabilities"], ["shell", "python"])
+        self.assertEqual(loaded["capabilities"], ["python", "shell"])
         self.assertEqual(loaded["workdir_allowlist"], ["/tmp"])
         self.assertEqual(loaded["max_concurrent"], 2)
         # Re-registering with different capabilities updates but
