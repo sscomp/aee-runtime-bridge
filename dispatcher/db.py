@@ -299,6 +299,15 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     # (CREATE TABLE IF NOT EXISTS + IF NOT EXISTS indexes).
     from aee.runtimes.repository import ensure_aee5_schema
     ensure_aee5_schema(conn)
+    # AEE-6: Artifact Pipeline `artifacts` table + indexes. The
+    # migration lives in `aee.artifacts.repository.ensure_aee6_schema`
+    # for the same runtime-neutrality reason as AEE-5. Idempotent
+    # (CREATE TABLE IF NOT EXISTS). Slice 1 shipped the package
+    # but did NOT wire it in; AEE-6.2 is the wire-up. Re-runs are
+    # no-ops, so existing deployed DBs gain the `artifacts` table
+    # transparently on next dispatcher restart.
+    from aee.artifacts.repository import ensure_aee6_schema
+    ensure_aee6_schema(conn)
     conn.commit()
 
 
