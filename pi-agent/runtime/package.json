@@ -1,0 +1,23 @@
+{
+  "name": "pi-agent-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AEE-4 Part B — minimal in-house Pi Agent runtime (Node.js). Reads a job spec, calls an OpenAI-compatible LLM, executes shell / file_read / file_write tools inside an allowlist + workdir, returns a single JSON result on stdout.",
+  "main": "pi-agent-runtime.js",
+  "bin": {
+    "pi-agent-runtime": "./pi-agent-runtime.js"
+  },
+  "scripts": {
+    "test": "node --test tests/test_dry_run.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "openai": "^4.55.0",
+    "zod": "^3.23.8"
+  }
+}

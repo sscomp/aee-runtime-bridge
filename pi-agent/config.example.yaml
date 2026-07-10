@@ -1,0 +1,83 @@
+# AEE-4 Part B — Pi Worker configuration (template).
+#
+# Copy this file to `config.yaml` next to it, fill in the
+# values, and start the daemon with:
+#
+#   python3 -u pi_worker.py --config config.yaml
+#
+# IMPORTANT: do NOT commit a real `bridge_api_key` or any
+# provider API key into the repo. Use the env-file convention
+# below — `${VAR_NAME}` is replaced from os.environ at load.
+#
+# If you copy this file, also copy `pi_agent.provider.env.example`
+# to `provider.env` and `chmod 600` it.
+
+# --- bridge connection ---
+bridge_base_url: "http://127.0.0.1:8787"
+# Substitute from the BRIDGE_API_KEY env var. The daemon will
+# refuse to start if this is unresolved.
+bridge_api_key: "${BRIDGE_API_KEY}"
+
+# --- worker identity ---
+worker_id: "pi-agent-m2-001"
+worker_name: "pi-agent-m2-001"
+worker_type: "pi_agent"
+capabilities:
+  - "runtime.pi"
+  - "tool.shell"
+  - "tool.python"
+  - "tool.git"
+  - "tool.filesystem"
+
+# --- filesystem ---
+# Per-job workdir is created at {workdir_root}/jobs/{job_id}.
+# The workdir_allowlist must contain workdir_root.
+workdir_root: "/home/ubuntu/hermes-runtime-bridge/runtime_data/pi-agent"
+workdir_allowlist:
+  - "/home/ubuntu/hermes-runtime-bridge/runtime_data/pi-agent"
+
+# --- scheduling ---
+max_concurrent: 1
+claim_interval_sec: 5
+heartbeat_interval_sec: 15
+log_max_bytes: 4096
+
+# --- shell allowlist (mirrors config/safety.json in the bridge) ---
+allowlist_commands:
+  - ls
+  - cat
+  - head
+  - tail
+  - grep
+  - find
+  - file
+  - echo
+  - pwd
+  - whoami
+  - env
+  - date
+  - python3
+  - node
+  - git
+  - jq
+  - curl
+  - wget
+
+# --- provider (read by the node runtime, not the daemon directly) ---
+# The daemon reads PI_PROVIDER_* from the env file specified by
+# `env_file` (or the --env-file flag) and passes them through to
+# the node runtime's process env. The runtime also accepts them
+# as --provider-base-url / --provider-api-key / --provider-model
+# flags.
+env_file: "/home/ubuntu/hermes-runtime-bridge/pi-agent/provider.env"
+
+# --- node runtime ---
+# Path to the pi-agent-runtime.js entrypoint. Default is
+# `<repo>/pi-agent/runtime/pi-agent-runtime.js`. Set this to
+# override (e.g. when running the runtime from a system install).
+runtime_path: ""
+# Extra flags appended to the runtime invocation. Common:
+#   --dry-run                     (no LLM call; canned response)
+#   --max-steps 5                 (override the spec's max_steps)
+#   --per-step-timeout-ms 10000   (override per-tool timeout)
+runtime_flags: []

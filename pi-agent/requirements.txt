@@ -1,0 +1,10 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27
+python-dotenv>=1.0
+pydantic>=2.6
+
+# AEE-4 Part B: Pi Worker daemon dependencies. The daemon reads
+# its config as YAML; PyYAML is the only extra dep over the
+# bridge's requirements.
+PyYAML>=6.0
