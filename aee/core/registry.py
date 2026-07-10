@@ -3,7 +3,7 @@
 AdapterRegistry
 ---------------
 A module-level singleton that maps `adapter_name` (e.g. "hermes",
-"fake", future "pi_agent") to a `RuntimeAdapter` instance. Tests
+"fake", future "aee_lightweight" (the AEE Lightweight Agent Runtime) — "pi_agent" was the historical pre-AEE-4-Part-B worker_type and is now reserved) to a `RuntimeAdapter` instance. Tests
 call `register()` to install a FakeAdapter; production wires the
 real `HermesAdapter` at startup.
 

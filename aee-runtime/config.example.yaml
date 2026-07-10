@@ -1,15 +1,19 @@
-# AEE-4 Part B — Pi Worker configuration (template).
+# AEE-4 Part B — AEE Lightweight Agent Runtime configuration (template).
+#
+# This runtime is **in-house** — we do not install or wrap
+# an external "Pi Agent" / "Pi Coding Agent" package. See
+# docs/AEE4_FINAL_VALIDATION_REPORT.md §1 for the rationale.
 #
 # Copy this file to `config.yaml` next to it, fill in the
 # values, and start the daemon with:
 #
-#   python3 -u pi_worker.py --config config.yaml
+#   python3 -u aee_runtime.py --config config.yaml
 #
 # IMPORTANT: do NOT commit a real `bridge_api_key` or any
 # provider API key into the repo. Use the env-file convention
 # below — `${VAR_NAME}` is replaced from os.environ at load.
 #
-# If you copy this file, also copy `pi_agent.provider.env.example`
+# If you copy this file, also copy `aee_runtime.provider.env.example`
 # to `provider.env` and `chmod 600` it.
 
 # --- bridge connection ---
@@ -19,11 +23,15 @@ bridge_base_url: "http://127.0.0.1:8787"
 bridge_api_key: "${BRIDGE_API_KEY}"
 
 # --- worker identity ---
-worker_id: "pi-agent-m2-001"
-worker_name: "pi-agent-m2-001"
-worker_type: "pi_agent"
+worker_id: "aee-runtime-m2-001"
+worker_name: "aee-runtime-m2-001"
+# worker_type is the bridge's `adapter_name` match key. We
+# use `aee_lightweight` to make it clear this is the in-house
+# AEE Lightweight Agent Runtime (NOT a third-party "Pi Agent"
+# integration). See ADR-006 + the Worker Runtime Contract.
+worker_type: "aee_lightweight"
 capabilities:
-  - "runtime.pi"
+  - "runtime.aee_runtime"
   - "tool.shell"
   - "tool.python"
   - "tool.git"
@@ -32,9 +40,9 @@ capabilities:
 # --- filesystem ---
 # Per-job workdir is created at {workdir_root}/jobs/{job_id}.
 # The workdir_allowlist must contain workdir_root.
-workdir_root: "/home/ubuntu/hermes-runtime-bridge/runtime_data/pi-agent"
+workdir_root: "/home/ubuntu/hermes-runtime-bridge/runtime_data/aee-runtime"
 workdir_allowlist:
-  - "/home/ubuntu/hermes-runtime-bridge/runtime_data/pi-agent"
+  - "/home/ubuntu/hermes-runtime-bridge/runtime_data/aee-runtime"
 
 # --- scheduling ---
 max_concurrent: 1
@@ -69,11 +77,11 @@ allowlist_commands:
 # the node runtime's process env. The runtime also accepts them
 # as --provider-base-url / --provider-api-key / --provider-model
 # flags.
-env_file: "/home/ubuntu/hermes-runtime-bridge/pi-agent/provider.env"
+env_file: "/home/ubuntu/hermes-runtime-bridge/aee-runtime/provider.env"
 
 # --- node runtime ---
-# Path to the pi-agent-runtime.js entrypoint. Default is
-# `<repo>/pi-agent/runtime/pi-agent-runtime.js`. Set this to
+# Path to the aee-runtime.js entrypoint. Default is
+# `<repo>/aee-runtime/runtime/aee-runtime.js`. Set this to
 # override (e.g. when running the runtime from a system install).
 runtime_path: ""
 # Extra flags appended to the runtime invocation. Common:

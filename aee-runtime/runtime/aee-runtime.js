@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// pi-agent/runtime/pi-agent-runtime.js
-// AEE-4 Part B — minimal in-house Pi Agent runtime (Node.js).
+// aee-runtime/runtime/aee-runtime.js
+// AEE-4 Part B — AEE Lightweight Agent Runtime (Node.js, in-house).
 //
 // Reads a JSON job spec from a file (--job-file) or stdin
 // (--job-stdin), optionally calls an OpenAI-compatible LLM,
@@ -99,8 +99,8 @@ async function readSpec(opts) {
 
 const program = new Command();
 program
-  .name("pi-agent-runtime")
-  .description("AEE-4 Part B — minimal in-house Pi Agent runtime")
+  .name("aee-runtime")
+  .description("AEE-4 Part B — AEE Lightweight Agent Runtime (Node.js)")
   .option("--job-file <path>", "path to the JSON job spec file")
   .option("--job-stdin", "read the job spec from stdin instead of --job-file")
   .option("--provider-base-url <url>", "OpenAI-compatible base URL", process.env.PI_PROVIDER_BASE_URL)

@@ -1,4 +1,4 @@
-// pi-agent/runtime/lib/provider.js
+// aee-runtime/runtime/lib/provider.js
 // OpenAI-compatible LLM client. Reads base URL + API key + model
 // from constructor args (which the CLI populates from --provider-*
 // flags or PI_PROVIDER_* env vars).

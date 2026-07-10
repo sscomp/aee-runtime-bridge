@@ -1,4 +1,4 @@
-// pi-agent/runtime/lib/tools.js
+// aee-runtime/runtime/lib/tools.js
 // Three tool handlers: shell, file_read, file_write.
 // Each enforces workdir containment + per-call timeout + output cap.
 // Returns {ok, output, error?, duration_ms} so the loop can serialize
@@ -12,7 +12,7 @@
 // The CLI's job is to map these to bridge calls; the runtime
 // itself never decides "is this a job-failing error" — it
 // only reports what happened. The daemon maps the exit code
-// at the higher level (see pi-agent/pi_worker.py).
+// at the higher level (see aee-runtime/aee_runtime.py).
 
 import { exec } from "node:child_process";
 import { readFile, writeFile, stat } from "node:fs/promises";

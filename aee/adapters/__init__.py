@@ -7,7 +7,7 @@ particular agent / worker backend. AEE-1 ships:
     hermes_adapter  — wraps `POST/GET/STOP /v1/runs` against Hermes M2
     fake_adapter    — in-memory adapter for tests
 
-Adding Pi Agent / Claude Code / MCP is purely additive: implement the
+Adding the AEE Lightweight Agent Runtime / Claude Code / MCP is purely additive: implement the
 Protocol, register it in `AdapterRegistry`, done.
 """
 from __future__ import annotations

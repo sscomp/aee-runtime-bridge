@@ -1,4 +1,22 @@
-# AEE-4 Part B — Pi Reference Implementation Report
+# AEE-4 Part B — AEE Lightweight Agent Runtime Report
+
+**Naming change (2026-07-10, post AEE-4 Architecture Review).** This
+report was originally titled "AEE-4 Part B — Pi Reference
+Implementation Report" and described a runtime called the
+"AEE Lightweight Agent Runtime." After the AEE-4 Architecture Review
+(Conditional Approval), the runtime was renamed to the
+**AEE Lightweight Agent Runtime** (`aee-runtime/`) to
+make it clear that it is an **in-house** reference runtime,
+not a wrapper around any third-party "Pi Agent" package
+(`badlogic/pi-mono`, `earendil-works/pi-mono`,
+`pi-agent-core`, etc.). The directory `aee-runtime/` was
+renamed to `aee-runtime/`; the daemon was renamed from
+`pi_worker.py` to `aee_runtime.py`; the worker_type is
+now `aee_lightweight` (not `pi_agent`); the runtime
+capability is `runtime.aee_runtime` (not `runtime.pi`).
+The original report content is preserved below with the
+new naming. See `docs/AEE4_FINAL_VALIDATION_REPORT.md`
+for the full rationale and test counts.
 
 **Version:** 1.0
 **Date:** 2026-07-10
@@ -12,21 +30,21 @@
 
 ## 1. Change summary
 
-AEE-4 Part B implements the **Pi Agent Worker**, the first
+AEE-4 Part B implements the **AEE Lightweight Agent Runtime**, the first
 production-quality runtime that conforms to the AEE-4 Worker
-Runtime Contract. Pi Worker is a **separate process** that
+Runtime Contract. The AEE Lightweight Agent Runtime is a **separate process** that
 talks to the bridge over HTTP at `/v1/workers/...` and
 `/v1/jobs/...`; it has no import-time dependency on the
 bridge or on Hermes. The runtime itself is split into two
 pieces:
 
-- A **Python daemon** (`pi-agent/pi_worker.py`, ~580 lines)
+- A **Python daemon** (`aee-runtime/aee_runtime.py`, ~580 lines)
   that handles the AEE-4 lifecycle: register, heartbeat
   (with the 5-value status model), claim, execute, log,
   complete / fail. Plus a config loader, a stdlib HTTP
   client, and the per-job workdir + spec-file plumbing.
 - A **Node.js LLM runtime**
-  (`pi-agent/runtime/pi-agent-runtime.js` + 5 lib files,
+  (`aee-runtime/runtime/aee-runtime.js` + 5 lib files,
   ~250 lines) that reads a JSON spec, calls an
   OpenAI-compatible LLM with a small tool-calling loop
   (shell / file_read / file_write), enforces a workdir
@@ -41,7 +59,7 @@ distinct exit code (0..9), so the daemon can fail the
 Job on the bridge with a precise reason.
 
 The full lifecycle was exercised end-to-end in the
-closed-loop smoke test (`pi-agent/tests/test_smoke.py`)
+closed-loop smoke test (`aee-runtime/tests/test_smoke.py`)
 that spawns a real uvicorn bridge, a real daemon
 subprocess, and a real node runtime in `--dry-run` mode
 (no LLM call). The test asserts the Job's status moves
@@ -57,24 +75,24 @@ metadata fields.
 | Path | Purpose |
 |---|---|
 | `docs/runtime/Worker_Runtime_Contract.md` | The canonical AEE-4 Worker Runtime Contract (Part A; 780 lines). |
-| `pi-agent/README.md` | Operational guide for the Pi Worker. |
-| `pi-agent/requirements.txt` | Daemon deps: PyYAML >= 6.0 (only addition over the bridge). |
-| `pi-agent/config.example.yaml` | Config template. |
-| `pi-agent/pi_agent.provider.env.example` | Provider env template. |
-| `pi-agent/pi_worker.py` | The Python daemon. |
-| `pi-agent/runtime/package.json` | Node deps: openai, commander, dotenv, zod. |
-| `pi-agent/runtime/package-lock.json` | (npm-generated, 17 KB) |
-| `pi-agent/runtime/pi-agent-runtime.js` | The Node CLI entrypoint. |
-| `pi-agent/runtime/lib/spec.js` | Job-spec schema (zod). |
-| `pi-agent/runtime/lib/tools.js` | 3 tool handlers (shell, file_read, file_write) + TOOL_DEFS. |
-| `pi-agent/runtime/lib/provider.js` | OpenAI client wrapper. |
-| `pi-agent/runtime/lib/loop.js` | The function-calling loop. |
-| `pi-agent/runtime/lib/result.js` | Result envelope + dry-run canned response. |
-| `pi-agent/runtime/tests/test_dry_run.js` | Node tests (3 tests, `node --test`). |
-| `pi-agent/tests/test_pi_worker.py` | Daemon unit tests (13 tests). |
-| `pi-agent/tests/test_smoke.py` | Closed-loop smoke tests (2 tests). |
-| `pi-agent/systemd/pi-agent.service` | Reference systemd unit. |
-| `pi-agent/supervisor/pi-agent.conf` | Production supervisord unit. |
+| `aee-runtime/README.md` | Operational guide for the AEE Lightweight Agent Runtime. |
+| `aee-runtime/requirements.txt` | Daemon deps: PyYAML >= 6.0 (only addition over the bridge). |
+| `aee-runtime/config.example.yaml` | Config template. |
+| `aee-runtime/aee_runtime.provider.env.example` | Provider env template. |
+| `aee-runtime/aee_runtime.py` | The Python daemon. |
+| `aee-runtime/runtime/package.json` | Node deps: openai, commander, dotenv, zod. |
+| `aee-runtime/runtime/package-lock.json` | (npm-generated) |
+| `aee-runtime/runtime/aee-runtime.js` | The Node CLI entrypoint. |
+| `aee-runtime/runtime/lib/spec.js` | Job-spec schema (zod). |
+| `aee-runtime/runtime/lib/tools.js` | 3 tool handlers (shell, file_read, file_write) + TOOL_DEFS. |
+| `aee-runtime/runtime/lib/provider.js` | OpenAI client wrapper. |
+| `aee-runtime/runtime/lib/loop.js` | The function-calling loop. |
+| `aee-runtime/runtime/lib/result.js` | Result envelope + dry-run canned response. |
+| `aee-runtime/runtime/tests/test_dry_run.js` | Node tests (3 tests, `node --test`). |
+| `aee-runtime/tests/test_aee_runtime.py` | Daemon unit tests (13 tests). |
+| `aee-runtime/tests/test_smoke.py` | Closed-loop smoke tests (2 tests). |
+| `aee-runtime/systemd/aee-runtime.service` | Reference systemd unit. |
+| `aee-runtime/supervisor/aee-runtime.conf` | Production supervisord unit. |
 | `docs/AEE_RUNTIME_INTEGRATION_GUIDE.md` | The runtime-agnostic integration handbook (NEW; see §3.4 of the master plan). |
 | `docs/AEE4_PI_REFERENCE_IMPLEMENTATION_REPORT.md` | This document. |
 
@@ -151,13 +169,13 @@ alias) — the same handler serves both:
 | POST | `/v1/jobs/claim` | bearer | YES |
 | POST | `/v1/jobs/{id}/logs` | bearer + claim_token | YES |
 | POST | `/v1/jobs/{id}/complete` | bearer + claim_token | YES |
-| POST | `/v1/jobs/{id}/heartbeat` | bearer + claim_token | supplementary (Pi Worker sends these too) |
+| POST | `/v1/jobs/{id}/heartbeat` | bearer + claim_token | supplementary (AEE Lightweight Agent Runtime sends these too) |
 | POST | `/v1/jobs/{id}/fail` | bearer + claim_token | YES (error path) |
-| POST | `/v1/jobs/{id}/cancel` | bearer (+ token) | not used by Pi Worker |
-| POST | `/v1/jobs` | bearer | not used by Pi Worker (operator-side) |
-| GET  | `/v1/jobs/{id}` | bearer | not used by Pi Worker |
-| GET  | `/v1/workers` | bearer | not used by Pi Worker |
-| GET  | `/v1/workers/{id}` | bearer | not used by Pi Worker |
+| POST | `/v1/jobs/{id}/cancel` | bearer (+ token) | not used by AEE Lightweight Agent Runtime |
+| POST | `/v1/jobs` | bearer | not used by AEE Lightweight Agent Runtime (operator-side) |
+| GET  | `/v1/jobs/{id}` | bearer | not used by AEE Lightweight Agent Runtime |
+| GET  | `/v1/workers` | bearer | not used by AEE Lightweight Agent Runtime |
+| GET  | `/v1/workers/{id}` | bearer | not used by AEE Lightweight Agent Runtime |
 
 All responses include `"version": "v1"`. The same
 handlers serve `/jobs/...` and `/workers/...` (no
@@ -165,11 +183,11 @@ prefix) as legacy aliases for backward compatibility
 with AEE-2 / AEE-3 clients and the `/runs` GPT-Action
 compat layer.
 
-## 5. Pi Worker architecture
+## 5. AEE Lightweight Agent Runtime architecture
 
 ### 5.1 The Python daemon
 
-The daemon (`pi-agent/pi_worker.py`) is a single-threaded
+The daemon (`aee-runtime/aee_runtime.py`) is a single-threaded
 loop with one background thread (the heartbeat thread
 that's only alive while a Job is running). The shape:
 
@@ -194,7 +212,7 @@ that's only alive while a Job is running). The shape:
        │      ├─ _execute_job()                      │
        │      │  ├─ build per-job workdir            │
        │      │  ├─ write spec.json                  │
-       │      │  ├─ spawn node pi-agent-runtime      │
+       │      │  ├─ spawn node aee-runtime      │
        │      │  ├─ stream stderr to /v1/jobs/.../logs│
        │      │  ├─ parse final stdout JSON          │
        │      │  └─ /v1/jobs/{id}/complete|fail      │
@@ -218,12 +236,12 @@ runtime's exit code map).
 
 ### 5.2 The Node.js runtime
 
-The runtime (`pi-agent/runtime/`) is a minimal LLM
+The runtime (`aee-runtime/runtime/`) is a minimal LLM
 function-calling loop. The shape:
 
 ```
    ┌──────────────────────────────────────────┐
-   │ pi-agent-runtime.js (CLI entrypoint)     │
+   │ aee-runtime.js (CLI entrypoint)     │
    │  --job-file <path>                       │
    │  --provider-{base-url,api-key,model}     │
    │  --allowlist-cmds "ls,cat,git"           │
@@ -275,7 +293,7 @@ runtime is a single JSON file at
   "max_steps": 20,
   "per_step_timeout_ms": 30000,
   "max_output_bytes": 204800,
-  "workdir": "/home/ubuntu/hermes-runtime-bridge/runtime_data/pi-agent/jobs/TASK-20260710-0010",
+  "workdir": "/home/ubuntu/hermes-runtime-bridge/runtime_data/aee-runtime/jobs/TASK-20260710-0010",
   "allowlist_cmds": ["ls", "cat", "echo", ...],
   "approval_required": false
 }
@@ -286,11 +304,11 @@ the runtime with code 2.
 
 ## 6. Capability namespace + the worker's capabilities
 
-The Pi Worker declares these capabilities at register:
+The AEE Lightweight Agent Runtime declares these capabilities at register:
 
 ```
 [
-  "runtime.pi",
+  "runtime.aee_runtime",
   "tool.shell",
   "tool.python",
   "tool.git",
@@ -305,7 +323,7 @@ matcher doesn't use it (it just checks `worker_type` vs
 routing.
 
 A Job with `required_capabilities=["tool.shell"]` is
-claimable by the Pi Worker (subset match). A Job with
+claimable by the AEE Lightweight Agent Runtime (subset match). A Job with
 `required_capabilities=["tool.brain_surgery"]` is NOT
 claimable; the matcher filters it out at the SQL level.
 
@@ -329,9 +347,9 @@ matcher bug), the daemon fails the Job with
 | `tests/test_adapter.py` | 9 | all green |
 | `tests/test_safety.py` | 8 | all green |
 | `tests/test_migration_aee1.py` | 2 | all green |
-| `pi-agent/tests/test_pi_worker.py` | 13 (NEW) | all green |
-| `pi-agent/tests/test_smoke.py` | 2 (NEW) | all green |
-| `pi-agent/runtime/tests/test_dry_run.js` | 3 (NEW) | all green |
+| `aee-runtime/tests/test_aee_runtime.py` | 13 (NEW) | all green |
+| `aee-runtime/tests/test_smoke.py` | 2 (NEW) | all green |
+| `aee-runtime/runtime/tests/test_dry_run.js` | 3 (NEW) | all green |
 
 **Total at AEE-4 Part B freeze: 79 tests across 9
 test runners, all green.**
@@ -345,7 +363,7 @@ from `test_workers_api.py:48` mutating
 
 ### 7.2 Closed-loop smoke test transcript
 
-The closed-loop smoke test (`pi-agent/tests/test_smoke.py::TestEndToEndDryRun`)
+The closed-loop smoke test (`aee-runtime/tests/test_smoke.py::TestEndToEndDryRun`)
 spins up a real bridge on a random port, spawns the
 daemon as a subprocess, creates a Job in the bridge's
 DB via direct SQL, and asserts the daemon claims +
@@ -353,12 +371,12 @@ completes the Job end-to-end. The transcript:
 
 ```
 $ PYTHONPATH=. .venv/bin/python -m unittest \
-    pi-agent.tests.test_smoke.TestEndToEndDryRun -v
+    aee-runtime.tests.test_smoke.TestEndToEndDryRun -v
 test_daemon_claims_completes_a_job_end_to_end ...
 
 2026-07-10T14:25:00+0800 [pi_worker] INFO starting pi-worker pid=339737
-2026-07-10T14:25:00+0800 [pi_worker] INFO registered worker_id=pi-smoke-01 type=pi_agent
-2026-07-10T14:25:00+0800 [pi_worker] INFO spawning runtime: node /home/ubuntu/hermes-runtime-bridge/pi-agent/runtime/pi-agent-runtime.js --job-file /tmp/.../spec.json --dry-run
+2026-07-10T14:25:00+0800 [aee_runtime] INFO registered worker_id=aee-smoke-01 type=aee_lightweight
+2026-07-10T14:25:00+0800 [aee_runtime] INFO spawning aee-runtime: node /home/ubuntu/hermes-runtime-bridge/aee-runtime/runtime/aee-runtime.js --job-file /tmp/.../spec.json --dry-run
 2026-07-10T14:25:00+0800 [pi_worker] INFO job TASK-SMOKE-001 completed: completed
 ok
 
@@ -376,7 +394,7 @@ heartbeat).
 
 ### 7.3 Coverage of the spec's error-handling matrix
 
-The spec lists 6 error modes that Pi Worker must handle.
+The spec lists 6 error modes that AEE Lightweight Agent Runtime must handle.
 The test suite covers each:
 
 | Error mode | Test |
@@ -404,14 +422,14 @@ The test suite covers each:
 | R15 | `find_claimable_job` post-filters up to 5 candidates. | medium | Unchanged. |
 | R16 | Workers registered pre-AEE-3 may have non-canonical caps. | low | Unchanged. |
 | **R17 (new)** | Pre-existing `tests/test_dispatcher.py::test_log_file_written` and `test_task_json_written_on_complete` fail when run after `tests/test_workers_api.py` (the latter mutates `mgr.LOGS_DIR`). | low | Pre-existing on master; not introduced by AEE-4. The test passes when run alone. Documented for the AEE-5 fix. |
-| **R18 (new)** | The Pi Worker daemon uses a single `urllib.request`-based HTTP client. Under heavy load, a connection pool would be more efficient. | low | Out of scope for AEE-4. The daemon makes ~3 HTTP calls per minute; connection pooling is premature. |
+| **R18 (new)** | The AEE Lightweight Agent Runtime daemon uses a single `urllib.request`-based HTTP client. Under heavy load, a connection pool would be more efficient. | low | Out of scope for AEE-4. The daemon makes ~3 HTTP calls per minute; connection pooling is premature. |
 | **R19 (new)** | The Node runtime has no metric collection (no token / cost / latency histograms). | low | Out of scope for AEE-4. AEE-5+ may add. |
 | **R20 (new)** | The Node runtime spawns a new `node` process per Job. Cold-start cost is ~100 ms; for low-throughput batch workloads this is fine. | low | Out of scope for AEE-4. A future AEE-5 may switch to a long-lived `node` worker (a `RuntimeAdapter`-style seam). |
 | **R21 (new)** | The closed-loop smoke test spins up a real uvicorn server in a thread; it works in CI but may flake in environments where port 0 isn't honored. | low | AEE-4 smoke is best-effort; the 13 unit tests in `test_pi_worker.py` give most of the coverage without the integration dependency. |
 
 ## 9. AEE-5+ next steps
 
-Pi Worker is the first of N future runtimes. The next
+AEE Lightweight Agent Runtime is the first of N future runtimes. The next
 ones (per the master plan) are:
 
 - **AEE-5: Claude Code Worker.** Same shape as Pi
@@ -425,7 +443,7 @@ ones (per the master plan) are:
   a fork-and-rename of `pi_worker.py`.
 - **AEE-6: artifact pipeline.** Out of scope for
   AEE-4. The contract's `expected_artifacts` field is
-  passed to Pi Worker but not yet honored; AEE-6
+  passed to AEE Lightweight Agent Runtime but not yet honored; AEE-6
   lands the `POST /v1/jobs/{id}/artifacts` upload
   endpoint.
 - **AEE-7: scheduler / future matcher.** Per
@@ -435,7 +453,7 @@ ones (per the master plan) are:
   model is in place (ADR-004 `requirements_json`,
   `capability_versions_json`); the matcher is not.
 - **AEE-8: event bus.** Out of scope for AEE-4.
-  Pi Worker's `task_events` writes go through the
+  AEE Lightweight Agent Runtime's `task_events` writes go through the
   existing AEE-1 `manager._emit_event` path. A
   pub/sub layer (Redis Streams? Kafka?) is AEE-8
   scope.
@@ -444,11 +462,10 @@ ones (per the master plan) are:
   reserved; AEE-9 implements it.
 - **AEE-10: cluster / multi-host.** Out of scope.
 
-GPT Architecture Review is required before AEE-5
-starts. The review should focus on:
+GPT Architecture Review was performed and returned Conditional Approval on 2026-07-10. The remediation (this report + `docs/AEE4_FINAL_VALIDATION_REPORT.md`) addresses each finding. After Conditional Approval is cleared, AEE-5 may begin. The follow-up review should focus on:
 
 1. The Worker Runtime Contract (`docs/runtime/Worker_Runtime_Contract.md` §1-§9).
-2. The Pi Worker's conformance (§9 checklist mapping in `pi-agent/README.md`).
+2. The AEE Lightweight Agent Runtime's conformance (§9 checklist mapping in `aee-runtime/README.md`).
 3. The 5-value status model (§5 of the contract; ADR-008).
 4. The /v1/... path-prefix versioning decision (ADR-007).
 5. The runtime-agnostic integration handbook (`docs/AEE_RUNTIME_INTEGRATION_GUIDE.md`) — is the template good for Claude Code / GPT / MCP?

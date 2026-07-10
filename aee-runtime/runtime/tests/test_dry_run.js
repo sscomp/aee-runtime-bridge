@@ -1,10 +1,10 @@
-// pi-agent/runtime/tests/test_dry_run.js
+// aee-runtime/runtime/tests/test_dry_run.js
 // AEE-4 Part B — minimum smoke test for the runtime.
 // Runs the runtime with --dry-run on a sample spec, asserts
 // the JSON shape, asserts exit code 0.
 //
 // This test does NOT call any LLM. It exists so the closed-
-// loop Pi Worker smoke test (`pi-agent/tests/test_smoke.py`)
+// loop AEE Lightweight Agent Runtime smoke test (`aee-runtime/tests/test_smoke.py`)
 // can spawn the runtime with --dry-run and read the
 // deterministic output.
 
@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const runtime = join(__dirname, "..", "pi-agent-runtime.js");
+const runtime = join(__dirname, "..", "aee-runtime.js");
 
 test("dry-run emits canonical JSON result on stdout and exits 0", () => {
   const tmp = mkdtempSync(join(tmpdir(), "pi-runtime-test-"));

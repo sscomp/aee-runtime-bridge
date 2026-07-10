@@ -1,23 +1,23 @@
-# AEE-4 Part B — Pi Worker systemd reference unit
+# AEE-4 Part B — AEE Lightweight Agent Runtime systemd reference unit
 #
 # The Abacus.AI host uses supervisord (PID 7), NOT systemd.
 # This file is a reference for hosts that do use systemd
 # (developer laptops, other deployments). See
-# pi-agent/supervisor/pi-agent.conf for the production unit.
+# aee-runtime/supervisor/aee-runtime.conf for the production unit.
 #
 # Install (one-time, on a systemd host):
-#   1. Copy to /etc/systemd/system/pi-agent.service
+#   1. Copy to /etc/systemd/system/aee-runtime.service
 #   2. Ensure the bridge is also a systemd unit
 #      (hermes-runtime-bridge.service)
 #   3. sudo systemctl daemon-reload
-#   4. sudo systemctl enable --now pi-agent
+#   4. sudo systemctl enable --now aee-runtime
 #
 # Logs:
-#   journalctl -u pi-agent -f
+#   journalctl -u aee-runtime -f
 
 [Unit]
-Description=AEE-4 Part B — Pi Worker daemon (Agent Execution Engine)
-Documentation=file:///home/ubuntu/hermes-runtime-bridge/pi-agent/README.md
+Description=AEE-4 Part B — AEE Lightweight Agent Runtime daemon (Agent Execution Engine)
+Documentation=file:///home/ubuntu/hermes-runtime-bridge/aee-runtime/README.md
 After=network-online.target hermes-runtime-bridge.service
 Wants=network-online.target
 
@@ -28,8 +28,8 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/hermes-runtime-bridge
 ExecStart=/home/ubuntu/hermes-runtime-bridge/.venv/bin/python \
     -u \
-    /home/ubuntu/hermes-runtime-bridge/pi-agent/pi_worker.py \
-    --config /home/ubuntu/hermes-runtime-bridge/pi-agent/config.yaml
+    /home/ubuntu/hermes-runtime-bridge/aee-runtime/aee_runtime.py \
+    --config /home/ubuntu/hermes-runtime-bridge/aee-runtime/config.yaml
 Restart=on-failure
 RestartSec=10
 StartLimitBurst=3
@@ -44,9 +44,9 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=/home/ubuntu/hermes-runtime-bridge/runtime_data/pi-agent
+ReadWritePaths=/home/ubuntu/hermes-runtime-bridge/runtime_data/aee-runtime
 # /home/ubuntu is read-only; the daemon's workdirs live under
-# runtime_data/pi-agent, which is the only writable path.
+# runtime_data/aee-runtime, which is the only writable path.
 
 [Install]
 WantedBy=multi-user.target

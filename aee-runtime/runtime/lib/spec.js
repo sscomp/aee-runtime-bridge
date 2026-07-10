@@ -1,4 +1,4 @@
-// pi-agent/runtime/lib/spec.js
+// aee-runtime/runtime/lib/spec.js
 // Zod schema + parse helper for the job spec the daemon writes to
 // the spec file before invoking the runtime.
 //
@@ -32,7 +32,7 @@
 //                       runtime rejects with exit 6 otherwise.
 //   * allowlist_cmds  — list of allowed first tokens for the
 //                       `shell` tool. Default mirrors the
-//                       allowlist_commands in pi-agent/config.yaml.
+//                       allowlist_commands in aee-runtime/config.yaml.
 //   * approval_required — placeholder for AEE-5+ human-in-the-loop
 //                       approval. AEE-4 reads the field but
 //                       does not act on it (always allow).

@@ -8,7 +8,7 @@
 - `docs/runtime/Worker_Runtime_Contract.md` — the canonical
   contract every runtime must satisfy.
 - `docs/AEE4_PI_REFERENCE_IMPLEMENTATION_REPORT.md` — the
-  first conformant runtime (Pi Agent).
+  first conformant runtime (AEE Lightweight Agent Runtime; in-house, not a third-party "Pi Agent" package).
 - `docs/AEE_RUNTIME_INTEGRATION_GUIDE.md` — this document.
 
 ---
@@ -24,7 +24,7 @@ provider), we describe that choice explicitly so a
 future Claude Code / GPT / MCP runtime can follow the
 same shape with a different runtime internals.
 
-Pi Worker is the **first conformant runtime**. The
+AEE Lightweight Agent Runtime is the **first conformant runtime**. The
 guide is shaped around the same steps a future runtime
 (Claude Code in AEE-5, MCP in AEE-9) will go through.
 
@@ -48,19 +48,19 @@ Every runtime needs:
 - The runtime's own dependencies (Node.js, Python,
   Go, etc., depending on the runtime).
 - A **provider env file** (only if the runtime needs
-  an LLM / external API). Pi Worker uses
+  an LLM / external API). AEE Lightweight Agent Runtime uses
   `provider.env`; future runtimes that don't call an
   LLM (e.g. a shell-only runtime) can skip this.
 
-For Pi Worker specifically:
+For AEE Lightweight Agent Runtime specifically:
 
 ```bash
 # 1. Install the daemon deps (PyYAML is the only new dep).
 cd /home/ubuntu/hermes-runtime-bridge
-.venv/bin/pip install -r pi-agent/requirements.txt
+.venv/bin/pip install -r aee-runtime/requirements.txt
 
 # 2. Install the runtime deps (openai, commander, dotenv, zod).
-cd pi-agent/runtime
+cd aee-runtime/runtime
 npm install
 ```
 
@@ -89,16 +89,16 @@ the runtime.
 
 ### 3.1 The daemon's YAML config
 
-Pi Worker's `config.example.yaml` (template; copy to
+AEE Lightweight Agent Runtime's `config.example.yaml` (template; copy to
 `config.yaml`):
 
 ```yaml
 bridge_base_url: "http://127.0.0.1:8787"
 bridge_api_key: "${BRIDGE_API_KEY}"  # from env, never committed
 
-worker_id: "pi-agent-m2-001"
-worker_name: "pi-agent-m2-001"
-worker_type: "pi_agent"             # matches the job's adapter_name
+worker_id: "aee-runtime-m2-001"
+worker_name: "aee-runtime-m2-001"
+worker_type: "aee_lightweight"             # matches the job's adapter_name
 capabilities:
   - "runtime.pi"
   - "tool.shell"
@@ -118,7 +118,7 @@ log_max_bytes: 4096
 allowlist_commands: ["ls", "cat", "echo", ...]  # shell first-token allowlist
 
 env_file: "/path/to/provider.env"
-runtime_path: ""                                # default: <repo>/pi-agent/runtime/pi-agent-runtime.js
+runtime_path: ""                                # default: <repo>/aee-runtime/runtime/aee-runtime.js
 runtime_flags: []                                # e.g. ["--dry-run"] for tests
 ```
 
@@ -128,7 +128,7 @@ with `worker_type=claude_code` and
 
 ### 3.2 The provider env file
 
-Pi Worker's `pi_agent.provider.env.example` (template;
+AEE Runtime's `aee_runtime.provider.env.example` (template;
 copy to `provider.env`, `chmod 600`):
 
 ```
@@ -169,14 +169,14 @@ before the bridge is up.
 
 ### 4.1 Supervisord (this host's convention)
 
-Pi Worker's `pi-agent/supervisor/pi-agent.conf`:
+AEE Runtime's `aee-runtime/supervisor/aee-runtime.conf`:
 
 ```ini
-[program:pi-agent]
+[program:aee-runtime]
 command=/home/ubuntu/hermes-runtime-bridge/.venv/bin/python
     -u
-    /home/ubuntu/hermes-runtime-bridge/pi-agent/pi_worker.py
-    --config /home/ubuntu/hermes-runtime-bridge/pi-agent/config.yaml
+    /home/ubuntu/hermes-runtime-bridge/aee-runtime/aee_runtime.py
+    --config /home/ubuntu/hermes-runtime-bridge/aee-runtime/config.yaml
 directory=/home/ubuntu/hermes-runtime-bridge
 user=ubuntu
 autostart=true
@@ -185,10 +185,10 @@ startsecs=10
 startretries=3
 stopwaitsecs=15
 stopsignal=TERM
-stdout_logfile=/var/log/pi-agent.out.log
+stdout_logfile=/var/log/aee-runtime.out.log
 stdout_logfile_maxbytes=10MB
 stdout_logfile_backups=5
-stderr_logfile=/var/log/pi-agent.err.log
+stderr_logfile=/var/log/aee-runtime.err.log
 stderr_logfile_maxbytes=10MB
 stderr_logfile_backups=5
 priority=30
@@ -197,20 +197,20 @@ priority=30
 Install:
 
 ```bash
-sudo cp pi-agent/supervisor/pi-agent.conf \
-        /etc/supervisor/conf.d/pi-agent.conf
+sudo cp aee-runtime/supervisor/aee-runtime.conf \
+        /etc/supervisor/conf.d/aee-runtime.conf
 sudo supervisorctl reread
 sudo supervisorctl update
-sudo supervisorctl status pi-agent
+sudo supervisorctl status aee-runtime
 ```
 
 ### 4.2 systemd (developer-laptop convention)
 
-Pi Worker's `pi-agent/systemd/pi-agent.service`:
+AEE Lightweight Agent Runtime's `aee-runtime/systemd/aee-runtime.service`:
 
 ```ini
 [Unit]
-Description=AEE-4 Part B — Pi Worker daemon
+Description=AEE-4 Part B — AEE Lightweight Agent Runtime daemon
 After=network-online.target hermes-runtime-bridge.service
 Wants=network-online.target
 
@@ -220,15 +220,15 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/hermes-runtime-bridge
 ExecStart=/home/ubuntu/hermes-runtime-bridge/.venv/bin/python \
     -u \
-    /home/ubuntu/hermes-runtime-bridge/pi-agent/pi_worker.py \
-    --config /home/ubuntu/hermes-runtime-bridge/pi-agent/config.yaml
+    /home/ubuntu/hermes-runtime-bridge/aee-runtime/aee_runtime.py \
+    --config /home/ubuntu/hermes-runtime-bridge/aee-runtime/config.yaml
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=15
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ubuntu/hermes-runtime-bridge/runtime_data/pi-agent
+ReadWritePaths=/home/ubuntu/hermes-runtime-bridge/runtime_data/aee-runtime
 
 [Install]
 WantedBy=multi-user.target
@@ -237,14 +237,14 @@ WantedBy=multi-user.target
 Install:
 
 ```bash
-sudo cp pi-agent/systemd/pi-agent.service \
-        /etc/systemd/system/pi-agent.service
+sudo cp aee-runtime/systemd/aee-runtime.service \
+        /etc/systemd/system/aee-runtime.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now pi-agent
+sudo systemctl enable --now aee-runtime
 ```
 
 A future Claude Code Worker unit would be a near-copy
-of either file, with `pi-agent` → `claude-code-worker`
+of either file, with `aee-runtime` → `claude-code-worker`
 and the `ExecStart` pointing to the Claude Code
 runtime.
 
@@ -388,8 +388,8 @@ Every runtime MUST ship a closed-loop smoke test that:
 5. Asserts the Job is `completed` and the output_text
    contains the expected marker.
 
-Pi Worker's smoke test is
-`pi-agent/tests/test_smoke.py::TestEndToEndDryRun`. A
+AEE Lightweight Agent Runtime's smoke test is
+`aee-runtime/tests/test_smoke.py::TestEndToEndDryRun`. A
 future Claude Code / MCP smoke test copies this
 template and changes:
 
@@ -398,6 +398,48 @@ template and changes:
 - The expected `output_text` marker.
 - The `worker_type` and `capabilities` in the register
   body.
+
+### 6.1 Operator-only live provider smoke test
+
+The AEE Lightweight Agent Runtime ALSO ships a second
+smoke test that exercises a real LLM provider
+(Ollama, RouteLLM, or any OpenAI-compatible
+endpoint):
+
+- **File:** `aee-runtime/tests/test_live_provider.py`
+- **Off by default.** The standard `python -m unittest`
+  invocation will skip it; the test is for operator
+  use only.
+- **How to run:**
+
+      # 1. Set up the provider env file.
+      $ cp aee-runtime/aee_runtime.provider.env.example \\
+            aee-runtime/provider.env
+      $ chmod 600 aee-runtime/provider.env
+      $ $EDITOR aee-runtime/provider.env   # set real key
+
+      # 2. Set the env var to enable the test.
+      $ export AEE_RUNTIME_RUN_LIVE_PROVIDER=1
+
+      # 3. Run.
+      $ PYTHONPATH=. .venv/bin/python -m unittest \\
+            aee-runtime.tests.test_live_provider
+
+- **What it does:** spins up a real uvicorn bridge,
+  launches the daemon against a real provider, creates
+  a Job whose instruction tells the LLM to invoke the
+  `shell` tool to echo a known string, and asserts the
+  Job reaches `completed` with the expected `output_text`.
+- **API-key safety:** the test **never** writes
+  `PI_PROVIDER_API_KEY` to stdout, stderr, the bridge
+  DB, or the disk. It reads the key from `provider.env`,
+  passes it to the daemon subprocess via the env file,
+  and asserts at the end that the key is not present
+  in any persisted row.
+- **Why operator-only:** it needs a real provider and
+  a real key, both of which CI doesn't have. CI
+  continues to run only the offline tests
+  (`test_aee_runtime.py` + `test_smoke.py`).
 
 ## 7. Troubleshooting
 
@@ -415,7 +457,7 @@ template and changes:
 | `logs not appearing in /tasks/{id}/events` | The runtime sent a log line but the bridge's `task_events` table isn't being read by anything | The events are in the DB; check the bridge's `task_events` table or the `/tasks/{id}/events` endpoint. |
 | `worker gets reaped to timeout mid-job` | The runtime's heartbeat interval is too slow, or the runtime is blocked on a synchronous call | Reduce `heartbeat_interval_sec` (default 15 s, well under the 60 s threshold); check that long-running ops in the runtime are async or chunked. |
 
-## 8. Pi-specific appendix
+## 8. AEE Lightweight Agent Runtime–specific appendix
 
 The non-runtime-neutral bits, kept here so future
 runtimes can skip them.
@@ -438,7 +480,7 @@ The split is deliberate for two reasons:
 The contract between the Python daemon and the Node
 runtime is a single JSON file at
 `{workdir_root}/jobs/{job_id}/spec.json`. See
-`pi-agent/runtime/lib/spec.js` for the zod schema. The
+`aee-runtime/runtime/lib/spec.js` for the zod schema. The
 key fields are:
 
 - `job_id` — the bridge's `TASK-...` id.
@@ -471,7 +513,7 @@ key fields are:
 
 The daemon maps these to `/v1/jobs/{id}/fail` calls
 with the appropriate `error` field. See
-`pi-agent/pi_worker.py:_RUNTIME_EXIT_TO_ERROR` for
+`aee-runtime/aee_runtime.py:_RUNTIME_EXIT_TO_ERROR` for
 the full map.
 
 ### 8.4 The `--dry-run` mode
@@ -479,7 +521,7 @@ the full map.
 The Node runtime supports `--dry-run`, which
 short-circuits the provider call and prints a canned
 response. The closed-loop smoke test
-(`pi-agent/tests/test_smoke.py`) uses this so the
+(`aee-runtime/tests/test_smoke.py`) uses this so the
 test doesn't need a real LLM key.
 
 To use `--dry-run` outside tests, add it to
@@ -498,10 +540,11 @@ runtime will skip the provider call and the Job's
 - `docs/runtime/Worker_Runtime_Contract.md` — the
   canonical contract. Read this first; the rest of the
   guide assumes §2 and §3 of the contract.
-- `docs/AEE4_PI_REFERENCE_IMPLEMENTATION_REPORT.md` —
-  the first conformant runtime.
-- `pi-agent/README.md` — operational guide for Pi
-  Worker.
+- `docs/AEE4_AEE_RUNTIME_REPORT.md` — the
+  first conformant runtime (AEE Lightweight Agent
+  Runtime, in-house).
+- `aee-runtime/README.md` — operational guide for the
+  AEE Lightweight Agent Runtime.
 - `Abacus/AEE_MASTER_PLAN.md` — §9 (ADRs), §10.5
   (deliverables), §11 (release history).
 - `docs/AEE3_CAPABILITY_MATCHING_REPORT.md` — the

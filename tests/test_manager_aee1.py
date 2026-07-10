@@ -147,7 +147,7 @@ class TestManagerAEE1(unittest.TestCase):
         rec = db.upsert_worker(
             worker_id="w-1",
             worker_name="w-1",
-            worker_type="pi_agent",
+            worker_type="aee_lightweight",  # was "pi_agent" pre-AEE-4 Part B freeze
             hostname="m2",
             capabilities=["shell", "python"],
             workdir_allowlist=["/tmp"],
@@ -169,7 +169,7 @@ class TestManagerAEE1(unittest.TestCase):
         db.upsert_worker(
             worker_id="w-1",
             worker_name="w-1",
-            worker_type="pi_agent",
+            worker_type="aee_lightweight",  # was "pi_agent" pre-AEE-4 Part B freeze
             hostname="m2",
             capabilities=["shell"],
             workdir_allowlist=["/tmp"],
@@ -187,16 +187,16 @@ class TestManagerAEE1(unittest.TestCase):
         c = self.tm.create(title="c", type="ops", input_text="x")
         with db.transaction() as conn2:
             conn2.execute(
-                "UPDATE tasks SET adapter_name = 'pi_agent' WHERE task_id IN (?, ?)",
+                "UPDATE tasks SET adapter_name = 'aee_lightweight' WHERE task_id IN (?, ?)",
                 (a.task_id, b.task_id),
             )
             conn2.execute(
                 "UPDATE tasks SET adapter_name = 'claude_code' WHERE task_id = ?",
                 (c.task_id,),
             )
-        # A pi_agent worker should see a and b, not c.
+        # A aee_lightweight worker should see a and b, not c. (Historical comment: this was a pi_agent worker in the pre-AEE-4-Part-B test fixture.)
         for _ in range(2):
-            j = db.find_claimable_job(worker_type="pi_agent", capabilities=[])
+            j = db.find_claimable_job(worker_type="aee_lightweight", capabilities=[])
             self.assertIsNotNone(j)
             # Claim it and re-list.
             db.claim_job(
@@ -205,7 +205,7 @@ class TestManagerAEE1(unittest.TestCase):
                 claim_token_hash="x" * 64,
             )
         # Third call: nothing left.
-        j = db.find_claimable_job(worker_type="pi_agent", capabilities=[])
+        j = db.find_claimable_job(worker_type="aee_lightweight", capabilities=[])
         self.assertIsNone(j)
         # A claude_code worker should still see c.
         j2 = db.find_claimable_job(worker_type="claude_code", capabilities=[])

@@ -1,4 +1,4 @@
-// pi-agent/runtime/lib/result.js
+// aee-runtime/runtime/lib/result.js
 // Wraps the loop output into the canonical result JSON and
 // writes it to stdout. The daemon reads this single JSON
 // object; anything else on stdout is treated as a runtime

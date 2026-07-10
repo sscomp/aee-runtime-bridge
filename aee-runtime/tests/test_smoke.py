@@ -1,4 +1,4 @@
-"""pi-agent/tests/test_smoke.py — AEE-4 Part B closed-loop smoke test.
+"""aee-runtime/tests/test_smoke.py — AEE-4 Part B closed-loop smoke test.
 
 The end-to-end "register → claim → execute → complete" cycle,
 in-process. We:
@@ -6,7 +6,7 @@ in-process. We:
 1. Spin up the bridge's FastAPI app on a TestClient.
 2. Start the Pi Worker daemon in a subprocess (with --dry-run
    on the runtime, so no real LLM call).
-3. Create a Job via the bridge with `target_runtime="pi_agent"`
+3. Create a Job via the bridge with `target_runtime="aee_lightweight"`
    and `required_capabilities=["tool.shell"]`.
 4. Wait up to 10s for the Job to be claimed and completed.
 5. Assert the Job's `status` is `completed` and `output_text`
@@ -79,11 +79,11 @@ def _make_smoke_config(tmp: Path) -> Path:
         f"""
 bridge_base_url: "http://127.0.0.1:1"  # never actually called; we mock it via env
 bridge_api_key: "test-key"
-worker_id: "pi-smoke-01"
-worker_name: "pi-smoke-01"
-worker_type: "pi_agent"
+worker_id: "aee-smoke-01"
+worker_name: "aee-smoke-01"
+worker_type: "aee_lightweight"
 capabilities:
-  - "runtime.pi"
+  - "runtime.aee_runtime"
   - "tool.shell"
 workdir_root: "{tmp}/work"
 workdir_allowlist:
@@ -125,12 +125,12 @@ class TestClosedLoop(unittest.TestCase):
 
             # 1. Register a worker.
             reg = client.post("/v1/workers/register", json={
-                "worker_name": "pi-smoke-01",
-                "worker_type": "pi_agent",
-                "capabilities": ["runtime.pi", "tool.shell"],
+                "worker_name": "aee-smoke-01",
+                "worker_type": "aee_lightweight",
+                "capabilities": ["runtime.aee_runtime", "tool.shell"],
                 "workdir_allowlist": [str(tmp / "work")],
                 "max_concurrent": 1,
-                "runtime_name": "pi",
+                "runtime_name": "aee-runtime",
                 "runtime_version": "0.1.0",
                 "operating_system": "linux",
                 "architecture": "x86_64",
@@ -155,7 +155,7 @@ class TestClosedLoop(unittest.TestCase):
             job = client.post("/v1/jobs", json={
                 "title": "smoke test",
                 "input": "echo hello from pi",
-                "target_runtime": "pi_agent",
+                "target_runtime": "aee_lightweight",
                 "required_capabilities": ["tool.shell"],
             }, headers=headers)
             self.assertEqual(job.status_code, 200, job.text)
@@ -165,8 +165,8 @@ class TestClosedLoop(unittest.TestCase):
             # 4. Claim.
             claim = client.post("/v1/jobs/claim", json={
                 "worker_id": wid,
-                "worker_type": "pi_agent",
-                "capabilities": ["runtime.pi", "tool.shell"],
+                "worker_type": "aee_lightweight",
+                "capabilities": ["runtime.aee_runtime", "tool.shell"],
             }, headers=headers)
             self.assertEqual(claim.status_code, 200, claim.text)
             claim_token = claim.json()["claim_token"]
@@ -307,7 +307,7 @@ class TestEndToEndDryRun(unittest.TestCase):
                     [
                         str(ROOT / ".venv" / "bin" / "python"),
                         "-u",
-                        str(ROOT / "pi-agent" / "pi_worker.py"),
+                        str(ROOT / "aee-runtime" / "aee_runtime.py"),
                         "--config", str(live_cfg),
                         "--env-file", str(tmp / "provider.env"),
                     ],
@@ -333,13 +333,13 @@ class TestEndToEndDryRun(unittest.TestCase):
                                 "smoke",
                                 "ops",
                                 50,
-                                "pi_agent",
+                                "aee_lightweight",
                                 "queued",
                                 now,
                                 "echo hello from pi",
                                 "normal",
-                                "pi_agent",
-                                "pi_agent",
+                                "aee_lightweight",
+                                "aee_lightweight",
                                 '["tool.shell"]',
                             ),
                         )
@@ -377,8 +377,8 @@ class TestEndToEndDryRun(unittest.TestCase):
                         "SELECT worker_id, runtime_name FROM workers"
                     ).fetchall()
                     self.assertEqual(len(workers), 1)
-                    self.assertEqual(workers[0]["worker_id"], "pi-smoke-01")
-                    self.assertEqual(workers[0]["runtime_name"], "pi")
+                    self.assertEqual(workers[0]["worker_id"], "aee-smoke-01")
+                    self.assertEqual(workers[0]["runtime_name"], "aee-runtime")
                 finally:
                     daemon.terminate()
                     try:

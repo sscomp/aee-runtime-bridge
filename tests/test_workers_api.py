@@ -77,8 +77,8 @@ class TestWorkersAPI(unittest.TestCase):
 
     def test_register_then_repeat_is_idempotent(self):
         body = {
-            "worker_name": "pi-agent-m2-test",
-            "worker_type": "pi_agent",
+            "worker_name": "aee-runtime-m2-test",
+            "worker_type": "aee_lightweight",
             "hostname": "m2",
             "capabilities": ["shell", "filesystem", "python"],
             "workdir_allowlist": ["/home/ubuntu/hermes-runtime-bridge"],
@@ -107,8 +107,8 @@ class TestWorkersAPI(unittest.TestCase):
 
     def test_heartbeat_updates_last_heartbeat_at(self):
         body = {
-            "worker_name": "pi-agent-b2-01",
-            "worker_type": "pi_agent",
+            "worker_name": "aee-runtime-b2-01",
+            "worker_type": "aee_lightweight",
             "capabilities": ["shell"],
             "workdir_allowlist": ["/tmp"],
             "max_concurrent": 1,
@@ -133,7 +133,7 @@ class TestWorkersAPI(unittest.TestCase):
     def test_register_requires_bearer(self):
         body = {
             "worker_name": "noauth",
-            "worker_type": "pi_agent",
+            "worker_type": "aee_lightweight",
             "capabilities": [],
         }
         r = self.client.post("/workers/register", json=body)
@@ -148,7 +148,7 @@ class TestWorkersAPI(unittest.TestCase):
         body = {
             "worker_id": "bad/id",  # slash is not allowed
             "worker_name": "x",
-            "worker_type": "pi_agent",
+            "worker_type": "aee_lightweight",
         }
         r = self.client.post("/workers/register", json=body, headers=self.headers)
         self.assertEqual(r.status_code, 400)
@@ -157,7 +157,7 @@ class TestWorkersAPI(unittest.TestCase):
         for nm in ("a", "b", "c"):
             self.client.post(
                 "/workers/register",
-                json={"worker_name": nm, "worker_type": "pi_agent"},
+                json={"worker_name": nm, "worker_type": "aee_lightweight"},
                 headers=self.headers,
             )
         r = self.client.get("/workers", headers=self.headers)
@@ -196,8 +196,8 @@ class TestWorkersAPIAEE4(unittest.TestCase):
     def test_register_accepts_runtime_metadata(self):
         """The 8 new metadata fields round-trip through register + GET."""
         body = {
-            "worker_name": "pi-agent-aee4-01",
-            "worker_type": "pi_agent",
+            "worker_name": "aee-runtime-aee4-01",
+            "worker_type": "aee_lightweight",
             "capabilities": ["runtime.pi", "tool.shell"],
             "workdir_allowlist": ["/tmp"],
             "runtime_name": "pi",
@@ -233,7 +233,7 @@ class TestWorkersAPIAEE4(unittest.TestCase):
         response, status defaults to 'unknown'."""
         body = {
             "worker_name": "aee2-only-worker",
-            "worker_type": "pi_agent",
+            "worker_type": "aee_lightweight",
             "capabilities": ["shell"],
         }
         r = self.client.post("/workers/register", json=body, headers=self.headers)
@@ -255,7 +255,7 @@ class TestWorkersAPIAEE4(unittest.TestCase):
         row and stamps `last_status_change_at`."""
         body = {
             "worker_name": "aee4-hb-01",
-            "worker_type": "pi_agent",
+            "worker_type": "aee_lightweight",
             "capabilities": ["shell"],
         }
         reg = self.client.post("/workers/register", json=body, headers=self.headers).json()
@@ -291,7 +291,7 @@ class TestWorkersAPIAEE4(unittest.TestCase):
         """Contract: unknown status is HTTP 400, not silently coerced."""
         body = {
             "worker_name": "aee4-hb-bad",
-            "worker_type": "pi_agent",
+            "worker_type": "aee_lightweight",
             "capabilities": ["shell"],
         }
         reg = self.client.post("/workers/register", json=body, headers=self.headers).json()
@@ -309,7 +309,7 @@ class TestWorkersAPIAEE4(unittest.TestCase):
         legacy /jobs/... and /workers/... paths."""
         body = {
             "worker_name": "aee4-v1-01",
-            "worker_type": "pi_agent",
+            "worker_type": "aee_lightweight",
             "capabilities": ["shell"],
             "runtime_name": "pi",
             "runtime_version": "0.1.0",

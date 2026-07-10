@@ -45,7 +45,7 @@ class Job:
     # Set on worker claim (AEE-2):
     worker_id: Optional[str] = None
     # Free-form payload for adapters that need more than the above
-    # (e.g. Pi Agent step list, Claude Code repo path).
+    # (e.g. AEE Lightweight Agent Runtime step list, Claude Code repo path).
     spec: Dict[str, Any] = field(default_factory=dict)
     # Optional artifact paths the dispatcher should stat() at
     # completion (Phase 4 delivery).

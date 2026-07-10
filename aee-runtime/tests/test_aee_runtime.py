@@ -1,4 +1,4 @@
-"""pi-agent/tests/test_pi_worker.py — AEE-4 Part B Pi Worker unit tests.
+"""aee-runtime/tests/test_aee_runtime.py — AEE-4 Part B AEE Lightweight Agent Runtime unit tests.
 
 11 tests covering the daemon's full lifecycle. Mocks the
 HTTP bridge and the node runtime; the daemon never talks to
@@ -26,12 +26,12 @@ os.environ.setdefault("PYTHONPATH", "/home/ubuntu/hermes-runtime-bridge")
 ROOT = Path("/home/ubuntu/hermes-runtime-bridge")
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(ROOT / "pi-agent") not in sys.path:
-    sys.path.insert(0, str(ROOT / "pi-agent"))
+if str(ROOT / "aee-runtime") not in sys.path:
+    sys.path.insert(0, str(ROOT / "aee-runtime"))
 
-from pi_worker import (  # noqa: E402
+from aee_runtime import (  # noqa: E402
     Bridge,
-    PiWorker,
+    AeeRuntimeWorker,
     STATUS_BUSY,
     STATUS_IDLE,
     STATUS_OFFLINE,
@@ -54,11 +54,11 @@ def _make_config(tmp: Path, *, runtime_flags=()) -> Path:
         f"""
 bridge_base_url: "http://127.0.0.1:9999"
 bridge_api_key: "${{BRIDGE_API_KEY}}"
-worker_id: "pi-test-01"
-worker_name: "pi-test-01"
-worker_type: "pi_agent"
+worker_id: "aee-test-01"
+worker_name: "aee-test-01"
+worker_type: "aee_lightweight"
 capabilities:
-  - "runtime.pi"
+  - "runtime.aee_runtime"
   - "tool.shell"
 workdir_root: "{tmp}/work"
 workdir_allowlist:
@@ -94,8 +94,8 @@ def _make_claim_response(job_id="T-TEST-1", input_text="echo hi", token="plain-t
         "mode": "normal",
         "input": input_text,
         "session_id": None,
-        "runtime_type": "pi_agent",
-        "adapter_name": "pi_agent",
+        "runtime_type": "aee_lightweight",
+        "adapter_name": "aee_lightweight",
         "external_run_id": None,
         "timeout_seconds": 60,
         "expected_artifacts": [],
@@ -119,8 +119,8 @@ class TestConfigLoading(unittest.TestCase):
             # that the config picked up whatever the env says.
             expected = os.environ.get("BRIDGE_API_KEY", "test-key")
             cfg = load_config(cfg_path)
-            self.assertEqual(cfg["worker_type"], "pi_agent")
-            self.assertEqual(cfg["worker_id"], "pi-test-01")
+            self.assertEqual(cfg["worker_type"], "aee_lightweight")
+            self.assertEqual(cfg["worker_id"], "aee-test-01")
             self.assertEqual(cfg["bridge_api_key"], expected)
             env = load_env_file(tmp / "provider.env")
             self.assertEqual(env["PI_PROVIDER_API_KEY"], "sk-test-1234567890")
@@ -129,14 +129,14 @@ class TestConfigLoading(unittest.TestCase):
 
 class TestMetadataCollection(unittest.TestCase):
     def test_collect_metadata_returns_all_8_fields(self):
-        env = {"PI_PROVIDER_RUNTIME_NAME": "pi", "PI_PROVIDER_RUNTIME_VERSION": "0.1.0"}
+        env = {"PI_PROVIDER_RUNTIME_NAME": "aee-runtime", "PI_PROVIDER_RUNTIME_VERSION": "0.1.0"}
         meta = collect_metadata(env)
         for k in (
             "runtime_name", "runtime_version", "operating_system", "architecture",
             "python_version", "node_version", "git_version", "start_time",
         ):
             self.assertIn(k, meta, f"missing field: {k}")
-        self.assertEqual(meta["runtime_name"], "pi")
+        self.assertEqual(meta["runtime_name"], "aee-runtime")
         self.assertEqual(meta["runtime_version"], "0.1.0")
         # start_time is ISO-8601 UTC
         self.assertRegex(meta["start_time"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
@@ -151,18 +151,18 @@ class TestRegister(unittest.TestCase):
             with mock.patch.object(Bridge, "post") as mock_post:
                 mock_post.return_value = (200, {
                     "version": "v1",
-                    "worker_id": "pi-test-01",
+                    "worker_id": "aee-test-01",
                     "registered": True,
                     "registered_at": "2026-07-10T00:00:00Z",
-                    "worker_type": "pi_agent",
+                    "worker_type": "aee_lightweight",
                 })
-                worker = PiWorker(cfg, env)
+                worker = AeeRuntimeWorker(cfg, env)
                 ok = worker._register()
                 self.assertTrue(ok)
                 # Inspect the body of the register call.
                 args, _ = mock_post.call_args
                 body = args[1]
-                self.assertEqual(body["worker_type"], "pi_agent")
+                self.assertEqual(body["worker_type"], "aee_lightweight")
                 for k in (
                     "runtime_name", "runtime_version", "operating_system", "architecture",
                     "python_version", "node_version", "git_version", "start_time",
@@ -178,12 +178,12 @@ class TestRegister(unittest.TestCase):
             with mock.patch.object(Bridge, "post") as mock_post:
                 mock_post.return_value = (200, {
                     "version": "v1",
-                    "worker_id": "pi-test-01",
+                    "worker_id": "aee-test-01",
                     "registered": True,
                     "registered_at": "2026-07-10T00:00:00Z",
-                    "worker_type": "pi_agent",
+                    "worker_type": "aee_lightweight",
                 })
-                worker = PiWorker(cfg, env)
+                worker = AeeRuntimeWorker(cfg, env)
                 worker._register()
                 args, _ = mock_post.call_args
                 self.assertEqual(args[0], "/v1/workers/register", "must call /v1/... not /...")
@@ -202,7 +202,7 @@ class TestLifecycle(unittest.TestCase):
             tmp = Path(td)
             cfg = load_config(_make_config(tmp, runtime_flags=["--dry-run"]))
             env = load_env_file(tmp / "provider.env")
-            worker = PiWorker(cfg, env)
+            worker = AeeRuntimeWorker(cfg, env)
             worker.worker_id = cfg["worker_id"]
             post_calls = []
             def fake_post(self, path, body):
@@ -215,10 +215,10 @@ class TestLifecycle(unittest.TestCase):
                     return (200, {"version": "v1", "job_id": "T-TEST-1", "status": "failed"})
                 return (200, {"version": "v1", "status": body.get("status", "idle")})
             with mock.patch.object(Bridge, "post", new=fake_post), \
-                 mock.patch.object(PiWorker, "_heartbeat_loop", lambda self: None), \
-                 mock.patch.object(PiWorker, "_start_heartbeat_thread", lambda self: None), \
-                 mock.patch.object(PiWorker, "_stop_heartbeat_thread", lambda self: None), \
-                 mock.patch("pi_worker.subprocess.Popen") as mock_popen:
+                 mock.patch.object(AeeRuntimeWorker, "_heartbeat_loop", lambda self: None), \
+                 mock.patch.object(AeeRuntimeWorker, "_start_heartbeat_thread", lambda self: None), \
+                 mock.patch.object(AeeRuntimeWorker, "_stop_heartbeat_thread", lambda self: None), \
+                 mock.patch("aee_runtime.subprocess.Popen") as mock_popen:
                 proc = mock.MagicMock()
                 proc.communicate.return_value = (
                     json.dumps({
@@ -250,8 +250,8 @@ class TestLifecycle(unittest.TestCase):
             # The claim body should advertise the worker's
             # worker_type and capabilities.
             claim_body = next(b for (p, b) in post_calls if p == "/v1/jobs/claim")
-            self.assertEqual(claim_body["worker_type"], "pi_agent")
-            self.assertIn("runtime.pi", claim_body["capabilities"])
+            self.assertEqual(claim_body["worker_type"], "aee_lightweight")
+            self.assertIn("runtime.aee_runtime", claim_body["capabilities"])
 
     def test_claim_with_no_jobs_sleeps_and_retries(self):
         # Verify that a 404 from /v1/jobs/claim causes the
@@ -260,7 +260,7 @@ class TestLifecycle(unittest.TestCase):
             tmp = Path(td)
             cfg = load_config(_make_config(tmp))
             env = load_env_file(tmp / "provider.env")
-            worker = PiWorker(cfg, env)
+            worker = AeeRuntimeWorker(cfg, env)
             worker.worker_id = cfg["worker_id"]
             post_calls = []
             def fake_post(self, path, body):
@@ -269,8 +269,8 @@ class TestLifecycle(unittest.TestCase):
                     return (404, {"detail": "no claimable job"})
                 return (200, {"version": "v1", "status": "idle"})
             with mock.patch.object(Bridge, "post", new=fake_post), \
-                 mock.patch.object(PiWorker, "_start_heartbeat_thread", lambda self: None), \
-                 mock.patch.object(PiWorker, "_stop_heartbeat_thread", lambda self: None):
+                 mock.patch.object(AeeRuntimeWorker, "_start_heartbeat_thread", lambda self: None), \
+                 mock.patch.object(AeeRuntimeWorker, "_stop_heartbeat_thread", lambda self: None):
                 # Patch the shutdown Event's wait so the
                 # "sleep" between claims returns immediately.
                 real_wait = worker._shutdown.wait
@@ -307,7 +307,7 @@ class TestHeartbeatStatus(unittest.TestCase):
             tmp = Path(td)
             cfg = load_config(_make_config(tmp))
             env = load_env_file(tmp / "provider.env")
-            worker = PiWorker(cfg, env)
+            worker = AeeRuntimeWorker(cfg, env)
             worker.worker_id = cfg["worker_id"]
             args, _ = self._drive_one_heartbeat(worker)
             self.assertEqual(args[1]["status"], STATUS_IDLE)
@@ -317,7 +317,7 @@ class TestHeartbeatStatus(unittest.TestCase):
             tmp = Path(td)
             cfg = load_config(_make_config(tmp))
             env = load_env_file(tmp / "provider.env")
-            worker = PiWorker(cfg, env)
+            worker = AeeRuntimeWorker(cfg, env)
             worker.worker_id = cfg["worker_id"]
             worker._current_status = STATUS_BUSY
             worker._current_status_message = "executing T-1"
@@ -333,8 +333,8 @@ class TestErrorHandling(unittest.TestCase):
             tmp = Path(td)
             cfg = load_config(_make_config(tmp))
             env = load_env_file(tmp / "provider.env")
-            worker = PiWorker(cfg, env)
-            worker.worker_id = "pi-test-01"
+            worker = AeeRuntimeWorker(cfg, env)
+            worker.worker_id = "aee-test-01"
             with mock.patch.object(Bridge, "post") as mock_post:
                 mock_post.return_value = (200, {
                     "version": "v1", "job_id": "T-1", "status": "failed", "error": "allowlist blocked: echo"
@@ -349,8 +349,8 @@ class TestErrorHandling(unittest.TestCase):
             tmp = Path(td)
             cfg = load_config(_make_config(tmp))
             env = load_env_file(tmp / "provider.env")
-            worker = PiWorker(cfg, env)
-            worker.worker_id = "pi-test-01"
+            worker = AeeRuntimeWorker(cfg, env)
+            worker.worker_id = "aee-test-01"
             import subprocess as _sp
             with mock.patch.object(_sp, "Popen") as mock_popen:
                 proc = mock.MagicMock()
@@ -385,7 +385,7 @@ class TestErrorHandling(unittest.TestCase):
                 "PI_PROVIDER_MODEL=gpt-4o-mini\n",
                 encoding="utf-8",
             )
-            with mock.patch("sys.argv", ["pi_worker", "--config", str(cfg_path)]):
+            with mock.patch("sys.argv", ["aee_runtime", "--config", str(cfg_path)]):
                 rc = main(["--config", str(cfg_path)])
             self.assertEqual(rc, 3, f"expected exit 3, got {rc}")
 
@@ -400,8 +400,8 @@ class TestCapabilityCheck(unittest.TestCase):
             tmp = Path(td)
             cfg = load_config(_make_config(tmp))
             env = load_env_file(tmp / "provider.env")
-            worker = PiWorker(cfg, env)
-            worker.worker_id = "pi-test-01"
+            worker = AeeRuntimeWorker(cfg, env)
+            worker.worker_id = "aee-test-01"
             # Simulate the bridge returning a Job with a capability
             # the worker doesn't have, then check that the daemon's
             # "unsupported capability" guard catches it.
@@ -428,8 +428,8 @@ class TestOfflineShutdown(unittest.TestCase):
             tmp = Path(td)
             cfg = load_config(_make_config(tmp))
             env = load_env_file(tmp / "provider.env")
-            worker = PiWorker(cfg, env)
-            worker.worker_id = "pi-test-01"
+            worker = AeeRuntimeWorker(cfg, env)
+            worker.worker_id = "aee-test-01"
             with mock.patch.object(Bridge, "post") as mock_post:
                 mock_post.return_value = (200, {"version": "v1", "status": STATUS_OFFLINE})
                 worker._send_offline_then_exit()

@@ -1,4 +1,4 @@
-// pi-agent/runtime/lib/loop.js
+// aee-runtime/runtime/lib/loop.js
 // The function-calling loop. Up to `max_steps` iterations:
 //   1. Call the LLM with the current messages + tool defs.
 //   2. If finish_reason === "stop", return the assistant's
@@ -27,7 +27,7 @@ export async function runLoop({ spec, provider, logger = () => {} }) {
     {
       role: "system",
       content: [
-        "You are Pi Agent, a careful and concise worker that executes a single user instruction.",
+        "You are the AEE Lightweight Agent Runtime, a careful and concise worker that executes a single user instruction.",
         "You operate inside a per-job workdir. Every shell command, file read, and file write must be inside that workdir.",
         "The shell tool's first token must be in the allowlist. If a command is not in the allowlist, do not call shell with it; either rewrite the command to use an allowed binary, or return your final answer noting the limitation.",
         "Prefer reading files before writing them. Prefer running one shell command at a time and observing the output before issuing the next.",

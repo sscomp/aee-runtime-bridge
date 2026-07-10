@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
-"""pi-agent/pi_worker.py — AEE-4 Part B Pi Worker daemon.
+"""aee-runtime/aee_runtime.py — AEE-4 Part B Lightweight Agent Runtime daemon.
 
-The first AEE-4 conformant Worker runtime. Speaks the
-Worker Runtime Contract over HTTP to the bridge at
-/v1/workers/register, /v1/workers/{id}/heartbeat,
+The first AEE-4 conformant Worker runtime. **In-house** —
+we do not install or wrap an external "Pi Agent" / "Pi Coding
+Agent" package. The runtime is a from-scratch Node.js
+LLM agent (`aee-runtime/runtime/aee-runtime.js`) plus a
+small Python daemon (this file) that handles the AEE
+lifecycle. The two pieces communicate via a JSON spec
+file at `{workdir_root}/jobs/{job_id}/spec.json`.
+
+The runtime is named "AEE Lightweight Agent Runtime" to
+distinguish it from any third-party "Pi Agent" product
+(`badlogic/pi-mono`, `earendil-works/pi-mono`,
+`pi-agent-core`, etc., none of which are used here — see
+`docs/AEE4_FINAL_VALIDATION_REPORT.md` §1 for the full
+rationale and the original Phase 2 research report).
+
+Speaks the Worker Runtime Contract over HTTP to the
+bridge at /v1/workers/register, /v1/workers/{id}/heartbeat,
 /v1/jobs/claim, /v1/jobs/{id}/logs, /v1/jobs/{id}/complete,
-/v1/jobs/{id}/fail. Spawns the Node.js pi-agent-runtime for
-each claimed Job, streams its logs to the bridge, and reports
-the final result.
+/v1/jobs/{id}/fail. Spawns the Node.js aee-runtime for
+each claimed Job, streams its logs to the bridge, and
+reports the final result.
 
 The daemon is single-threaded, except for a background
 heartbeat thread while a Job is running. The background
-thread is the only reason for threading — the rest of the
-daemon is a simple `while True` loop.
+thread is the only reason for threading — the rest of
+the daemon is a simple `while True` loop.
 
 Run:
 
-    python3 -u pi_worker.py --config /path/to/config.yaml
+    python3 -u aee_runtime.py --config /path/to/config.yaml
 
 The daemon exits 3 if the provider env file is missing or has
 placeholder values. All other failures are non-fatal: the
@@ -47,11 +61,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    import yaml  # PyYAML >= 6.0; see pi-agent/requirements.txt
+    import yaml  # PyYAML >= 6.0; see aee-runtime/requirements.txt
 except ImportError:  # pragma: no cover
     print(
-        "[pi_worker] PyYAML is required. Install with: "
-        "pip install -r pi-agent/requirements.txt",
+        "[aee_runtime] PyYAML is required. Install with: "
+        "pip install -r aee-runtime/requirements.txt",
         file=sys.stderr,
     )
     sys.exit(2)
@@ -61,7 +75,7 @@ except ImportError:  # pragma: no cover
 # Logging
 # ---------------------------------------------------------------------------
 
-log = logging.getLogger("pi_worker")
+log = logging.getLogger("aee_runtime")
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -79,6 +93,11 @@ def _setup_logging(verbose: bool) -> None:
 # ---------------------------------------------------------------------------
 
 # Status names from the AEE-4 Worker Runtime Contract §5.
+# We exercise `idle`, `busy`, and `offline` in the daemon's
+# runtime path; `draining` and `error` are reserved in the
+# vocabulary but not yet sent by the daemon (no graceful
+# drain signal in v1, no "error" path that doesn't already
+# fail the Job). See docs/AEE4_FINAL_VALIDATION_REPORT.md §4.
 STATUS_IDLE = "idle"
 STATUS_BUSY = "busy"
 STATUS_OFFLINE = "offline"
@@ -86,7 +105,7 @@ STATUS_DRAINING = "draining"
 STATUS_ERROR = "error"
 
 # Exit code from the node runtime that we map to /fail reasons
-# (see runtime/pi-agent-runtime.js docstring). Codes 1-7 are
+# (see runtime/aee-runtime.js docstring). Codes 1-7 are
 # the runtime's contract; 124 is the well-known SIGKILL exit.
 _RUNTIME_EXIT_TO_ERROR = {
     2: "invalid job spec",
@@ -228,7 +247,8 @@ def collect_metadata(env: Dict[str, str]) -> Dict[str, Any]:
     node_version = _safe_subprocess(["node", "--version"]) or ""
     git_version = _safe_subprocess(["git", "--version"]) or ""
     return {
-        "runtime_name": env.get("PI_PROVIDER_RUNTIME_NAME", "pi"),
+        # AEE-4 Part B; bump in AEE-5+ when the runtime evolves.
+        "runtime_name": env.get("PI_PROVIDER_RUNTIME_NAME", "aee-runtime"),
         "runtime_version": env.get("PI_PROVIDER_RUNTIME_VERSION", "0.1.0"),
         "operating_system": platform.system().lower() or "unknown",
         "architecture": platform.machine() or "unknown",
@@ -257,15 +277,15 @@ def _safe_subprocess(cmd: List[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-class PiWorker:
+class AeeRuntimeWorker:
     def __init__(self, cfg: Dict[str, Any], env: Dict[str, str]):
         self.cfg = cfg
         self.env = env
         self.bridge = Bridge(cfg["bridge_base_url"], cfg["bridge_api_key"])
         self.worker_id: Optional[str] = None
-        self.worker_type = cfg["worker_type"]
+        self.worker_type = cfg["worker_type"]  # see config.example.yaml; default "aee_lightweight"
         self.capabilities = cfg.get("capabilities", [
-            "runtime.pi", "tool.shell", "tool.python", "tool.git", "tool.filesystem",
+            "runtime.aee_runtime", "tool.shell", "tool.python", "tool.git", "tool.filesystem",
         ])
         self._shutdown = threading.Event()
         self._current_status: str = STATUS_IDLE
@@ -463,7 +483,7 @@ class PiWorker:
         runtime_path = self.cfg.get("runtime_path") or self._default_runtime_path()
         flags = self.cfg.get("runtime_flags", [])
         cmd = ["node", str(runtime_path), "--job-file", str(spec_path), *flags]
-        log.info("spawning runtime: %s", " ".join(cmd))
+        log.info("spawning aee-runtime: %s", " ".join(cmd))
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -517,8 +537,8 @@ class PiWorker:
         self._fail_job(job_id, claim_token_hash, msg)
 
     def _default_runtime_path(self) -> Path:
-        # Default: <repo>/pi-agent/runtime/pi-agent-runtime.js
-        return Path(__file__).resolve().parent / "runtime" / "pi-agent-runtime.js"
+        # Default: <repo>/aee-runtime/runtime/aee-runtime.js
+        return Path(__file__).resolve().parent / "runtime" / "aee-runtime.js"
 
     def _log_line(self, job_id: str, claim_token_hash: str, line: str) -> None:
         max_bytes = int(self.cfg.get("log_max_bytes", 4096))
@@ -582,7 +602,7 @@ class PiWorker:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Pi Worker daemon (AEE-4 Part B)")
+    parser = argparse.ArgumentParser(description="AEE Lightweight Agent Runtime daemon (AEE-4 Part B)")
     parser.add_argument("--config", required=True, type=Path, help="path to config.yaml")
     parser.add_argument("--env-file", type=Path, default=None, help="path to provider env file (overrides config)")
     parser.add_argument("--verbose", "-v", action="store_true", help="DEBUG-level logging")
@@ -601,7 +621,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if k.startswith("PI_") and k not in env:
             env[k] = v
     try:
-        return PiWorker(cfg, env).run()
+        return AeeRuntimeWorker(cfg, env).run()
     except KeyboardInterrupt:
         log.info("interrupted; exiting")
         return 130

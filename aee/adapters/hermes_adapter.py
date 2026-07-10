@@ -1,7 +1,7 @@
 """HermesAdapter — wraps the Hermes M2 `/v1/runs` API.
 
 Extracted from `app.py` (AEE-1) so that the dispatcher can talk to
-Hermes the same way it will talk to Pi Agent / Claude Code Agent
+Hermes the same way it will talk to the AEE Lightweight Agent Runtime / Claude Code Agent
 in later phases. The wire-level semantics are unchanged.
 
 Endpoints wrapped

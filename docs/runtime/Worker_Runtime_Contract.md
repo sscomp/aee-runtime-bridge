@@ -72,7 +72,7 @@ Register a Worker. Idempotent: re-registering the same
 |---|---|---|---|
 | `worker_id` | string | optional | Auto-derived from `worker_name` if absent. Charset `[A-Za-z0-9_.-]{1,64}`. |
 | `worker_name` | string | required | Human-readable name. |
-| `worker_type` | string | required | e.g. `pi_agent`, `claude_code`, `hermes`, `mcp`. **This is the key the dispatcher uses to match a Worker to a Job's `adapter_name` field.** |
+| `worker_type` | string | required | e.g. `aee_lightweight` (the AEE Lightweight Agent Runtime; see §3.4 of AEE4_FINAL_VALIDATION_REPORT.md for the rename history), `claude_code`, `hermes`, `mcp`. **This is the key the dispatcher uses to match a Worker to a Job's `adapter_name` field.** |
 | `hostname` | string | optional | The host the Worker runs on. |
 | `capabilities` | string[] | optional | Namespaced capability strings (§6). Default `[]`. |
 | `workdir_allowlist` | string[] | optional | Path prefixes the Worker is allowed to write to. Default `[]`. |
@@ -93,10 +93,10 @@ Register a Worker. Idempotent: re-registering the same
 ```json
 {
   "version": "v1",
-  "worker_id": "pi-agent-m2-001",
+  "worker_id": "aee-runtime-m2-001",
   "registered": true,
   "registered_at": "2026-07-10T00:00:00Z",
-  "worker_type": "pi_agent"
+  "worker_type": "aee_lightweight"
 }
 ```
 
@@ -122,7 +122,7 @@ Liveness ping. Also where the Worker reports its current
 ```json
 {
   "version": "v1",
-  "worker_id": "pi-agent-m2-001",
+  "worker_id": "aee-runtime-m2-001",
   "last_heartbeat_at": "2026-07-10T00:00:05Z",
   "last_job_id": "TASK-20260710-0010",
   "status": "busy",
@@ -171,8 +171,8 @@ Pull a Job for the Worker. Returns either a Job + claim token
   "mode": "normal",
   "input": "echo hello from pi",
   "session_id": null,
-  "runtime_type": "pi_agent",
-  "adapter_name": "pi_agent",
+  "runtime_type": "aee_lightweight",
+  "adapter_name": "aee_lightweight",
   "external_run_id": null,
   "timeout_seconds": 900,
   "expected_artifacts": [],
@@ -560,7 +560,7 @@ dispatcher is forgiving.
 
 A conformant Worker MUST declare at least one `runtime.*`
 capability whose `<type>` matches its `worker_type`. The
-Pi Worker declares `runtime.pi` and uses `worker_type="pi_agent"`.
+The AEE Lightweight Agent Runtime declares `runtime.aee_runtime` and uses `worker_type="aee_lightweight"` (the values shipped in the AEE-4 Part B reference implementation; the contract itself does not require these specific names — any name is fine as long as it is consistent).
 The dispatcher does not enforce this match today (the
 matcher only checks the worker_type vs the job's
 `adapter_name`), but the convention is enforced by the
@@ -592,10 +592,10 @@ curl -sS -X POST http://127.0.0.1:8787/v1/workers/register \
   -H "Authorization: Bearer br_xxx" \
   -H "Content-Type: application/json" \
   -d '{
-    "worker_name": "pi-agent-m2-001",
-    "worker_type": "pi_agent",
+    "worker_name": "aee-runtime-m2-001",
+    "worker_type": "aee_lightweight",
     "capabilities": ["runtime.pi", "tool.shell", "tool.python", "tool.git"],
-    "workdir_allowlist": ["/home/ubuntu/hermes-runtime-bridge/runtime_data/pi-agent"],
+    "workdir_allowlist": ["/home/ubuntu/hermes-runtime-bridge/runtime_data/aee-runtime"],
     "max_concurrent": 1,
     "runtime_name": "pi",
     "runtime_version": "0.1.0",
@@ -606,11 +606,11 @@ curl -sS -X POST http://127.0.0.1:8787/v1/workers/register \
     "git_version": "2.34.1",
     "start_time": "2026-07-10T00:00:00Z"
   }'
-# {"version":"v1","worker_id":"pi-agent-m2-001","registered":true,
-#  "registered_at":"2026-07-10T00:00:00Z","worker_type":"pi_agent"}
+# {"version":"v1","worker_id":"aee-runtime-m2-001","registered":true,
+#  "registered_at":"2026-07-10T00:00:00Z","worker_type":"aee_lightweight"}
 
 # 2. Heartbeat (between Jobs)
-curl -sS -X POST http://127.0.0.1:8787/v1/workers/pi-agent-m2-001/heartbeat \
+curl -sS -X POST http://127.0.0.1:8787/v1/workers/aee-runtime-m2-001/heartbeat \
   -H "Authorization: Bearer br_xxx" -H "Content-Type: application/json" \
   -d '{"status": "idle"}'
 # {"version":"v1","worker_id":"...","last_heartbeat_at":"...","status":"idle", ...}
@@ -621,7 +621,7 @@ curl -sS -X POST http://127.0.0.1:8787/v1/jobs \
   -d '{
     "title": "echo test",
     "input": "echo hello from pi",
-    "target_runtime": "pi_agent",
+    "target_runtime": "aee_lightweight",
     "required_capabilities": ["tool.shell"]
   }'
 # {"version":"v1","job_id":"TASK-20260710-0010", "status":"queued", ...}
@@ -630,8 +630,8 @@ curl -sS -X POST http://127.0.0.1:8787/v1/jobs \
 CLAIM=$(curl -sS -X POST http://127.0.0.1:8787/v1/jobs/claim \
   -H "Authorization: Bearer br_xxx" -H "Content-Type: application/json" \
   -d '{
-    "worker_id": "pi-agent-m2-001",
-    "worker_type": "pi_agent",
+    "worker_id": "aee-runtime-m2-001",
+    "worker_type": "aee_lightweight",
     "capabilities": ["runtime.pi", "tool.shell", "tool.python", "tool.git"]
   }')
 echo "$CLAIM" | jq .
@@ -641,7 +641,7 @@ TOKEN=$(echo "$CLAIM" | jq -r .claim_token)
 TOKEN_HASH=$(echo -n "$TOKEN" | sha256sum | cut -d' ' -f1)
 
 # 5. Heartbeat the running Job (also report Worker status=busy)
-curl -sS -X POST http://127.0.0.1:8787/v1/workers/pi-agent-m2-001/heartbeat \
+curl -sS -X POST http://127.0.0.1:8787/v1/workers/aee-runtime-m2-001/heartbeat \
   -H "Authorization: Bearer br_xxx" -H "Content-Type: application/json" \
   -d "{\"status\": \"busy\", \"status_message\": \"executing $JOB_ID\", \"job_id\": \"$JOB_ID\"}"
 
@@ -665,7 +665,7 @@ curl -sS -X POST http://127.0.0.1:8787/v1/jobs/$JOB_ID/complete \
 # {"version":"v1","job_id":"TASK-20260710-0010","status":"completed"}
 
 # 8. Heartbeat (back to idle)
-curl -sS -X POST http://127.0.0.1:8787/v1/workers/pi-agent-m2-001/heartbeat \
+curl -sS -X POST http://127.0.0.1:8787/v1/workers/aee-runtime-m2-001/heartbeat \
   -H "Authorization: Bearer br_xxx" -H "Content-Type: application/json" \
   -d '{"status": "idle"}'
 ```
@@ -775,6 +775,7 @@ above is the floor; future versions will extend it.
 - ADR-003 — Capability Naming Convention. (`AEE_MASTER_PLAN.md` §9 + `AEE4_CAPABILITY_NAMING_SPEC.md`)
 - ADR-004 — Capability Extension Point. (`AEE_MASTER_PLAN.md` §9 + `AEE4_CAPABILITY_EXTENSION_POINT.md`)
 - ADR-005 — Future Matcher Design. (`AEE_MASTER_PLAN.md` §9 + `AEE4_FUTURE_MATCHER_DESIGN.md`)
-- `docs/AEE4_PI_REFERENCE_IMPLEMENTATION_REPORT.md` — the Pi Worker as the first conformant runtime.
+- `docs/AEE4_AEE_RUNTIME_REPORT.md` — the AEE Lightweight Agent Runtime (in-house; not a third-party "Pi Agent" package) as the first conformant runtime.
+- `docs/AEE4_FINAL_VALIDATION_REPORT.md` — the Conditional Approval remediation report (2026-07-10); includes the runtime rename history, accurate test counts, and the live-provider smoke test path.
 - `docs/AEE_RUNTIME_INTEGRATION_GUIDE.md` — the runtime-agnostic integration handbook.
 - `Abacus/AEE_MASTER_PLAN.md` — the master plan; §10.5 enumerates AEE-4 deliverables.

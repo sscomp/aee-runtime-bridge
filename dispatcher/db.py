@@ -766,8 +766,8 @@ def _task_claim_eligible_where(
       * NOT cancelled
       * approval_required = 0 OR approval_state = 'approved'
       * adapter_name == worker_type (runtime routing; 'hermes'-typed
-        workers claim 'hermes'-typed jobs, 'pi_agent' claims
-        'pi_agent', etc.)
+        workers claim 'hermes'-typed jobs, 'aee_lightweight' claims
+        'aee_lightweight', etc.)
       * required_capabilities ⊆ worker_capabilities  (AEE-3)
         An empty required_capabilities list always satisfies the
         subset check, so the legacy "any worker can claim" behaviour

@@ -158,7 +158,7 @@ class Watcher:
     async def _tick(self) -> None:
         # 1) Poll running tasks via the runtime adapter. The
         # adapter is resolved per-task via
-        # `adapter_registry.get(task.adapter_name)` so Pi Agent /
+        # `adapter_registry.get(task.adapter_name)` so AEE Lightweight Agent Runtime /
         # Claude Code Agent / MCP adapters all flow through the
         # same code path.
         running = self._manager.list(status="running", limit=200)
