@@ -134,6 +134,60 @@ _AEE3_MIGRATIONS: list[tuple[str, str]] = [
     ),
 ]
 
+# AEE-4: Worker metadata + status. Adds 11 columns to `workers` so any
+# registered worker can self-describe its runtime, environment, and
+# current state. The columns are NULLable except `status`, which
+# defaults to 'unknown' for backward compat with pre-AEE-4 workers.
+# The full vocabulary and semantics live in
+# `docs/runtime/Worker_Runtime_Contract.md` §3 and §4.
+_AEE4_MIGRATIONS: list[tuple[str, str, str]] = [
+    # (column_name, ALTER statement, default)
+    # Worker runtime self-description (ADR-006 + contract §3).
+    ("runtime_name",      "ALTER TABLE workers ADD COLUMN runtime_name TEXT",       "NULL"),
+    ("runtime_version",   "ALTER TABLE workers ADD COLUMN runtime_version TEXT",    "NULL"),
+    ("operating_system",  "ALTER TABLE workers ADD COLUMN operating_system TEXT",   "NULL"),
+    ("architecture",      "ALTER TABLE workers ADD COLUMN architecture TEXT",       "NULL"),
+    ("python_version",    "ALTER TABLE workers ADD COLUMN python_version TEXT",     "NULL"),
+    ("node_version",      "ALTER TABLE workers ADD COLUMN node_version TEXT",       "NULL"),
+    ("git_version",       "ALTER TABLE workers ADD COLUMN git_version TEXT",        "NULL"),
+    ("start_time",        "ALTER TABLE workers ADD COLUMN start_time TEXT",         "NULL"),
+    # Worker status (ADR-008 + contract §4). Default 'unknown' for
+    # pre-AEE-4 rows; new workers set their real status on the
+    # first heartbeat.
+    ("status",                 "ALTER TABLE workers ADD COLUMN status TEXT NOT NULL DEFAULT 'unknown'", "'unknown'"),
+    ("status_message",         "ALTER TABLE workers ADD COLUMN status_message TEXT", "NULL"),
+    ("last_status_change_at",  "ALTER TABLE workers ADD COLUMN last_status_change_at TEXT", "NULL"),
+]
+
+
+# ---------------------------------------------------------------------------
+# AEE-4: Worker status vocabulary (canonical for the runtime contract)
+# ---------------------------------------------------------------------------
+
+
+# The 5-status set from `docs/runtime/Worker_Runtime_Contract.md` §4.
+# `unknown` is the 6th value used as the schema default for pre-AEE-4
+# rows; it is NOT a documented status, just a "we have no idea" marker.
+WORKER_STATUSES = (
+    "idle",
+    "busy",
+    "offline",
+    "draining",
+    "error",
+    "unknown",
+)
+
+
+def is_valid_status(status: str) -> bool:
+    """True iff `status` is one of the canonical Worker Status values.
+
+    The bridge accepts only these 6 strings on `POST /v1/workers/.../heartbeat`;
+    any other value is rejected with HTTP 400. Backward-compat: `unknown`
+    is in the set because the schema default is `'unknown'`; old rows
+    that never had a status set will report `unknown` and that's fine.
+    """
+    return isinstance(status, str) and status in WORKER_STATUSES
+
 
 # ---------------------------------------------------------------------------
 # Capability normalization (used by both the API and the manager)
@@ -226,9 +280,16 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     _apply_aee1_migrations(conn)
     # AEE-3: capability matching column. Idempotent via pragma check.
     _apply_aee3_migrations(conn)
+    # AEE-4: worker metadata + status columns on `workers`. Same pattern.
+    _apply_aee4_migrations(conn)
     # AEE-1: index for the new lookup path. Idempotent via IF NOT EXISTS.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_run_id ON tasks(external_run_id)"
+    )
+    # AEE-4: index on `workers.status` so future AEE-5+ scheduler
+    # queries ("give me all idle workers") are O(log n), not O(n).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status)"
     )
     conn.commit()
 
@@ -271,6 +332,30 @@ def _apply_aee3_migrations(conn: sqlite3.Connection) -> None:
             print(f"[db] AEE-3 migration: added tasks.{col}", file=sys.stderr)
 
 
+def _apply_aee4_migrations(conn: sqlite3.Connection) -> None:
+    """AEE-4: worker metadata + status columns on `workers`.
+
+    Same idempotent pragma check as AEE-1 / AEE-3. Re-running on an
+    already-migrated DB is a no-op. The 10 NULLable columns default
+    to NULL for legacy rows; `status` defaults to 'unknown' so the
+    5-status vocabulary is honoured from the moment the migration
+    lands, even for workers that haven't heartbeated yet.
+
+    The 11 columns together implement the Worker Runtime Contract
+    metadata + status fields documented in
+    `docs/runtime/Worker_Runtime_Contract.md` §3 and §4.
+    """
+    import sys
+    for col, stmt, _default in _AEE4_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('workers') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(f"[db] AEE-4 migration: added workers.{col}", file=sys.stderr)
+
+
 def run_migrations() -> list[str]:
     """Public entry point: applies all pending migrations.
 
@@ -300,9 +385,22 @@ def run_migrations() -> list[str]:
             conn.execute(stmt)
             print(f"[db] AEE-3 migration: added tasks.{col}", file=sys.stderr)
             added.append(col)
-    # Index too (idempotent).
+    # AEE-4: worker metadata + status columns on `workers`.
+    for col, stmt, _default in _AEE4_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('workers') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(f"[db] AEE-4 migration: added workers.{col}", file=sys.stderr)
+            added.append(col)
+    # Indexes (idempotent).
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_run_id ON tasks(external_run_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status)"
     )
     conn.commit()
     return added
@@ -382,6 +480,24 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# AEE-4: optional Worker metadata fields. All NULLable except the
+# status enum, which defaults to 'unknown'. The bridge accepts
+# them on `POST /v1/workers/register` and persists them as-is
+# (after capability normalization). See
+# `docs/runtime/Worker_Runtime_Contract.md` §3 for the full schema
+# and the AEE-4 conformance checklist.
+_WORKER_METADATA_FIELDS = (
+    "runtime_name",
+    "runtime_version",
+    "operating_system",
+    "architecture",
+    "python_version",
+    "node_version",
+    "git_version",
+    "start_time",
+)
+
+
 def upsert_worker(
     *,
     worker_id: str,
@@ -391,6 +507,26 @@ def upsert_worker(
     capabilities: List[str],
     workdir_allowlist: List[str],
     max_concurrent: int,
+    # AEE-4: optional metadata fields. All default to None so the
+    # AEE-2 / AEE-3 callers (and the existing tests) keep working
+    # without change. The bridge's worker API may pass strings;
+    # we store whatever the caller sends and only normalize
+    # capabilities (the only field with a canonical form).
+    runtime_name: Optional[str] = None,
+    runtime_version: Optional[str] = None,
+    operating_system: Optional[str] = None,
+    architecture: Optional[str] = None,
+    python_version: Optional[str] = None,
+    node_version: Optional[str] = None,
+    git_version: Optional[str] = None,
+    start_time: Optional[str] = None,
+    # AEE-4: optional initial status. Bridge workers normally
+    # report `status` via heartbeat; some flows (e.g. the
+    # closed-loop smoke test) want to set the status at register
+    # time too. We accept any of the 5 canonical values plus
+    # `unknown`; anything else falls back to `unknown`.
+    status: Optional[str] = None,
+    status_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Register a new worker or update an existing one (idempotent).
 
@@ -402,28 +538,67 @@ def upsert_worker(
     """
     conn = get_conn()
     existing = conn.execute(
-        "SELECT registered_at FROM workers WHERE worker_id = ?", (worker_id,)
+        "SELECT registered_at, status FROM workers WHERE worker_id = ?", (worker_id,)
     ).fetchone()
+    is_new = existing is None
     registered_at = existing["registered_at"] if existing else _now_iso()
+    # Preserve the previous status across re-registers if the caller
+    # didn't pass a new one. A re-register is metadata refresh, not
+    # a state change.
+    prior_status = existing["status"] if existing else None
+    if status is None:
+        new_status = prior_status or "unknown"
+    else:
+        new_status = status if is_valid_status(status) else "unknown"
     # AEE-3: normalize the worker's capability list the same way
     # job requirements are normalized, so the matcher's subset
     # check is comparing strings in the same canonical form.
     normalized_caps = normalize_capabilities(capabilities)
+    # Bump `last_status_change_at` only on a real status change.
+    # A fresh row is "born" with status='unknown' (the schema
+    # default); we don't stamp a separate change time on insert —
+    # operators see the `registered_at` as the row's birth. Only
+    # RE-registers that flip the status (e.g. 'unknown' -> 'idle')
+    # get a fresh `last_status_change_at`.
+    if is_new:
+        status_change_at = None
+    else:
+        status_change_at = _now_iso() if new_status != prior_status else None
     with transaction() as conn2:
         conn2.execute(
             """
             INSERT INTO workers (
               worker_id, worker_name, worker_type, hostname,
               capabilities_json, workdir_allowlist_json,
-              max_concurrent, registered_at, last_heartbeat_at, last_job_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+              max_concurrent, registered_at, last_heartbeat_at, last_job_id,
+              runtime_name, runtime_version, operating_system, architecture,
+              python_version, node_version, git_version, start_time,
+              status, status_message, last_status_change_at
+            ) VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL,
+              ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?
+            )
             ON CONFLICT(worker_id) DO UPDATE SET
               worker_name            = excluded.worker_name,
               worker_type            = excluded.worker_type,
               hostname               = excluded.hostname,
               capabilities_json      = excluded.capabilities_json,
               workdir_allowlist_json = excluded.workdir_allowlist_json,
-              max_concurrent         = excluded.max_concurrent
+              max_concurrent         = excluded.max_concurrent,
+              runtime_name           = excluded.runtime_name,
+              runtime_version        = excluded.runtime_version,
+              operating_system       = excluded.operating_system,
+              architecture           = excluded.architecture,
+              python_version         = excluded.python_version,
+              node_version           = excluded.node_version,
+              git_version            = excluded.git_version,
+              start_time             = excluded.start_time,
+              status                 = excluded.status,
+              status_message         = excluded.status_message,
+              last_status_change_at  = COALESCE(
+                excluded.last_status_change_at, workers.last_status_change_at
+              )
             """,
             (
                 worker_id, worker_name, worker_type, hostname,
@@ -431,6 +606,9 @@ def upsert_worker(
                 _json.dumps(workdir_allowlist),
                 int(max_concurrent),
                 registered_at,
+                runtime_name, runtime_version, operating_system, architecture,
+                python_version, node_version, git_version, start_time,
+                new_status, status_message, status_change_at,
             ),
         )
     return {
@@ -465,16 +643,53 @@ def list_workers(worker_type: Optional[str] = None) -> List[Dict[str, Any]]:
 
 
 def update_worker_heartbeat(
-    worker_id: str, *, job_id: Optional[str] = None
+    worker_id: str,
+    *,
+    job_id: Optional[str] = None,
+    # AEE-4: optional status payload. The bridge accepts the 5
+    # canonical values plus `unknown`; invalid values are
+    # silently coerced to `unknown` (so a buggy client can't
+    # wedge the column).
+    status: Optional[str] = None,
+    status_message: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Bump last_heartbeat_at (and optionally last_job_id)."""
+    """Bump last_heartbeat_at (and optionally last_job_id / status).
+
+    AEE-4 contract: when `status` is supplied and differs from the
+    stored value, also stamp `last_status_change_at = now()`. A
+    re-heartbeat with the same status is a no-op for the status
+    columns; we only bump `last_heartbeat_at`. This is the
+    "liveness only" mode used by every pre-AEE-4 worker.
+    """
     conn = get_conn()
+    now = _now_iso()
+    # Read the prior status so we can decide whether to stamp
+    # `last_status_change_at`. Done before the UPDATE so the
+    # COALESCE below is correct.
+    prior_row = conn.execute(
+        "SELECT status FROM workers WHERE worker_id = ?", (worker_id,),
+    ).fetchone()
+    if prior_row is None:
+        return None
+    prior_status = prior_row["status"]
+    new_status = status if (status is not None and is_valid_status(status)) else None
     with transaction() as conn2:
-        cur = conn2.execute(
-            "UPDATE workers SET last_heartbeat_at = ?, last_job_id = COALESCE(?, last_job_id) "
-            "WHERE worker_id = ?",
-            (_now_iso(), job_id, worker_id),
-        )
+        if new_status is not None and new_status != prior_status:
+            cur = conn2.execute(
+                "UPDATE workers SET "
+                "last_heartbeat_at = ?, last_job_id = COALESCE(?, last_job_id), "
+                "status = ?, status_message = ?, last_status_change_at = ? "
+                "WHERE worker_id = ?",
+                (now, job_id, new_status, status_message, now, worker_id),
+            )
+        else:
+            cur = conn2.execute(
+                "UPDATE workers SET last_heartbeat_at = ?, "
+                "last_job_id = COALESCE(?, last_job_id), "
+                "status_message = COALESCE(?, status_message) "
+                "WHERE worker_id = ?",
+                (now, job_id, status_message, worker_id),
+            )
     if cur.rowcount == 0:
         return None
     return get_worker(worker_id)
@@ -493,7 +708,19 @@ def _row_to_worker_dict(row) -> Dict[str, Any]:
             allow = _json.loads(row["workdir_allowlist_json"])
         except _json.JSONDecodeError:
             allow = []
-    return {
+    # AEE-4: include all 11 new metadata / status fields. Use
+    # `row[k]` defensively in case a very old DB row is missing
+    # one of the new columns (the AEE-4 migration is idempotent
+    # but a fresh DB created with a stale `dispatcher/db.py` build
+    # could in theory lack them). The defaults mirror the SQL
+    # DEFAULT clauses.
+    def _get(name: str, default):
+        try:
+            v = row[name]
+        except (IndexError, KeyError):
+            return default
+        return v if v is not None else default
+    out: Dict[str, Any] = {
         "worker_id": row["worker_id"],
         "worker_name": row["worker_name"],
         "worker_type": row["worker_type"],
@@ -504,7 +731,21 @@ def _row_to_worker_dict(row) -> Dict[str, Any]:
         "registered_at": row["registered_at"],
         "last_heartbeat_at": row["last_heartbeat_at"],
         "last_job_id": row["last_job_id"],
+        # AEE-4 metadata fields (all NULLable; status defaults to
+        # 'unknown' so the field is always present in the dict).
+        "runtime_name": _get("runtime_name", None),
+        "runtime_version": _get("runtime_version", None),
+        "operating_system": _get("operating_system", None),
+        "architecture": _get("architecture", None),
+        "python_version": _get("python_version", None),
+        "node_version": _get("node_version", None),
+        "git_version": _get("git_version", None),
+        "start_time": _get("start_time", None),
+        "status": _get("status", "unknown"),
+        "status_message": _get("status_message", None),
+        "last_status_change_at": _get("last_status_change_at", None),
     }
+    return out
 
 
 # ---------------------------------------------------------------------------

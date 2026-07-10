@@ -207,6 +207,7 @@ async def create_job(
         )
     task = manager.get_or_raise(task.task_id)
     return {
+        "version": "v1",
         "job_id": task.task_id,
         "task_id": task.task_id,
         "status": task.status,
@@ -305,6 +306,7 @@ async def claim_job(
     )
     task = manager.get_or_raise(candidate["task_id"])
     return {
+        "version": "v1",
         "job_id": task.task_id,
         "task_id": task.task_id,
         "claim_token": token,  # plain, returned ONCE
@@ -352,7 +354,7 @@ async def heartbeat_job(
             detail=f"job is in status {task.status!r}, heartbeat only valid in 'running'",
         )
     db.update_task_heartbeat(job_id)
-    return {"job_id": job_id, "status": "running", "heartbeat_at": db._now_iso()}
+    return {"version": "v1", "job_id": job_id, "status": "running", "heartbeat_at": db._now_iso()}
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +380,7 @@ async def append_log(
     if not isinstance(line, str) or not line.strip():
         raise HTTPException(status_code=400, detail="line is required")
     db.append_task_log(job_id, line)
-    return {"job_id": job_id, "appended": True}
+    return {"version": "v1", "job_id": job_id, "appended": True}
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +416,7 @@ async def complete_job(
         raise HTTPException(status_code=404, detail="job not found")
     except IllegalTransition as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    return {"job_id": job_id, "status": task.status}
+    return {"version": "v1", "job_id": job_id, "status": task.status}
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +445,7 @@ async def fail_job(
         raise HTTPException(status_code=404, detail="job not found")
     except IllegalTransition as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    return {"job_id": job_id, "status": task.status, "error": task.error_message}
+    return {"version": "v1", "job_id": job_id, "status": task.status, "error": task.error_message}
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +487,7 @@ async def cancel_job(
         except Exception as exc:  # noqa: BLE001
             # Don't fail the HTTP response if upstream cancel fails.
             manager.log(job_id, f"adapter cancel error: {type(exc).__name__}: {exc}")
-    return {"job_id": job_id, "status": task.status}
+    return {"version": "v1", "job_id": job_id, "status": task.status}
 
 
 # ---------------------------------------------------------------------------

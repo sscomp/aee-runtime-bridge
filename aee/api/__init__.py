@@ -9,9 +9,16 @@ AEE-1 only provided the package skeleton. AEE-2 ships the routers:
                 /jobs/{id}/complete, /jobs/{id}/fail,
                 /jobs/{id}/cancel, GET /jobs/_claimable
 
-Both routers are mounted by `app.py` under the same `/` prefix
-(they self-declare their paths in the `prefix=""` APIRouter
-instances).
+AEE-4 adds `/v1/...` aliases (see ADR-007). The same handlers are
+re-mounted under a `prefix="/v1"` router so:
+
+  * `POST /v1/workers/register` and `POST /workers/register`
+    share the same handler (and the same auth + validation).
+  * `/v1/...` is the canonical forward path documented in
+    `docs/runtime/Worker_Runtime_Contract.md` §2.
+  * `/jobs/...` and `/workers/...` are kept as legacy aliases
+    for backward compat with the existing AEE-2 / AEE-3 surface
+    and the GPT-Action compat layer (`/runs`).
 
 The `/runs` legacy endpoints remain in `app.py` for now; the plan
 is to migrate them to thin aliases over `/jobs` in AEE-5
@@ -30,4 +37,18 @@ api_router = APIRouter()
 api_router.include_router(jobs_router)
 api_router.include_router(workers_router)
 
-__all__ = ["api_router"]
+# AEE-4: `/v1/...` aliases (ADR-007). Re-include the same routers
+# under a prefix; FastAPI re-uses the same handler objects, so the
+# behaviour is identical to the legacy paths. Both the canonical
+# and the legacy URLs work; the contract document is explicit that
+# `/v1/...` is the forward-looking path. A future `/v2/...` would
+# similarly re-include (or replace) the router under a new prefix.
+v1_router = APIRouter(prefix="/v1")
+v1_router.include_router(jobs_router)
+v1_router.include_router(workers_router)
+
+# Wire the v1 prefix into the combined router. Now both
+# `api_router` and the `v1_router` are mounted by `app.py`.
+api_router.include_router(v1_router)
+
+__all__ = ["api_router", "v1_router"]
