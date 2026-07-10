@@ -376,6 +376,7 @@ def bootstrap_default_runtimes(
     force: bool = False,
     *,
     default_runtime_id: str = "aee-lightweight-local",
+    register_claude_code: bool = True,
 ) -> None:
     """Register the built-in `aee-lightweight-local` Runtime.
 
@@ -390,14 +391,35 @@ def bootstrap_default_runtimes(
     capabilities the AEE-4 worker reports to the
     bridge (`tool.shell`, `tool.python`, `tool.git`,
     `tool.filesystem`).
+
+    AEE-6.3: when `register_claude_code=True` (default),
+    also try to register the `claude-code-local` Runtime
+    built-in. The descriptor builder returns ``None`` if
+    the ``claude`` CLI is not on $PATH, in which case we
+    silently skip — the AEE Lightweight Agent Runtime
+    remains the only registered runtime, and the
+    existing baseline is preserved byte-for-byte.
     """
     from .builtins.aee_lightweight import build_default_descriptor
 
     descriptor = build_default_descriptor(default_runtime_id=default_runtime_id)
     existing_ids = {r.runtime_id for r in runtime_registry.list_runtimes()}
-    if descriptor.runtime_id in existing_ids and not force:
-        return
-    runtime_registry.register_runtime(descriptor, replace=force)
+    if descriptor.runtime_id not in existing_ids or force:
+        runtime_registry.register_runtime(descriptor, replace=force)
+
+    if register_claude_code:
+        from .builtins.claude_code_local import build_claude_code_descriptor
+
+        cc_descriptor = build_claude_code_descriptor()
+        if cc_descriptor is None:
+            # ``claude`` CLI not on $PATH; skip silently. The AEE
+            # Lightweight Agent Runtime remains the sole registered
+            # runtime and the existing AEE-5 baseline is preserved.
+            return
+        existing_ids = {r.runtime_id for r in runtime_registry.list_runtimes()}
+        if cc_descriptor.runtime_id in existing_ids and not force:
+            return
+        runtime_registry.register_runtime(cc_descriptor, replace=force)
 
 
 __all__ = [
