@@ -1,0 +1,7 @@
+{
+  "max_retries": 3,
+  "queue_max_size": 100,
+  "poll_interval_sec": 2.0,
+  "watcher_tick_sec": 5.0,
+  "auto_cancel_after_sec": 7200
+}

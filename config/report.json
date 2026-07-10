@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "output_dir": "reports",
+  "sections_order": [
+    "Executive Summary",
+    "Current Architecture",
+    "Current Workflow",
+    "Findings",
+    "Technical Debt",
+    "Optimization",
+    "Priority",
+    "Roadmap",
+    "Appendix"
+  ],
+  "include_task_json": true
+}

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Convenience wrapper for `hermes task ...` (alias of `python cli/hermes_task.py`).
+# Symlink this into ~/bin/ to make `hermes-task` available on PATH.
+
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+exec "$ROOT/.venv/bin/python" "$HERE/hermes_task.py" "$@"

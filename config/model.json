@@ -1,0 +1,8 @@
+{
+  "default_model": "claude-sonnet-4-6",
+  "fallback_order": [
+    "claude-sonnet-4-6",
+    "kimi-k2.6:cloud",
+    "gpt-4o"
+  ]
+}

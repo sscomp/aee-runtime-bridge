@@ -1,0 +1,15 @@
+{
+  "default_root": "/home/ubuntu",
+  "scan_paths": [
+    "/home/ubuntu/hermes-runtime-bridge",
+    "/home/ubuntu/macro-report"
+  ],
+  "skip_dirs": [
+    "__pycache__",
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules"
+  ],
+  "max_files": 5000
+}

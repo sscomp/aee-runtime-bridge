@@ -1,0 +1,55 @@
+# .tarignore — used by `tar --exclude-from=.tarignore` when assembling
+# internal handoff bundles. Mirrors .gitignore but in a separate file so
+# we can keep tighter rules for transport than for git history.
+#
+# AEE-0 baseline: do not pack secrets, runtime DBs, or build artifacts
+# into any handoff tarball.
+#
+# NOTE: GNU tar --exclude-from matches by **basename or full path**
+# depending on the pattern. Patterns starting with `/` anchor to repo
+# root; patterns with a leading `*/` match at any depth. We use the
+# `*/` prefix form so deeply-nested __pycache__/.venv are also caught.
+
+# ---- Secrets / credentials ----
+*/.env
+*/.env.*
+*/.api_keys.vault.json
+*/CREDENTIALS.txt
+*/secrets
+*/private
+**/.env
+**/.env.*
+**/.api_keys.vault.json
+**/CREDENTIALS.txt
+
+# ---- Runtime data ----
+*/data/*.db
+*/data/*.db-*
+*/data/*.db-journal
+*/data/*.db-wal
+*/data/*.db-shm
+*/runtime_data
+*/logs
+*/reports/TASK-*
+*/reports/TASK-*
+*.log
+
+# ---- Backups ----
+*.bak
+*.bak.*
+*.bak-*
+
+# ---- Build / tooling artifacts ----
+*/.venv
+*/__pycache__
+*/.pytest_cache
+*/.mypy_cache
+*/.ruff_cache
+*/.coverage
+*/htmlcov
+*/*.egg-info
+*/dist
+*/build
+*/node_modules
+**/__pycache__
+**/.venv

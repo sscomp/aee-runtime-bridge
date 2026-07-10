@@ -1,0 +1,30 @@
+; Hermes Runtime Bridge — ORIGINAL systemd unit (for reference)
+;
+; The Abacus.AI host does NOT have systemd. Use the supervisord unit in
+; `supervisor/hermes-runtime-bridge.conf` instead. This file is kept here
+; as documentation for the day someone runs the bridge on a regular Linux
+; server (not Abacus).
+;
+; Install (on a systemd host):
+;     sudo cp systemd/hermes-runtime-bridge.service /etc/systemd/system/
+;     sudo systemctl daemon-reload
+;     sudo systemctl enable --now hermes-runtime-bridge
+;     sudo systemctl status hermes-runtime-bridge --no-pager
+;
+; Logs:
+;     journalctl -u hermes-runtime-bridge -f
+
+[Unit]
+Description=Hermes Runtime Bridge
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/hermes-runtime-bridge
+EnvironmentFile=/home/ubuntu/hermes-runtime-bridge/.env
+ExecStart=/home/ubuntu/hermes-runtime-bridge/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8787
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

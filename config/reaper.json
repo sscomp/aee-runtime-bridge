@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "stale_running_sec": 1800,
+  "stale_queued_sec": 300,
+  "max_total_age_sec": 7200,
+  "grace_period_sec": 30
+}

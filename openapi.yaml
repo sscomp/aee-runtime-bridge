@@ -1,0 +1,607 @@
+openapi: 3.1.0
+info:
+  title: Hermes Runtime Bridge
+  version: 1.2.0
+  description: |
+    A thin, safe facade in front of the Hermes M2 (Abacus.ai) `/v1/runs` API,
+    with a built-in Task Dispatcher (Phase 1, 2026-07-07) that gives every
+    task a persistent `TASK-YYYYMMDD-NNNN` id, status, progress, log, and
+    result — queryable across chat sessions and from the CLI.
+
+    Use this schema in a ChatGPT Custom GPT Action to:
+    1. dispatch a task to Hermes M2 (createRun) → get a `task_id` back
+    2. poll for status / progress (getRun, getTaskProgress)
+    3. fetch logs / final output / result metadata
+    4. request cancellation (stopRun, cancelTask)
+    5. retry a failed task (rerunTask)
+
+    The bridge enforces:
+      * its own bearer key (BRIDGE_API_KEY), independent of Hermes'
+      * a small blocklist of dangerous instructions (rm -rf /, cat secrets, etc.)
+      * an optional session_id prefix allowlist (set via env if needed)
+
+    ## Recommended Custom GPT Instructions
+    You are Hermes Orchestrator. When the user asks you to run shell / Python /
+    file ops / system status / long tasks, you MUST call these tools instead of
+    pretending to run them. Always: 1) call createRun, 2) capture the `task_id`
+    from the response, 3) call getTaskProgress(task_id) every few seconds, 4)
+    summarize the output. Never invent stdout / stderr.
+
+servers:
+  - url: https://hermes-runtime.biaobecue.com
+    description: Production (Cloudflare Tunnel, no direct Hermes 8642 exposure)
+
+# Authentication is configured in the GPT Action "Authentication" tab as:
+#   Type: API Key
+#   Auth Type: Bearer
+#   API Key: <BRIDGE_API_KEY>
+#
+# The schema below uses the same shape so OpenAI recognises the security
+# requirement automatically.
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+
+  schemas:
+    CreateRunRequest:
+      type: object
+      required: [input]
+      properties:
+        input:
+          type: string
+          minLength: 1
+          maxLength: 64000
+          description: Instruction to execute on Hermes M2.
+        session_id:
+          type: string
+          maxLength: 200
+          description: |
+            Shared Hermes session/task id. Defaults to the bridge's
+            DEFAULT_SESSION_ID. Use a stable id to preserve context
+            across multiple runs.
+        mode:
+          type: string
+          enum: [normal, research, coding, ops]
+          default: normal
+          description: Hint about the kind of work the agent will do.
+        timeout_seconds:
+          type: integer
+          minimum: 30
+          maximum: 7200
+          default: 900
+          description: Upstream call timeout in seconds.
+        title:
+          type: string
+          maxLength: 200
+          description: Human-friendly task title. Auto-generated if omitted.
+        type:
+          type: string
+          enum: [research, coding, ops, review, normal]
+
+          description: Task type. Defaults to `mode` or `normal`.
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 50
+          description: 0..100; lower is more urgent.
+        openai_run_id:
+          type: string
+          maxLength: 200
+          description: ChatGPT-side run_id (for cross-reference; optional).
+        prompt_version:
+          type: string
+          maxLength: 64
+          description: Prompt template version, e.g. 'macro_v1'.
+        model_name:
+          type: string
+          maxLength: 64
+          description: Model to use, e.g. 'claude-sonnet-4-6'.
+        expected_artifacts:
+          type: array
+          items:
+            type: string
+            minLength: 1
+            maxLength: 1024
+          description: |
+            Phase 4: absolute file paths the task is expected to produce
+            or verify. At task completion, the dispatcher will stat()
+            each path; missing entries bump the task's `warning_count`
+            and appear in `task_outputs.delivery_json`. This is in
+            ADDITION to the automatic scan of `input` for absolute
+            paths — pass this field when the contract is explicit and
+            the path may not appear verbatim in the input text.
+          example:
+            - /home/ubuntu/macro-report/PHASE2B_PLAN_AND_DIFF_PROPOSAL.md
+            - /home/ubuntu/macro-report/phase2a/scaffold.py
+
+    CreateRunResponse:
+      type: object
+      required: [run_id, status, session_id, poll_url, requires_review, task_id, task_poll_url, progress_pct]
+      properties:
+        run_id: { type: string, description: Hermes run id to poll. }
+        status: { type: string, description: 'Usually "started" or "running".' }
+        session_id: { type: string }
+        poll_url:
+          type: string
+          description: 'Relative path on this bridge, e.g. /runs/{run_id}.'
+        requires_review:
+          type: boolean
+          description: Reserved for future approval flow. Always false in v1.2.
+        task_id:
+          type: string
+          description: |
+            Persistent dispatcher task id of the form `TASK-YYYYMMDD-NNNN`.
+            Use this id for `/tasks/{task_id}/*` endpoints. Survives
+            ChatGPT session resets.
+        task_poll_url:
+          type: string
+          description: 'Relative path, e.g. /tasks/TASK-20260707-0001.'
+        progress_pct:
+          type: integer
+          description: 'Initial progress (5% by default).'
+
+    TaskSummary:
+      type: object
+      description: |
+        One task as returned by /tasks or /tasks/{id}. The `input_text`
+        field is truncated to 2000 chars; use /tasks/{id}/result for the
+        full output.
+      properties:
+        task_id: { type: string }
+        title: { type: string }
+        type: { type: string }
+        priority: { type: integer }
+        owner: { type: string }
+        status:
+          type: string
+          enum: [pending, queued, running, waiting, completed, failed, cancelled]
+        progress_pct: { type: integer, description: 'One of 0/5/10/25/40/60/80/95/100.' }
+        progress_step: { type: string, nullable: true }
+        created_at: { type: string }
+        started_at: { type: string, nullable: true }
+        finished_at: { type: string, nullable: true }
+        duration_sec: { type: number, nullable: true }
+        hermes_run_id: { type: string, nullable: true }
+        openai_run_id: { type: string, nullable: true }
+        session_id: { type: string, nullable: true }
+        mode: { type: string, nullable: true }
+        result_path: { type: string, nullable: true }
+        error_message: { type: string, nullable: true }
+        warning_count: { type: integer }
+        retry_count: { type: integer }
+        prompt_version: { type: string, nullable: true }
+        model_name: { type: string, nullable: true }
+        git_commit: { type: string, nullable: true }
+        git_branch: { type: string, nullable: true }
+        input_text: { type: string, nullable: true, description: Truncated to 2000 chars. }
+
+    TaskListResponse:
+      type: object
+      properties:
+        count: { type: integer }
+        limit: { type: integer }
+        filters:
+          type: object
+          properties:
+            status: { type: string, nullable: true }
+            type: { type: string, nullable: true }
+        tasks:
+          type: array
+          items: { $ref: '#/components/schemas/TaskSummary' }
+
+    TaskProgressResponse:
+      type: object
+      properties:
+        task_id: { type: string }
+        status: { type: string }
+        progress_pct: { type: integer }
+        progress_step: { type: string, nullable: true }
+        started_at: { type: string, nullable: true }
+        finished_at: { type: string, nullable: true }
+        duration_sec: { type: number, nullable: true }
+        recent_events:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              ts: { type: string }
+              kind: { type: string }
+              payload: { type: object, nullable: true }
+        poll_url: { type: string }
+
+    TaskLogsResponse:
+      type: object
+      properties:
+        task_id: { type: string }
+        log_path: { type: string }
+        exists: { type: boolean }
+        total_lines: { type: integer }
+        returned_lines: { type: integer }
+        lines:
+          type: array
+          items: { type: string }
+
+    TaskResultResponse:
+      type: object
+      properties:
+        task_id: { type: string }
+        status: { type: string }
+        result_path: { type: string, nullable: true }
+        duration_sec: { type: number, nullable: true }
+        started_at: { type: string, nullable: true }
+        finished_at: { type: string, nullable: true }
+        error: { type: string, nullable: true }
+        warning_count: { type: integer }
+        retry_count: { type: integer }
+        prompt_version: { type: string, nullable: true }
+        model_name: { type: string, nullable: true }
+        git_commit: { type: string, nullable: true }
+        git_branch: { type: string, nullable: true }
+        output_text: { type: string, nullable: true }
+        usage:
+          type: object
+          nullable: true
+          additionalProperties: true
+
+    RerunResponse:
+      type: object
+      properties:
+        original_task_id: { type: string }
+        new_task_id: { type: string }
+        new_run_id: { type: string }
+        new_task: { $ref: '#/components/schemas/TaskSummary' }
+        poll_url: { type: string }
+
+    RunStatus:
+      type: object
+      description: |
+        Pass-through response from Hermes `GET /v1/runs/{run_id}`. Shape
+        includes `run_id`, `status`, `last_event`, `output`, `usage`, and
+        SSE event history. The bridge does not interpret the inner fields.
+
+    RunSummary:
+      type: object
+      properties:
+        run_id: { type: string }
+        status: { type: string, description: 'running | completed | failed | cancelled | unknown' }
+        last_event: { type: string, nullable: true }
+        output_preview:
+          type: string
+          nullable: true
+          description: First 2000 chars of `output`. Truncated if longer.
+        current_hint:
+          type: string
+          description: Human-readable hint about what to do next.
+
+    StopResult:
+      type: object
+      properties:
+        run_id: { type: string }
+        status: { type: string, description: 'Usually "stop_requested" or the upstream status.' }
+
+    ErrorBody:
+      type: object
+      properties:
+        detail:
+          oneOf:
+            - type: string
+            - type: object
+              properties:
+                code: { type: string }
+                message: { type: string }
+                matched_pattern: { type: string, nullable: true }
+        code: { type: string, nullable: true }
+        matched_pattern: { type: string, nullable: true }
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      operationId: hermesHealth
+      summary: Liveness + Hermes reachability probe.
+      security: []   # public; no auth required
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  service: { type: string }
+                  version: { type: string }
+                  hermes: { type: string, description: 'reachable | http_<code> | error: ...' }
+                  hermes_base_url: { type: string }
+
+  /runs:
+    post:
+      operationId: hermesCreateRun
+      summary: Start a new Hermes M2 run. Returns run_id for polling.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRunRequest' }
+      responses:
+        '200':
+          description: Run started.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateRunResponse' }
+        '400':
+          description: Dangerous input rejected by safety policy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401':
+          description: Missing or invalid bridge API key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '502':
+          description: Upstream Hermes error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '504':
+          description: Upstream Hermes timeout.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /runs/{run_id}:
+    get:
+      operationId: hermesGetRun
+      summary: Poll a run's current status and final output.
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Current state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunStatus' }
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          description: Unknown run_id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /runs/{run_id}/summary:
+    get:
+      operationId: hermesGetRunSummary
+      summary: Bridge-curated summary, friendlier for ChatGPT than raw `/runs/{id}`.
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunSummary' }
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /runs/{run_id}/stop:
+    post:
+      operationId: hermesStopRun
+      summary: Request cancellation of a running task.
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Stop requested.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StopResult' }
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          description: Unknown run_id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  # -------------------------------------------------------------------------
+  # /tasks/* — Task Dispatcher (Phase 1)
+  # -------------------------------------------------------------------------
+
+  /tasks:
+    get:
+      operationId: hermesListTasks
+      summary: List recent dispatcher tasks.
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, queued, running, waiting, completed, failed, cancelled]
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [research, coding, ops, review, normal]
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      responses:
+        '200':
+          description: List of tasks (newest first).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskListResponse' }
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /tasks/{task_id}:
+    get:
+      operationId: hermesGetTask
+      summary: Get a single task's current state.
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Task found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskSummary' }
+        '404':
+          description: Task not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /tasks/{task_id}/progress:
+    get:
+      operationId: hermesGetTaskProgress
+      summary: Lightweight progress poll (designed for ChatGPT mid-run polling).
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Current progress + recent events.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskProgressResponse' }
+        '404':
+          description: Task not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /tasks/{task_id}/logs:
+    get:
+      operationId: hermesGetTaskLogs
+      summary: Tail the per-task log file.
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: tail
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 2000, default: 200 }
+      responses:
+        '200':
+          description: Log lines (newest last).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskLogsResponse' }
+        '404':
+          description: Task not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /tasks/{task_id}/result:
+    get:
+      operationId: hermesGetTaskResult
+      summary: Get the final result metadata + output + report path.
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Result found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskResultResponse' }
+        '404':
+          description: Task not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /tasks/{task_id}/cancel:
+    post:
+      operationId: hermesCancelTask
+      summary: Cancel a running/queued task.
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Cancellation recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskSummary' }
+        '404':
+          description: Task not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '409':
+          description: Task is in a terminal state and cannot be cancelled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /tasks/{task_id}/rerun:
+    post:
+      operationId: hermesRerunTask
+      summary: |
+        Create a new task cloned from `task_id` and dispatch it to Hermes.
+        The new task gets a fresh `TASK-...` id; the original is left in
+        its terminal state.
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: New task created and dispatched.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RerunResponse' }
+        '404':
+          description: Task not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '409':
+          description: Task is not in a rerunnable state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
