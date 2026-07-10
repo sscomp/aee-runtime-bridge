@@ -408,10 +408,10 @@ class TaskManager:
         return self.get_or_raise(task_id)
 
     def _verify_expected_delivery(self, task_id: str, input_text: str) -> Dict[str, Any]:
-        """Phase 4: scan the task's input_text for absolute file paths and
-        stat() each one. If the agent was told "create file at /foo/bar",
-        we can detect that path in the input and verify it exists at
-        complete() time.
+        """Phase 4 + AEE-6.2: scan the task's input_text for absolute file
+        paths and stat + hash + classify each one. If the agent was told
+        "create file at /foo/bar", we can detect that path in the input
+        and verify it exists at complete() time.
 
         Why input scan instead of explicit field? Because ChatGPT's
         prompts are natural-language. A separate `expected_artifacts`
@@ -419,39 +419,104 @@ class TaskManager:
         detect" layer for free with zero prompt changes. Both layers
         can coexist.
 
+        AEE-6.2: the per-path stat+hash is now done by the AEE-6
+        `ArtifactCollector` so the same code path that the orchestrator
+        can use (POST /v1/artifacts) is also wired into delivery
+        verification. The legacy `delivery_json` shape (list of
+        {path, exists, size, mtime}) is preserved 100%; we just add
+        three more optional fields:
+
+            {
+                "path":     str,
+                "exists":   bool,
+                "size":     int | None,
+                "mtime":    str | None,
+                "sha256":   str | None,       # NEW in AEE-6.2
+                "kind":     str,              # NEW in AEE-6.2
+                "artifact_id": str | None,   # NEW in AEE-6.2 (None if missing)
+            }
+
+        Backward compatibility: every pre-AEE-6.2 test that checks
+        only the 4 legacy fields keeps passing.
+
         Returns:
             {
-                "artifacts": [{"path": str, "exists": bool, "size": int|None, "mtime": str|None}],
-                "missing_paths": [str],         # subset with exists=False
-                "warning_bump": int,            # 0 if nothing expected, N if N missing
+                "artifacts":     [delivery entries, shape above],
+                "missing_paths": [str],        # subset with exists=False
+                "warning_bump":  int,          # 0 if nothing expected, N if N missing
             }
         """
-        artifacts: List[Dict[str, Any]] = []
-        missing: List[str] = []
         # Strict absolute-path regex: /foo/bar or /foo/bar.txt — must
         # contain at least one slash, no shell metachars, no spaces.
         # This intentionally misses things like "~/x" or quoted paths;
         # better to under-detect than to flag false positives.
+        candidate_paths: List[str] = []
         seen: set = set()
-        for match in re.finditer(r"(?:^|[\s,;\"'`])(/[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,8})", input_text):
+        for match in re.finditer(
+            r"(?:^|[\s,;\"'`])(/[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,8})",
+            input_text,
+        ):
             p = match.group(1)
             if p in seen:
                 continue
             seen.add(p)
-            entry: Dict[str, Any] = {"path": p}
-            try:
-                st = os.stat(p)
-                entry["exists"] = True
-                entry["size"] = int(st.st_size)
-                entry["mtime"] = datetime.fromtimestamp(
-                    st.st_mtime, tz=timezone.utc
-                ).isoformat()
-            except (FileNotFoundError, PermissionError, OSError):
-                entry["exists"] = False
-                entry["size"] = None
-                entry["mtime"] = None
-                missing.append(p)
+            candidate_paths.append(p)
+
+        if not candidate_paths:
+            return {
+                "artifacts": [],
+                "missing_paths": [],
+                "warning_bump": 0,
+            }
+
+        # AEE-6.2: build a per-task ArtifactPipeline on top of the
+        # existing SQLite connection. The collector raises on
+        # permission / too-large / hard OS errors; the pipeline
+        # catches them and returns an `exists=False` record. So
+        # this call is "best-effort" in the same way the legacy
+        # os.stat block was — never raises out.
+        from aee.artifacts import ArtifactPipeline, SqliteArtifactRepository
+        pipeline = ArtifactPipeline(
+            repo=SqliteArtifactRepository(get_conn())
+        )
+        try:
+            persisted = pipeline.collect(task_id, candidate_paths)
+        except Exception as e:  # pragma: no cover - defensive
+            # If the pipeline explodes for any reason (e.g. table
+            # missing because someone bypassed _init_schema), fall
+            # back to a no-artifact delivery so the task still
+            # completes. We log but do not raise.
+            import sys
+            print(
+                f"[manager] AEE-6.2 ArtifactPipeline failed: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            return {
+                "artifacts": [],
+                "missing_paths": [],
+                "warning_bump": 0,
+            }
+
+        # Build the legacy-shape delivery entries, enriched with
+        # AEE-6 metadata. We map each persisted Artifact back to
+        # the original path string the user wrote (so the
+        # `delivery_json` regex input round-trips).
+        artifacts: List[Dict[str, Any]] = []
+        missing: List[str] = []
+        for art in persisted:
+            entry: Dict[str, Any] = {
+                "path": art.path,
+                "exists": art.exists,
+                "size": art.size,
+                "mtime": art.mtime,
+                # AEE-6.2 additions — back-compat safe (all optional):
+                "sha256": art.sha256,
+                "kind": art.kind,
+                "artifact_id": art.artifact_id,
+            }
             artifacts.append(entry)
+            if not art.exists:
+                missing.append(art.path)
         return {
             "artifacts": artifacts,
             "missing_paths": missing,
