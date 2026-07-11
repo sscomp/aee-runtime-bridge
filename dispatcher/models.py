@@ -90,6 +90,21 @@ class Task:
     # permissive default. The field is purely additive; legacy
     # tasks (pre-AEE-7.2) round-trip with ``None``.
     repo_root: Optional[str] = None
+    # AEE write-side metadata (closes §20.9.10 deferred limitation):
+    # the dispatcher's CREATE / START paths now stamp the
+    # executor's session id and the provider's external run id
+    # directly onto the `tasks` row, so the read-side identity
+    # validator can cite authoritative values rather than
+    # guessing from heuristics. Both are NULLable; legacy
+    # tasks round-trip with NULL.
+    # - `executor_session_id` is the caller's session id
+    #   (the orchestrator / ChatGPT session that asked for
+    #   the dispatch), written at `manager.create(...)` time.
+    # - `runtime_run_id` is the provider's external run id
+    #   (the value `Provider.submit()` returned), written at
+    #   `manager.start(...)` time.
+    executor_session_id: Optional[str] = None
+    runtime_run_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)

@@ -123,6 +123,14 @@ _COLUMNS = (
     # falls back to `ArtifactPolicy.permissive()` — fail-safe,
     # not fail-open.
     "repo_root",
+    # AEE write-side metadata: closes §20.9.10 deferred limitation.
+    # `executor_session_id` is stamped at create() time from the
+    # caller's `executor_session_id` kwarg; `runtime_run_id` is
+    # stamped at start() time from the provider's external run id
+    # (the value passed to `manager.start(..., hermes_run_id=...)`,
+    # which is aliased to `runtime_run_id` for non-Hermes runtimes).
+    # Both are NULLable; legacy tasks keep NULL.
+    "executor_session_id", "runtime_run_id",
 )
 
 
@@ -192,6 +200,7 @@ class TaskManager:
         initial_status: str = "queued",
         required_capabilities: Optional[List[str]] = None,
         repo_root: Optional[str] = None,
+        executor_session_id: Optional[str] = None,
     ) -> Task:
         """Create a new task. Generates the task_id, sets status, records event.
 
@@ -208,6 +217,16 @@ class TaskManager:
         continues to use ``ArtifactPolicy.permissive()`` for that
         task. We deliberately do **not** broaden the existing
         default.
+
+        AEE write-side metadata (closes §20.9.10 deferred
+        limitation): ``executor_session_id`` is the caller's
+        session id (the orchestrator / ChatGPT session that asked
+        for the dispatch). It is persisted in the
+        ``executor_session_id`` column (NULLable). Legacy callers
+        that don't pass it keep NULL — the read-side identity
+        validator falls back to its existing heuristics. Empty
+        string / whitespace is normalised to None so the DB
+        never sees "" as an executor session id.
         """
         if initial_status not in {"pending", "queued"}:
             raise ValueError(f"initial_status must be pending or queued, got {initial_status}")
@@ -216,6 +235,11 @@ class TaskManager:
         # normalised to None so the DB never sees "" as a repo_root.
         if repo_root is not None:
             repo_root = repo_root.strip() or None
+        # AEE write-side metadata: same wire-boundary normalisation
+        # for executor_session_id — strip + None-on-empty so legacy
+        # callers passing "" don't pollute the column.
+        if executor_session_id is not None:
+            executor_session_id = executor_session_id.strip() or None
         task_id = ids.next_task_id()
         created_at = ids.now_iso()
         commit, branch = _git_info(workdir)
@@ -230,8 +254,9 @@ class TaskManager:
                   input_text, openai_run_id, session_id, mode,
                   prompt_version, model_name, git_commit, git_branch,
                   required_capabilities_json,
-                  repo_root
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  repo_root,
+                  executor_session_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, title, type, priority, owner, initial_status,
@@ -240,6 +265,7 @@ class TaskManager:
                     prompt_version, model_name, commit, branch,
                     caps_blob,
                     repo_root,
+                    executor_session_id,
                 ),
             )
         _append_log(task_id, "INFO", f"created title={title!r} type={type} priority={priority}")
@@ -249,13 +275,19 @@ class TaskManager:
         # without joining against the events table. The path
         # is logged once (per_job_root) — ``input_text`` is
         # intentionally NOT included.
+        # AEE write-side metadata: extend the same single INFO
+        # line with the caller's executor_session_id (if set)
+        # so the dispatcher log remains the single source of
+        # truth for "who asked for this task". Same guard as
+        # repo_root: blank when None, no PII, no input_text.
         log.info(
             "manager.create: task_id=%s type=%s mode=%s "
-            "per_job_root=%s",
+            "per_job_root=%s executor_session=%s",
             task_id,
             type,
             mode,
             repo_root or "",
+            executor_session_id or "",
         )
         self._emit_event(task_id, EventKind.CREATED, {
             "title": title, "type": type, "priority": priority, "owner": owner,
@@ -268,6 +300,9 @@ class TaskManager:
             # AEE-7.2: only emit the field when actually set so the
             # event log stays compact for the legacy default case.
             **({"repo_root": repo_root} if repo_root else {}),
+            # AEE write-side metadata: only emit when set, same
+            # compact-log policy as repo_root.
+            **({"executor_session_id": executor_session_id} if executor_session_id else {}),
         })
         if initial_status == "queued":
             _append_log(task_id, "INFO", "queued — waiting for dispatcher worker")
@@ -360,14 +395,22 @@ class TaskManager:
         old = row["status"]
         if not is_legal_transition(old, "running"):
             raise IllegalTransition(f"{task_id}: {old} -> running not allowed")
+        # AEE write-side metadata: stamp the provider's external
+        # run id onto the new `runtime_run_id` column. This is
+        # the first time the dispatcher knows which provider
+        # accepted the job, so it is the authoritative point to
+        # record it. The legacy `hermes_run_id` column keeps the
+        # same value (it's the same run id — just exposed under
+        # the runtime-neutral name now). Idempotent: re-starting
+        # a running task re-stamps the same value.
         with transaction() as conn2:
             started_at = row["started_at"] or ts
             conn2.execute(
-                "UPDATE tasks SET status = 'running', hermes_run_id = ?, started_at = ? WHERE task_id = ?",
-                (hermes_run_id, started_at, task_id),
+                "UPDATE tasks SET status = 'running', hermes_run_id = ?, runtime_run_id = ?, started_at = ? WHERE task_id = ?",
+                (hermes_run_id, hermes_run_id, started_at, task_id),
             )
         _append_log(task_id, "INFO", f"started hermes_run_id={hermes_run_id}")
-        self._emit_event(task_id, EventKind.STARTED, {"hermes_run_id": hermes_run_id})
+        self._emit_event(task_id, EventKind.STARTED, {"hermes_run_id": hermes_run_id, "runtime_run_id": hermes_run_id})
         return self.get_or_raise(task_id)
 
     def progress(self, task_id: str, pct: int, step: Optional[str] = None) -> Task:

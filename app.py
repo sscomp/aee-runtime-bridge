@@ -294,6 +294,18 @@ class CreateRunRequest(BaseModel):
         None, max_length=64,
         description="Model to use, e.g. 'claude-sonnet-4-6'.",
     )
+    executor_session_id: Optional[str] = Field(
+        None, max_length=200,
+        description=(
+            "AEE write-side metadata: the caller's session id "
+            "(e.g. the orchestrator or ChatGPT session that asked "
+            "for this dispatch). Persisted on the `tasks` row at "
+            "create time so the read-side identity validator can "
+            "cite an authoritative value instead of guessing "
+            "from heuristics. Optional — legacy callers that "
+            "don't pass it keep the column NULL."
+        ),
+    )
 
     @field_validator("mode")
     @classmethod
@@ -602,6 +614,11 @@ async def create_run(
         openai_run_id=body.openai_run_id,
         prompt_version=body.prompt_version,
         model_name=effective_model_name,
+        # AEE write-side metadata: forward the caller's
+        # session id from the wire contract to the dispatcher's
+        # `manager.create(..., executor_session_id=...)` kwarg.
+        # Optional — None when the caller didn't pass one.
+        executor_session_id=body.executor_session_id,
     )
     task_id = task.task_id
     # Record the source + override note on the task log. This is the audit

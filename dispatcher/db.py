@@ -153,6 +153,40 @@ _AEE72_MIGRATIONS: list[tuple[str, str]] = [
     ),
 ]
 
+
+# AEE write-side metadata: the dispatcher's CREATE path now stamps
+# two extra columns onto the `tasks` row so the read-side identity
+# validator (aee/reporting/identity.py) does NOT have to guess
+# the executor's session / runtime run id from heuristics.
+#
+# * `executor_session_id` is the *caller's* session id (the
+#   orchestrator or ChatGPT session that asked the dispatcher to
+#   run this task). It is written at `manager.create(...)` time and
+#   is None when the caller did not pass one (legacy default).
+# * `runtime_run_id` is the *provider's* external run id, the
+#   value the worker returned from `Provider.submit()`. It is
+#   written at `manager.start(...)` time (the moment the provider
+#   accepts the job) and may stay None for tasks that were
+#   never dispatched (e.g. fail-fast at queueing).
+#
+# Both columns are NULLable; legacy tasks round-trip with
+# `executor_session_id = NULL` and `runtime_run_id = NULL`. The
+# `tasks` row never has its `hermes_run_id` overwritten — it
+# remains the canonical "external id" alias for backward compat.
+# See `Abacus/AEE/AEE_MASTER_PLAN.md` §20.9.10 "Dispatcher
+# write-side metadata" for the original deferred limitation
+# that this slice closes.
+_AEE7_WRITE_SIDE_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "executor_session_id",
+        "ALTER TABLE tasks ADD COLUMN executor_session_id TEXT",
+    ),
+    (
+        "runtime_run_id",
+        "ALTER TABLE tasks ADD COLUMN runtime_run_id TEXT",
+    ),
+]
+
 # AEE-4: Worker metadata + status. Adds 11 columns to `workers` so any
 # registered worker can self-describe its runtime, environment, and
 # current state. The columns are NULLable except `status`, which
@@ -309,6 +343,16 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if row is None:
             conn.execute(stmt)
+    # AEE write-side metadata: executor_session_id + runtime_run_id
+    # columns on `tasks`. Same idempotent pragma pattern as AEE-7.2;
+    # legacy rows keep their NULL values.
+    for col, stmt in _AEE7_WRITE_SIDE_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
     # AEE-1: index for the new lookup path. Idempotent via IF NOT EXISTS.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_run_id ON tasks(external_run_id)"
@@ -449,6 +493,21 @@ def run_migrations() -> list[str]:
         if row is None:
             conn.execute(stmt)
             print(f"[db] AEE-7.2 migration: added tasks.{col}", file=sys.stderr)
+            added.append(col)
+    # AEE write-side metadata: executor_session_id + runtime_run_id
+    # columns on `tasks`. Same idempotent pragma pattern as AEE-7.2;
+    # legacy rows keep their NULL values.
+    for col, stmt in _AEE7_WRITE_SIDE_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(
+                f"[db] AEE write-side metadata migration: added tasks.{col}",
+                file=sys.stderr,
+            )
             added.append(col)
     # Indexes (idempotent).
     conn.execute(
