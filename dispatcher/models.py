@@ -83,6 +83,13 @@ class Task:
     # worker with the right `adapter_name` can claim). Values are
     # always stored normalized: lowercase, trimmed, deduped, sorted.
     required_capabilities: List[str] = field(default_factory=list)
+    # AEE-7.2: per-job repo_root constraint. The dispatcher
+    # persists this verbatim and the artifact pipeline resolves
+    # it into an ArtifactPolicy at collect() time. ``None``
+    # means "no per-job constraint" — the pipeline keeps its
+    # permissive default. The field is purely additive; legacy
+    # tasks (pre-AEE-7.2) round-trip with ``None``.
+    repo_root: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)

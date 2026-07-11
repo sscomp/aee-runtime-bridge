@@ -134,6 +134,25 @@ _AEE3_MIGRATIONS: list[tuple[str, str]] = [
     ),
 ]
 
+# AEE-7.2: per-job `repo_root` artifact boundary. AEE-6.4 promised
+# a per-job allowlist; AEE-7.1 shipped the runtime-requirements
+# shape (`TaskRuntimeRequirements.repo_root`); AEE-7.2 actually
+# persists it on the `tasks` row and wires it into
+# ``_verify_expected_delivery`` so the ``ArtifactPolicy`` at
+# ``complete()`` time only accepts paths inside the repo.
+#
+# Column is NULLable — legacy tasks that did not declare a
+# ``repo_root`` keep their existing behaviour (permissive
+# policy, i.e. accept any path the worker wrote). A task that
+# declares a non-NULL ``repo_root`` gets a tightened policy at
+# ``complete()`` time; see ``aee/artifacts/policy_factory.py``.
+_AEE72_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "repo_root",
+        "ALTER TABLE tasks ADD COLUMN repo_root TEXT",
+    ),
+]
+
 # AEE-4: Worker metadata + status. Adds 11 columns to `workers` so any
 # registered worker can self-describe its runtime, environment, and
 # current state. The columns are NULLable except `status`, which
@@ -282,6 +301,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     _apply_aee3_migrations(conn)
     # AEE-4: worker metadata + status columns on `workers`. Same pattern.
     _apply_aee4_migrations(conn)
+    # AEE-7.2: per-job repo_root column on `tasks`.
+    for col, stmt in _AEE72_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
     # AEE-1: index for the new lookup path. Idempotent via IF NOT EXISTS.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_run_id ON tasks(external_run_id)"
@@ -411,6 +438,17 @@ def run_migrations() -> list[str]:
         if row is None:
             conn.execute(stmt)
             print(f"[db] AEE-4 migration: added workers.{col}", file=sys.stderr)
+            added.append(col)
+    # AEE-7.2: per-job repo_root column on `tasks`. Same idempotent
+    # pattern as AEE-1 / AEE-3.
+    for col, stmt in _AEE72_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(f"[db] AEE-7.2 migration: added tasks.{col}", file=sys.stderr)
             added.append(col)
     # Indexes (idempotent).
     conn.execute(

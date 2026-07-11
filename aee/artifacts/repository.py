@@ -75,6 +75,19 @@ class ArtifactRepository(Protocol):
 
     def record_policy_event(self, event: dict) -> None: ...
 
+    def list_policy_events(
+        self,
+        task_id: Optional[str] = None,
+        *,
+        code: Optional[str] = None,
+        accepted: Optional[bool] = None,
+        limit: int = 1000,
+    ) -> List[dict]: ...
+
+    def update_policy_event_artifact_id(
+        self, *, decision_id: str, artifact_id: str
+    ) -> None: ...
+
 
 # AEE-6.3 — artifact policy event payload shape (informational;
 # not enforced at runtime, but documented for callers).
@@ -185,6 +198,52 @@ class InMemoryArtifactRepository:
         if not hasattr(self, "_policy_events"):
             self._policy_events = []  # type: ignore[attr-defined]
         self._policy_events.append(dict(event))  # type: ignore[attr-defined]
+
+    def list_policy_events(
+        self,
+        task_id: Optional[str] = None,
+        *,
+        code: Optional[str] = None,
+        accepted: Optional[bool] = None,
+        limit: int = 1000,
+    ) -> List[dict]:
+        """AEE-7.2 — read back policy events for the in-memory audit log.
+
+        Mirrors the SQLite impl signature: ``task_id`` filters the
+        primary subject; ``code`` / ``accepted`` are optional
+        equality filters; ``limit`` caps the result count.
+        """
+        events = getattr(self, "_policy_events", [])
+        out: List[dict] = []
+        for ev in events:
+            if task_id is not None and ev.get("task_id") != task_id:
+                continue
+            if code is not None and ev.get("code") != code:
+                continue
+            if accepted is not None and bool(ev.get("accepted")) is not accepted:
+                continue
+            out.append(dict(ev))
+        # Newest first by recorded_at (fall back to insertion order).
+        out.sort(key=lambda e: e.get("recorded_at", ""), reverse=True)
+        return out[: int(limit)]
+
+    def update_policy_event_artifact_id(
+        self, *, decision_id: str, artifact_id: str
+    ) -> None:
+        """AEE-7.1 — backfill ``artifact_id`` on the audit row.
+
+        ``ArtifactPipeline.collect()`` writes the policy decision
+        audit row *before* it has saved the placeholder Artifact
+        (the rejection flow). The pipeline then needs to update
+        the row's ``artifact_id`` so the audit ↔ artifact join
+        is intact. The default Protocol in this module does not
+        require this hook; callers that don't expose it get a
+        silent no-op via the ``hasattr`` guard in ``collect.py``.
+        """
+        for event in getattr(self, "_policy_events", []):
+            if event.get("decision_id") == decision_id:
+                event["artifact_id"] = artifact_id
+                return
 
     @property
     def policy_events(self) -> List[dict]:
@@ -396,6 +455,26 @@ class SqliteArtifactRepository:
                 event.get("artifact_id"),
                 recorded_at,
             ),
+        )
+        self.conn.commit()
+
+    def update_policy_event_artifact_id(
+        self, *, decision_id: str, artifact_id: str
+    ) -> None:
+        """AEE-7.1 — backfill ``artifact_id`` on a previously recorded row.
+
+        Called by ``ArtifactPipeline.collect()`` after the
+        placeholder Artifact for a *rejected* path has been
+        saved. The audit row was written with ``artifact_id=NULL``
+        because the placeholder didn't exist yet. The dispatcher
+        relies on ``artifact_policy_events.artifact_id`` to join
+        the audit log with the artifacts table, so the link has
+        to be present even on the rejection path.
+        """
+        self.conn.execute(
+            "UPDATE artifact_policy_events SET artifact_id = ? "
+            "WHERE decision_id = ?",
+            (artifact_id, decision_id),
         )
         self.conn.commit()
 
