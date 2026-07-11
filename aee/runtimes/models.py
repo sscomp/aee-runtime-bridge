@@ -276,16 +276,24 @@ class TaskRuntimeRequirements:
     Semantics:
       * `runtime_type` — exact-match filter; if set, only
         Runtimes of this type are candidates.
-      * `required_capabilities` — every Runtime in
-        candidate set must have every required capability.
-      * `required_labels` — every Runtime in candidate set
-        must have every required label (k=v) (subset).
-      * `preferred_runtime_ids` — sort key: preferred
-        Runtimes rank first (after required filters).
-      * `preferred_capabilities` — tie-breaker weight:
-        Runtimes with more of these get a higher score.
-      * `excluded_runtime_ids` — hard exclude; Runtimes in
-        this set are NEVER candidates.
+          * `required_capabilities` — every Runtime in
+            candidate set must have every required capability.
+          * `required_labels` — every Runtime in candidate set
+            must have every required label (k=v) (subset).
+          * `preferred_runtime_ids` — sort key: preferred
+            Runtimes rank first (after required filters).
+          * `preferred_capabilities` — tie-breaker weight:
+            Runtimes with more of these get a higher score.
+          * `excluded_runtime_ids` — hard exclude; Runtimes in
+            this set are NEVER candidates.
+          * `repo_root` — AEE-7.1: the working directory the
+            provider should run in. Optional; the provider
+            falls back to its descriptor's ``default_workdir``
+            label, then to its own default. AEE-7.1 only
+            configures the value; AEE-7.2 will enforce the
+            policy that the provider's effective cwd must be
+            a descendant of the task's ``repo_root`` (or
+            ``/tmp`` for the AEE-6.3 smoke path).
     """
 
     runtime_type: Optional[str] = None
@@ -294,6 +302,7 @@ class TaskRuntimeRequirements:
     required_labels: Dict[str, str] = field(default_factory=dict)
     preferred_runtime_ids: List[str] = field(default_factory=list)
     excluded_runtime_ids: List[str] = field(default_factory=list)
+    repo_root: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -303,6 +312,7 @@ class TaskRuntimeRequirements:
             "required_labels": dict(self.required_labels),
             "preferred_runtime_ids": list(self.preferred_runtime_ids),
             "excluded_runtime_ids": list(self.excluded_runtime_ids),
+            "repo_root": self.repo_root,
         }
 
     @classmethod
@@ -333,6 +343,9 @@ class TaskRuntimeRequirements:
         excl_ids = data.get("excluded_runtime_ids") or []
         if not isinstance(excl_ids, list):
             excl_ids = []
+        repo_root = data.get("repo_root")
+        if repo_root is not None:
+            repo_root = str(repo_root).strip() or None
         return cls(
             runtime_type=rt,
             required_capabilities=[str(c) for c in req_caps if c],
@@ -340,6 +353,7 @@ class TaskRuntimeRequirements:
             required_labels=req_labels,
             preferred_runtime_ids=[str(c) for c in pref_ids if c],
             excluded_runtime_ids=[str(c) for c in excl_ids if c],
+            repo_root=repo_root,
         )
 
     def is_empty(self) -> bool:
@@ -351,8 +365,8 @@ class TaskRuntimeRequirements:
             and not self.required_labels
             and not self.preferred_runtime_ids
             and not self.excluded_runtime_ids
+            and not self.repo_root
         )
-
 
 # ---------------------------------------------------------------------------
 # Selection result + dispatch record
@@ -374,8 +388,11 @@ class DispatchStatus:
 
     SELECTED = "selected"
     DISPATCHED = "dispatched"
+    COMPLETED = "completed"
     FAILED = "failed"
-    ALL = (SELECTED, DISPATCHED, FAILED)
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    ALL = (SELECTED, DISPATCHED, COMPLETED, FAILED, TIMED_OUT, CANCELLED)
 
 
 @dataclass

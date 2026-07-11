@@ -96,6 +96,24 @@ from .exec_provider import (
 # set is dropped.  ``ANTHROPIC_*`` is intentionally absent except for
 # ``ANTHROPIC_BASE_URL`` (which is routing, not auth) and
 # ``ANTHROPIC_DEFAULT_*_MODEL`` (which is just a default).
+#
+# AEE-7.1 AUTH RESCUE NOTE (2026-07-11):
+#   On the Abacus-AI host, Claude Code is driven via the Ollama-Cloud
+#   API (ANTHROPIC_BASE_URL=https://ollama.com REDACTED) with the
+#   ``minimax-m3:cloud`` model. The auth credential in the parent env
+#   is ``ANTHROPIC_AUTH_TOKEN`` (Ollama-Cloud bearer token), not
+#   ``ANTHROPIC_API_KEY``. Claude CLI 2.1.206's default code path
+#   (``bare=False``) honours ``ANTHROPIC_API_KEY`` for auth; using
+#   ``--bare`` (hermetic mode) STRICTLY reads ``ANTHROPIC_API_KEY`` and
+#   ignores ``ANTHROPIC_AUTH_TOKEN`` → "Not logged in".
+#   The fix is twofold (see also ``claude_code_provider_shim.py``):
+#     1. Add ``ANTHROPIC_MODEL`` here (canonical Claude-Code override).
+#     2. The shim injects ``ANTHROPIC_API_KEY`` from
+#        ``ANTHROPIC_AUTH_TOKEN`` *only* if the former is unset, so the
+#        worker subprocess can authenticate against the Ollama-Cloud
+#        proxy that sits behind ``ANTHROPIC_BASE_URL``.
+#   The parent env's ``OLLAMA_API_KEY`` is NOT forwarded (Claude CLI
+#   does not read it; the auth path is the Anthropic-style env vars).
 _ALLOWED_ENV_VARS = frozenset(
     {
         "PATH",
@@ -125,6 +143,11 @@ _ALLOWED_ENV_VARS = frozenset(
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "ANTHROPIC_FOUNDRY_RESOURCE",
         "ANTHROPIC_BEDROCK_BASE_URL",
+        # AEE-7.1 — canonical per-session model override; was missing
+        # from the AEE-6.3 list. With ``ANTHROPIC_BASE_URL`` pointing
+        # at Ollama-Cloud, the upstream honours this var and routes
+        # the request to ``minimax-m3:cloud``.
+        "ANTHROPIC_MODEL",
         # Auth — forwarded to the worker so it can talk to the upstream
         # API. The AEE-6.3 case study originally said
         # ``ANTHROPIC_AUTH_TOKEN`` must NOT be forwarded; in practice

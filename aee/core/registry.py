@@ -89,13 +89,44 @@ def bootstrap_defaults(force: bool = False) -> None:
     In production this wires the real HermesAdapter; the function
     is safe to call more than once (subsequent calls are no-ops
     unless `force=True`).
+
+    AEE-7.1: also registers the ``ClaudeCodeRuntimeAdapter`` shim
+    so a task with ``adapter_name="claude_code"`` routes through
+    the ``ExecutionOrchestrator`` instead of the legacy
+    ``adapter_registry`` 404 path. The shim is best-effort —
+    if the AEE-7 orchestrator cannot be imported, the
+    hermes-only fallback is preserved.
     """
     from aee.adapters.hermes_adapter import HermesAdapter  # local import
 
     existing = "hermes" in adapter_registry.names()
     if existing and not force:
+        # Even when we are not forcing, still make sure the
+        # claude_code shim is registered (idempotent).
+        _register_aee7_defaults()
         return
     adapter_registry.register(HermesAdapter(), replace=True)
+    _register_aee7_defaults()
+
+
+def _register_aee7_defaults() -> None:
+    """AEE-7.1: register the claude_code AEE-2 adapter shim.
+
+    Idempotent: if the shim is already registered, this is a
+    no-op. If the import fails (e.g. slim install), the shim
+    is silently skipped — legacy ``adapter_name="hermes"``
+    tasks still work.
+    """
+    if "claude_code" in adapter_registry.names():
+        return
+    try:
+        from aee.orchestrator.aee2_shim import ClaudeCodeRuntimeAdapter
+    except Exception:  # noqa: BLE001 - defensive
+        return
+    try:
+        adapter_registry.register(ClaudeCodeRuntimeAdapter(), replace=True)
+    except Exception:  # noqa: BLE001 - defensive
+        pass
 
 
 # ---------------------------------------------------------------------------
