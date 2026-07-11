@@ -6,9 +6,11 @@ Run:
 or:
     .venv/bin/python tests/test_dispatcher.py
 
-The test suite uses a *fresh* in-memory-style DB by deleting
-`data/dispatcher.db` first (idempotent), so it never touches a real
-task store. Keep it that way.
+The test suite uses a *fresh* in-memory-style DB built in a
+tempdir (idempotent), so it never touches the production
+``data/dispatcher.db`` (the live bridge is running and holds
+the file open; touching the production path is unsafe —
+see AEE_MASTER_PLAN §A.7.15).
 """
 from __future__ import annotations
 
@@ -23,47 +25,76 @@ _ROOT = _HERE.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# Reset DB before importing modules.
-from dispatcher.db import DB_PATH, DB_DIR
-if DB_PATH.exists():
-    DB_PATH.unlink()
-for ext in ("-wal", "-shm"):
-    p = DB_PATH.with_name(DB_PATH.name + ext)
-    if p.exists():
-        p.unlink()
-# G2 (sqlite thread-local reset) is handled by test_workers_api /
-# test_phase4_delivery module-level fixtures (db._local.conn = None),
-# so we don't re-do it here.
+# AEE-7.6: use the live-DB safety guard so the test never touches
+# the production ``data/dispatcher.db``. The helper yields a
+# tempdir copy of the production schema (no row data) and rebinds
+# ``dispatcher.db`` + ``dispatcher.manager`` to point at it. The
+# canonical unlink at module load is now against the tempdir
+# copy, not the live DB.
+import importlib.util
+import tempfile
+_TMPDIR = tempfile.mkdtemp(prefix="aee76-dispatcher-test-")
+_guard_spec = importlib.util.spec_from_file_location(
+    "_aee76_live_db_guard", _ROOT / "tests" / "_live_db_guard.py"
+)
+_guard_mod = importlib.util.module_from_spec(_guard_spec)
+_guard_spec.loader.exec_module(_guard_mod)
 
-# Reset logs / reports directories for a clean slate.
-for d in (_ROOT / "logs", _ROOT / "reports"):
+# Enter the point_module_to_temp_db context. The rebinding must
+# persist for the entire lifetime of the test module (we are
+# ABOUT to import dispatcher.db and dispatcher.manager, which
+# bind module-level constants at import time). The exit from
+# the with-block below would restore the production paths; we
+# keep the context open for the rest of the module. The tempdir
+# is removed on interpreter exit via the atexit hook below.
+_TEMP_DB_PATH = Path(_TMPDIR) / "dispatcher.db"
+_point_ctx = _guard_mod.point_module_to_temp_db(_TEMP_DB_PATH)
+_db, _mgr = _point_ctx.__enter__()
+
+# AEE-7.6: register a process-exit hook to (a) restore the
+# production DB_PATH (so the in-process rebinding doesn't leak
+# to a sibling test module loaded later in the same process)
+# and (b) remove the tempdir. This is the only way to keep
+# the tempdir out of /tmp after the test run.
+import atexit as _atexit
+
+def _aee76_cleanup_dispatcher_test() -> None:
+    try:
+        _point_ctx.__exit__(None, None, None)
+    except Exception:
+        pass
+    import shutil as _sh
+    with __import__("contextlib").suppress(OSError):
+        if Path(_TMPDIR).exists():
+            _sh.rmtree(_TMPDIR, ignore_errors=True)
+
+_atexit.register(_aee76_cleanup_dispatcher_test)
+
+# Reset logs / reports directories for a clean slate. We sweep
+# the tempdir's logs/reports rather than the bridge root's, so
+# the test never touches production logs.
+for d in (Path(_TMPDIR) / "logs", Path(_TMPDIR) / "reports"):
     if d.exists():
         for child in d.iterdir():
             if child.is_file():
                 child.unlink()
 
-from dispatcher.ids import next_task_id
-from dispatcher.manager import (
+from dispatcher.ids import next_task_id  # noqa: E402
+from dispatcher.manager import (  # noqa: E402
     IllegalTransition,
     TaskManager,
     TaskNotFound,
 )
-from dispatcher.models import is_legal_transition, is_legal_progress, LEGAL_PROGRESS_PCTS
-from dispatcher.progress import next_pct_hint, validate_progress, monotonic
+from dispatcher.models import is_legal_transition, is_legal_progress, LEGAL_PROGRESS_PCTS  # noqa: E402
+from dispatcher.progress import next_pct_hint, validate_progress, monotonic  # noqa: E402
 
-import dispatcher.manager as _mgr
+import dispatcher.manager as _mgr  # noqa: E402
 
-# Default LOGS_DIR / REPORTS_DIR (based on the bridge root, not on
-# whatever some other test module may have mutated at import time).
-# ``test_jobs_api`` / ``test_workers_api`` re-assign these module
-# attributes to per-test tmpdirs to isolate their own logs; if the
-# mutation survives into our test class we end up writing per-task
-# log files to a tmpdir while this test asserts they live under
-# ``bridge_root/logs``. We re-derive from the canonical
-# ``_BRIDGE_ROOT`` (the same source the module uses at import time)
-# so the assertion below is order-independent.
-_DEFAULT_LOGS_DIR = _mgr._BRIDGE_ROOT / "logs"
-_DEFAULT_REPORTS_DIR = _mgr._BRIDGE_ROOT / "reports"
+# Default LOGS_DIR / REPORTS_DIR (based on the tempdir, not the
+# bridge root). The conftest in tests/ will clean up the tempdir
+# on session teardown.
+_DEFAULT_LOGS_DIR = Path(_TMPDIR) / "logs"
+_DEFAULT_REPORTS_DIR = Path(_TMPDIR) / "reports"
 
 
 def _reset_manager_paths() -> None:
