@@ -99,9 +99,26 @@ from .identity import (
     read_identity_sidecar,
     write_identity_sidecar,
 )
+# AEE-7.6: identity consistency tripwire. Re-exported so any
+# audit / reporting consumer can import the validator alongside
+# the read-side identity model:
+#
+#   from aee.reporting import (
+#       validate_task_identity,
+#       tripwire_violations,
+#       ConsistencySeverity,
+#   )
+from .identity_consistency import (
+    ConsistencySeverity,
+    IdentityConsistencyReport,
+    validate_task_identity,
+    tripwire_violations,
+)
 
 __all__ = [
+    "ConsistencySeverity",
     "Identity",
+    "IdentityConsistencyReport",
     "RecordKind",
     "SentinelPolicy",
     "classify_and_persist",
@@ -109,5 +126,7 @@ __all__ = [
     "iter_reports",
     "load_task_json",
     "read_identity_sidecar",
+    "tripwire_violations",
+    "validate_task_identity",
     "write_identity_sidecar",
 ]
