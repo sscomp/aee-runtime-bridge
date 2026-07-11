@@ -27,6 +27,7 @@ from dispatcher.manager import (
     TaskNotFound,
 )
 from aee.adapters.base import AdapterNotFoundError
+from aee.observability import EventKind
 
 
 router = APIRouter()
@@ -301,7 +302,7 @@ async def claim_job(
     db.update_worker_heartbeat(data["worker_id"], job_id=candidate["task_id"])
     manager.log(candidate["task_id"], f"claimed by worker_id={data['worker_id']}")
     manager._emit_event(
-        candidate["task_id"], "claimed",
+        candidate["task_id"], EventKind.CLAIMED,
         {"worker_id": data["worker_id"], "worker_type": worker_type},
     )
     task = manager.get_or_raise(candidate["task_id"])
