@@ -117,6 +117,15 @@ class PolicyDecision:
         events. Must not echo sensitive data — only path structure.
     decision_id
         Stable UUID for the decision; persisted with the event.
+    traversal_hint
+        AEE-7.1: ``True`` when the original path contained literal
+        ``..`` segments that were normalised away. The decision
+        itself may be ``OK`` (if the normalised path is still inside
+        an allowed root) or a violation code (if normalisation
+        pushed the path out of bounds). A traversal hint always
+        deserves its own audit row so ops can spot attempted
+        escapes; see :meth:`ArtifactPipeline.collect` and
+        :func:`record_traversal_event`.
     """
 
     code: PolicyViolationCode
@@ -124,6 +133,7 @@ class PolicyDecision:
     original: str
     detail: str
     decision_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    traversal_hint: bool = False
 
     @property
     def accepted(self) -> bool:
@@ -134,6 +144,13 @@ class PolicyDecision:
 
         Used by ``ArtifactCollector`` to emit one row per decision into
         the ``artifact_policy_events`` SQLite table.
+
+        AEE-7.1: the payload now carries a ``traversal_hint`` flag so
+        audit queries can filter on it without parsing the
+        free-form ``detail`` field. The collector still emits a
+        *secondary* row (via :func:`record_traversal_event`) when
+        the flag is set so the traversal attempt is queryable on
+        its own.
         """
         return {
             "decision_id": self.decision_id,
@@ -144,6 +161,7 @@ class PolicyDecision:
             "detail": self.detail,
             "source": source,
             "artifact_id": artifact_id,
+            "traversal_hint": bool(self.traversal_hint),
         }
 
 
@@ -360,6 +378,7 @@ class ArtifactPolicy:
                     f"path is outside allowed roots "
                     f"({self._roots_summary()})"
                 ),
+                traversal_hint=traversal_hint,
             )
 
         # Step 5: build OK decision, preserving the traversal hint
@@ -379,6 +398,7 @@ class ArtifactPolicy:
             realpath=real_abs,
             original=original,
             detail=detail,
+            traversal_hint=traversal_hint,
         )
 
     # ------------------------------------------------------------------

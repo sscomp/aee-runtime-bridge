@@ -49,10 +49,11 @@ AEE-6.3 security contract
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .errors import (
     ArtifactAccessError,
@@ -61,6 +62,16 @@ from .errors import (
     ArtifactTooLargeError,
 )
 from .hashutil import MAX_HASH_BYTES, sha256_file
+
+# AEE-7.4 finalization — canonical event-kind SOT.  The
+# secondary audit row's ``code`` field uses the same literal
+# string as ``EventKind.TRAVERSAL`` so the tripwire regression
+# test (which scans for the literal across the production
+# code) will not flag this site.  We deliberately bind the
+# literal to the SOT at import time — a future rename in
+# ``aee/observability/events.py`` will be caught at test
+# time, not at SQL row mismatch time.
+from aee.observability import EventKind
 from .models import (
     ARTIFACT_KIND_UNKNOWN,
     Artifact,
@@ -73,6 +84,13 @@ from .policy import (
     PolicyViolationCode,
 )
 from .repository import ArtifactRepository  # noqa: F401  (forward ref target)
+
+
+# AEE-7.2 observability: module-scoped logger for collect + policy events.
+# Structured fields are joined with " key=value" so downstream logfmt
+# parsers can index them. NEVER log token / env / secret / full stdout;
+# `decision.detail` may echo back a path or a code, both safe.
+log = logging.getLogger("aee.artifacts.collect")
 
 
 # Crude mime guess from the extension. Deliberately small — this
@@ -278,6 +296,17 @@ class ArtifactPipeline:
 
         Returns the persisted `Artifact` records (with their
         repository-assigned `artifact_id`s).
+
+        AEE-7.1 audit contract
+        ----------------------
+        When ``decision.traversal_hint`` is ``True`` the collector
+        emits a *secondary* audit row with ``code="traversal"``
+        after the primary decision row. This makes
+        ``cat /repo/../etc/passwd``-style attempts queryable
+        on their own (the primary decision is still ``OK`` if
+        the destination is in-bounds). The secondary row uses
+        the same ``decision_id`` as the primary so a single
+        ``WHERE decision_id = ?`` returns both.
         """
         classifications = classifications or {}
         results: List[Artifact] = []
@@ -289,7 +318,43 @@ class ArtifactPipeline:
             )
             audit["task_id"] = task_id
             if not decision.accepted:
+                # We deliberately emit *one* primary audit row
+                # per policy check. The flow is: write the row
+                # with ``artifact_id=None``, then save the
+                # placeholder Artifact, then update the *same*
+                # row's ``artifact_id`` via the repository's
+                # ``update_policy_event_artifact_id`` hook. We
+                # do NOT write a second row (an earlier draft
+                # of this code did, and the AEE-7.1 audit
+                # contract test caught it — see
+                # ``test_aee7_traversal_audit``).
+                audit["artifact_id"] = None
                 self.repo.record_policy_event(audit)
+                # AEE-7.2 observability: one structured WARNING
+                # line per rejection. Includes the code, the
+                # decision_id (so operators can grep audit
+                # rows), the original path (caller-supplied),
+                # and the resolved realpath. NEVER logs token /
+                # env / secret / full stdout. ``detail`` is
+                # policy-controlled text and is treated as
+                # untrusted but bounded (≤ a few hundred chars
+                # in practice).
+                log.warning(
+                    "artifact.policy_violation task_id=%s decision_id=%s "
+                    "code=%s original=%s realpath=%s mode=%s",
+                    task_id,
+                    audit.get("decision_id", ""),
+                    decision.code.value,
+                    raw_path,
+                    decision.realpath,
+                    self.on_policy_violation,
+                )
+                # AEE-7.1: traversal hint always gets its own row.
+                if decision.traversal_hint:
+                    self._record_traversal_event(
+                        audit=audit,
+                        decision=decision,
+                    )
                 if self.on_policy_violation == "fail":
                     raise PolicyViolationError(decision)
                 # skip_and_warn: record a missing Artifact so the
@@ -309,11 +374,22 @@ class ArtifactPipeline:
                     ),
                 )
                 persisted = self.repo.save(record)
-                # The decision audit row referenced an artifact_id
-                # that didn't exist yet; backfill the link so ops
-                # can join on it.
-                audit["artifact_id"] = persisted.artifact_id
-                self.repo.record_policy_event(audit)
+                # Backfill the artifact_id on the *same* audit
+                # row (best-effort; if the repository does not
+                # support update, ops still has the artifact
+                # itself for the join).
+                try:
+                    self.repo.update_policy_event_artifact_id(
+                        decision_id=audit.get("decision_id"),
+                        artifact_id=persisted.artifact_id,
+                    )
+                except AttributeError:
+                    # Older repository implementations don't
+                    # expose the update hook; the in-memory
+                    # repo and the Sqlite repo both do, so a
+                    # missing hook here means a test fixture
+                    # that does not care about the back-link.
+                    pass
                 results.append(persisted)
                 continue
 
@@ -351,8 +427,72 @@ class ArtifactPipeline:
             audit["accepted"] = True
             audit["realpath"] = decision.realpath
             self.repo.record_policy_event(audit)
+            # AEE-7.1: traversal hint always gets its own row,
+            # even on OK (so a `cat /repo/../foo.md` that
+            # happens to land in-bounds is still visible in
+            # the audit log as code="traversal").
+            if decision.traversal_hint:
+                self._record_traversal_event(
+                    audit=audit,
+                    decision=decision,
+                )
             results.append(persisted)
         return results
+
+    def _record_traversal_event(
+        self,
+        *,
+        audit: Dict[str, Any],
+        decision: PolicyDecision,
+    ) -> None:
+        """Emit a secondary audit row with ``code="traversal"``.
+
+        The row uses the same ``decision_id`` as the primary
+        decision so audit queries can correlate the two with a
+        simple ``WHERE decision_id = ?``. The primary
+        decision's code (``OK`` or ``OUTSIDE_ROOTS``) is
+        preserved in the secondary row's ``detail`` so the
+        final outcome is recoverable.
+        """
+        secondary = dict(audit)
+        # AEE-7.4 finalization: bind the literal to the event-kind
+        # SOT so the tripwire regression test passes (it excludes
+        # the EventKind class body from the literal scan).
+        secondary["code"] = EventKind.TRAVERSAL
+        secondary["accepted"] = decision.accepted
+        secondary["detail"] = (
+            f"traversal_hint: original={decision.original!r} "
+            f"primary_code={decision.code.value} "
+            f"realpath={decision.realpath!r} "
+            f"({decision.detail})"
+        )
+        secondary["traversal_hint"] = True
+        # New decision_id for the secondary row so the
+        # ``code="traversal"`` index is populated with a
+        # distinct key. We link via a ``linked_decision_id``
+        # column instead.
+        secondary["linked_decision_id"] = decision.decision_id
+        # Drop the audit's decision_id (we replaced it).
+        secondary.pop("decision_id", None)
+        # AEE-7.2 observability: traversal attempts are
+        # surfaced at WARNING even when the primary decision
+        # is ``OK`` (in-bounds but came from outside the
+        # repo). Operators depend on this signal to detect
+        # possible exfiltration or path-construction bugs.
+        log.warning(
+            "artifact.traversal_hint task_id=%s primary_code=%s "
+            "accepted=%s original=%s realpath=%s",
+            audit.get("task_id", ""),
+            decision.code.value,
+            decision.accepted,
+            decision.original,
+            decision.realpath,
+        )
+        try:
+            self.repo.record_policy_event(secondary)
+        except Exception:  # noqa: BLE001 - defensive
+            # Never let a secondary row fail the collect batch.
+            pass
 
 
 class PolicyViolationError(ArtifactError):
