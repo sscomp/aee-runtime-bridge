@@ -154,6 +154,40 @@ _AEE72_MIGRATIONS: list[tuple[str, str]] = [
 ]
 
 
+# AEE-7.13 follow-up: when the live DB was rebuilt after the
+# forensic-recovery incident, the AEE-7.5 + AEE-7.2 write-side
+# columns were stamped ``NOT NULL DEFAULT ''`` instead of NULLable.
+# That contradicted the AEE-7.2 design contract (NULL = no per-job
+# constraint) and broke ``manager.create()`` for callers that did
+# not pass ``repo_root`` (caller's wire contract treats it as
+# optional). AEE-7.13-fix rebuild replaced the live DB; this
+# idempotent migration is a safety net for any future ``init_db``
+# on a DB with the buggy schema: it converts '' to NULL on
+# ``tasks.repo_root`` / ``tasks.executor_session_id`` /
+# ``tasks.runtime_run_id`` / ``tasks.external_run_id``. Safe to
+# re-run; harmless if columns are already NULL. Does NOT touch
+# other NOT NULL columns (worker_id/heartbeat_at/etc. — those have
+# legitimate empty-string semantics).
+_AEE713_FIXUP_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "aee713_repo_root_nullify",
+        "UPDATE tasks SET repo_root = NULL WHERE repo_root = ''",
+    ),
+    (
+        "aee713_executor_session_id_nullify",
+        "UPDATE tasks SET executor_session_id = NULL WHERE executor_session_id = ''",
+    ),
+    (
+        "aee713_runtime_run_id_nullify",
+        "UPDATE tasks SET runtime_run_id = NULL WHERE runtime_run_id = ''",
+    ),
+    (
+        "aee713_external_run_id_nullify",
+        "UPDATE tasks SET external_run_id = NULL WHERE external_run_id = ''",
+    ),
+]
+
+
 # AEE write-side metadata: the dispatcher's CREATE path now stamps
 # two extra columns onto the `tasks` row so the read-side identity
 # validator (aee/reporting/identity.py) does NOT have to guess
@@ -369,6 +403,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if row is None:
             conn.execute(stmt)
+    # AEE-7.13 fixup: idempotent safety net that normalises any
+    # legacy '' values to NULL on the 4 NULLable write-side columns
+    # (repo_root / executor_session_id / runtime_run_id /
+    # external_run_id). See _AEE713_FIXUP_MIGRATIONS comment block.
+    for _label, stmt in _AEE713_FIXUP_MIGRATIONS:
+        conn.execute(stmt)
     # AEE-1: index for the new lookup path. Idempotent via IF NOT EXISTS.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_run_id ON tasks(external_run_id)"
@@ -525,6 +565,11 @@ def run_migrations() -> list[str]:
                 file=sys.stderr,
             )
             added.append(col)
+    # AEE-7.13 fixup: idempotent '' -> NULL on the 4 NULLable
+    # write-side columns. Runs on every migration pass; harmless
+    # when the data is already NULL.
+    for _label, stmt in _AEE713_FIXUP_MIGRATIONS:
+        conn.execute(stmt)
     # Indexes (idempotent).
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_run_id ON tasks(external_run_id)"
