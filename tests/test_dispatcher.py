@@ -31,6 +31,9 @@ for ext in ("-wal", "-shm"):
     p = DB_PATH.with_name(DB_PATH.name + ext)
     if p.exists():
         p.unlink()
+# G2 (sqlite thread-local reset) is handled by test_workers_api /
+# test_phase4_delivery module-level fixtures (db._local.conn = None),
+# so we don't re-do it here.
 
 # Reset logs / reports directories for a clean slate.
 for d in (_ROOT / "logs", _ROOT / "reports"):
@@ -47,6 +50,30 @@ from dispatcher.manager import (
 )
 from dispatcher.models import is_legal_transition, is_legal_progress, LEGAL_PROGRESS_PCTS
 from dispatcher.progress import next_pct_hint, validate_progress, monotonic
+
+import dispatcher.manager as _mgr
+
+# Default LOGS_DIR / REPORTS_DIR (based on the bridge root, not on
+# whatever some other test module may have mutated at import time).
+# ``test_jobs_api`` / ``test_workers_api`` re-assign these module
+# attributes to per-test tmpdirs to isolate their own logs; if the
+# mutation survives into our test class we end up writing per-task
+# log files to a tmpdir while this test asserts they live under
+# ``bridge_root/logs``. We re-derive from the canonical
+# ``_BRIDGE_ROOT`` (the same source the module uses at import time)
+# so the assertion below is order-independent.
+_DEFAULT_LOGS_DIR = _mgr._BRIDGE_ROOT / "logs"
+_DEFAULT_REPORTS_DIR = _mgr._BRIDGE_ROOT / "reports"
+
+
+def _reset_manager_paths() -> None:
+    _mgr.LOGS_DIR = _DEFAULT_LOGS_DIR
+    _mgr.REPORTS_DIR = _DEFAULT_REPORTS_DIR
+
+
+# Run the reset eagerly at module load as well, in case a previous
+# test module's import-time mutation had already landed.
+_reset_manager_paths()
 
 
 class TestIdGenerator(unittest.TestCase):
@@ -111,6 +138,12 @@ class TestProgress(unittest.TestCase):
 
 class TestTaskLifecycle(unittest.TestCase):
     def setUp(self):
+        # Make sure the per-task log path is the canonical one,
+        # even if some other test module mutated ``mgr.LOGS_DIR``
+        # at import time. The mutation is module-level and
+        # order-dependent; restoring it here is the cheapest way
+        # to keep the lifecycle tests order-independent.
+        _reset_manager_paths()
         self.m = TaskManager()
 
     def test_create_returns_task(self):
@@ -180,6 +213,12 @@ class TestTaskLifecycle(unittest.TestCase):
             self.assertIn(needed, kinds, f"missing event: {needed}")
 
     def test_log_file_written(self):
+        # Per the module-level fixture above and the
+        # ``TestTaskLifecycle.setUp`` reset, ``mgr.LOGS_DIR`` is
+        # guaranteed to point at ``bridge_root/logs`` for this
+        # test — even if a previous test module mutated it at
+        # import time. The contract: a freshly-created task has a
+        # non-empty per-task log file under ``logs/{task_id}.log``.
         t = self.m.create(title="t", type="normal", input_text="x")
         log_path = _ROOT / "logs" / f"{t.task_id}.log"
         self.assertTrue(log_path.exists(), f"log not written: {log_path}")
@@ -192,6 +231,63 @@ class TestTaskLifecycle(unittest.TestCase):
         report_dir = _ROOT / "reports" / t.task_id
         self.assertTrue(report_dir.exists())
         self.assertTrue((report_dir / "task.json").exists())
+
+
+class TestManagerPathsOrderIndependence(unittest.TestCase):
+    """Regression test for the test_log_file_written baseline.
+
+    Why this test exists
+    --------------------
+    ``dispatcher.manager.LOGS_DIR`` and ``REPORTS_DIR`` are
+    module-level mutable attributes. ``test_jobs_api`` (and
+    ``test_workers_api``) re-assign them to per-test tmpdirs
+    at *import* time to isolate their own logs. If that
+    mutation leaks into ``TestTaskLifecycle.test_log_file_written``,
+    the per-task log file lands in a tmpdir while the assertion
+    expects ``bridge_root/logs/{task_id}.log``, and the test
+    fails.
+
+    The fix lives in ``tests/test_dispatcher.py``: a module-level
+    ``_reset_manager_paths()`` and a ``setUp`` call restore the
+    canonical paths. This test simulates the import-order race by
+    mutating the module attributes from inside the test, then
+    constructs a ``TaskManager`` (matching the lifecycle setUp
+    path) and verifies the per-task log file lands at the
+    canonical path.
+    """
+
+    def setUp(self):
+        # Make sure the canonical paths are in effect *before*
+        # we measure — covers the case where another test module
+        # mutated the attribute and we're the first to run.
+        _reset_manager_paths()
+
+    def test_log_file_lands_in_canonical_logs_dir_after_external_mutation(self):
+        # Simulate the leak: another test module mutated the
+        # module attribute at import time.
+        bogus = _ROOT / "logs" / "should_not_be_used_by_this_test"
+        _mgr.LOGS_DIR = bogus
+        _mgr.REPORTS_DIR = _ROOT / "reports_should_not_be_used_by_this_test"
+        try:
+            # Mimic the setUp reset.
+            _reset_manager_paths()
+            mgr = TaskManager()
+            t = mgr.create(title="t", type="normal", input_text="x")
+            log_path = _ROOT / "logs" / f"{t.task_id}.log"
+            self.assertTrue(
+                log_path.exists(),
+                f"log not written to canonical path: {log_path}",
+            )
+            self.assertGreater(log_path.stat().st_size, 0)
+            # The bogus dir must NOT have been created.
+            self.assertFalse(
+                bogus.exists(),
+                f"log leaked into bogus path: {bogus}",
+            )
+        finally:
+            # Restore the canonical paths for any subsequent test
+            # in this process.
+            _reset_manager_paths()
 
 
 class TestResearchModules(unittest.TestCase):
