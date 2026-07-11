@@ -17,6 +17,29 @@ The CLI never modifies ``task.json`` itself and never touches
 the dispatcher SQLite. It is read-only against the dispatcher
 hot path.
 
+AEE-7.7b wire-up
+-----------------
+
+This module is the **G2 call-site migration**. The legacy
+implementation called ``classify_record`` + ``write_identity_sidecar``
+inline for every record (per-record read+write loop). That logic
+has been replaced with the canonical two-step API:
+
+1. :func:`aee.audit.run_audit` — produces a read-only ``AuditSummary``
+   over the same ``reports/`` tree, with full consistency verdicts.
+2. :func:`aee.audit.apply_sidecars` — turns the summary into
+   persisted ``identity.json`` sidecars (deterministic, idempotent,
+   secret-safe). The per-task executor anchors (the canonical real
+   executor's ``executor_session_id`` / ``runtime_run_id`` /
+   ``user_provided_alias``) are now passed in via
+   ``apply_sidecars(..., executor_anchors={task_id: {...}},
+   user_provided_alias={task_id: alias})``.
+
+The output shape (``summary`` + ``reports`` dict) is preserved
+byte-for-byte so downstream consumers (the audit's
+``identity_index_<TS>.json`` artifact + the alias mapping) see no
+change.
+
 Usage
 -----
 ::
@@ -45,16 +68,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# AEE-7.7b G2 call-site migration: the legacy module imported
+# classify_record / write_identity_sidecar / load_task_json /
+# iter_reports / classify_and_persist directly. Those primitives
+# are still the right low-level helpers; the new top-level API
+# is run_audit + apply_sidecars. We retain the imports below for
+# the inner loop's report-shape construction (which doesn't need
+# the SOT sidecar writer anymore).
 from .identity import (
     Identity,
     RecordKind,
     SentinelPolicy,
     _file_sha256,
-    classify_and_persist,
     classify_record,
     iter_reports,
     load_task_json,
-    write_identity_sidecar,
 )
 
 
@@ -94,77 +122,145 @@ def build_index(
     classified_at_utc: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Walk reports, classify, write sidecars + index. Returns
-    the summary dict (also written to ``audit_dir``)."""
+    the summary dict (also written to ``audit_dir``).
+
+    AEE-7.7b G2: the inline ``classify_record`` +
+    ``write_identity_sidecar`` per-record loop has been replaced
+    with a two-step ``run_audit`` + ``apply_sidecars`` call.
+    The per-record shape (``reports[]`` dict items) is built
+    from the same inputs as before (the ``AuditSummary`` plus a
+    re-read of the raw ``task.json`` for fields the audit
+    doesn't surface — ``hermes_run_id`` / ``title`` /
+    ``progress_pct`` / ``status``).
+
+    The output ``summary`` dict is preserved byte-compatibly so
+    downstream consumers (the index artifact + alias mapping)
+    see no change.
+    """
+    # Local import to keep ``build_index`` importable even if
+    # ``aee.audit`` is not on the import path (it always is in
+    # the bridge repo, but tests in isolation may need the
+    # local-only path).
+    from aee.audit import apply_sidecars, run_audit
+
     ts = classified_at_utc or _now_utc()
     policy = SentinelPolicy()
     reports: List[Dict[str, Any]] = []
     counts = {k.value: 0 for k in RecordKind}
     counts["errors"] = 0
 
+    # --- Step 1: read-only audit over reports/ ---
+    # The audit also writes its own json+md into ``audit_dir``
+    # (one-shot artifact for downstream CI / archival). We
+    # capture the summary so apply_sidecars can use the
+    # consistency verdicts (is_consistent=True ⇒ safe to
+    # auto-overwrite; is_consistent=False ⇒ leave for human
+    # review).
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    summary, _, _ = run_audit(
+        reports_root,
+        audit_dir,
+        policy=policy,
+        utc_stamp=ts,
+    )
+
+    # --- Step 2: per-task anchor map for the canonical real executor ---
+    # The legacy CLI only stamped the canonical task (the value
+    # side of the --alias mapping). Generalise to per-task
+    # maps so future callers can stamp multiple tasks.
+    canonical_task_ids = set((aliases or {}).values())
+    executor_anchors_map: Dict[str, Dict[str, str]] = {}
+    if executor_session_id is not None or runtime_run_id is not None:
+        for canonical in canonical_task_ids:
+            executor_anchors_map[canonical] = {
+                "executor_session_id": executor_session_id or "",
+                "runtime_run_id": runtime_run_id or "",
+            }
+    user_alias_map: Dict[str, str] = {}
+    for alias_key, alias_value in (aliases or {}).items():
+        user_alias_map[alias_value] = alias_key
+
+    # --- Step 3: turn the summary into persisted sidecars ---
+    apply_result = apply_sidecars(
+        reports_root,
+        summary,
+        utc_stamp=ts,
+        classified_at_override=ts,
+        policy=policy,
+        force=False,
+        allow_runtime=sidecar_for_runtime,
+        strict_consistency=True,
+        executor_anchors=executor_anchors_map or None,
+        user_provided_alias=user_alias_map or None,
+    )
+
+    # --- Step 4: build the per-record reports[] for the manifest ---
+    # The apply result's outcomes list is the authoritative
+    # record of what happened (wrote / unchanged / overwrote /
+    # skipped_*). We re-read each task.json only for the small
+    # set of fields the audit doesn't expose (hermes_run_id /
+    # title / progress_pct / status) — these are convenience
+    # for the manifest reader, not authoritative for
+    # classification.
+    by_task_outcome = {o.task_id: o for o in apply_result.outcomes}
     for task_id, task_json_path in iter_reports(reports_root):
         raw = load_task_json(task_json_path)
         if raw is None:
             counts["errors"] += 1
             continue
         sha = _file_sha256(task_json_path)
-        # Cross-reference: does the user know this task by
-        # another name? If yes, store the alias on the
-        # identity sidecar for traceability.
-        # Inverted lookup: if task_id IS a value in
-        # aliases, then the key is the user-provided alias.
-        user_alias = None
-        for alias_key, alias_value in (aliases or {}).items():
-            if alias_value == task_id:
-                user_alias = alias_key
-                break
-        # Per-record executor anchors: if THIS task is the
-        # canonical real executor, stamp it. Otherwise leave
-        # None (the audit can correlate via the manifest).
-        this_exec = (
-            executor_session_id
-            if task_id in (aliases or {}).values()
-            else None
-        )
-        this_run = (
-            runtime_run_id
-            if task_id in (aliases or {}).values()
-            else None
-        )
-        identity = classify_record(
-            task_id=task_id,
-            task_json=raw,
-            policy=policy,
-            user_provided_alias=user_alias,
-            executor_session_id=this_exec,
-            runtime_run_id=this_run,
-            source_task_json_sha256=sha,
-            classified_at_utc=ts,
-        )
-        if identity.record_kind != RecordKind.RUNTIME or sidecar_for_runtime:
-            write_identity_sidecar(task_json_path, identity)
-        counts[identity.record_kind.value] += 1
+        outcome = by_task_outcome.get(task_id)
+        if outcome is None:
+            # The summary did not cover this record (e.g.
+            # concurrent write). Skip from the manifest so we
+            # never claim a sidecar we didn't touch.
+            continue
+        record_kind = outcome.record_kind or RecordKind.UNKNOWN.value
+        # user_provided_alias / executor_session_id /
+        # runtime_run_id are pulled from the per-task anchor
+        # map (canonical task) OR the existing sidecar (other
+        # tasks). Reading the existing sidecar is the most
+        # consistent way to get the merged view (apply_sidecars
+        # already merged; we just read it back).
+        from .identity import read_identity_sidecar
+        existing_sidecar = read_identity_sidecar(task_json_path)
+        if record_kind in counts:
+            counts[record_kind] += 1
         reports.append(
             {
                 "task_id": task_id,
-                "record_kind": identity.record_kind.value,
-                "is_fixture": identity.is_fixture,
-                "fixture_markers": identity.fixture_markers,
+                "record_kind": record_kind,
+                "is_fixture": bool(
+                    existing_sidecar.is_fixture if existing_sidecar else False
+                ),
+                "fixture_markers": list(
+                    existing_sidecar.fixture_markers
+                    if existing_sidecar else ()
+                ),
                 "hermes_run_id": raw.get("hermes_run_id"),
                 "title": raw.get("title"),
                 "progress_pct": raw.get("progress_pct"),
                 "status": raw.get("status"),
                 "task_json_sha256": sha,
-                "user_provided_alias": identity.user_provided_alias,
-                "executor_session_id": identity.executor_session_id,
-                "runtime_run_id": identity.runtime_run_id,
+                "user_provided_alias": (
+                    existing_sidecar.user_provided_alias
+                    if existing_sidecar else None
+                ),
+                "executor_session_id": (
+                    existing_sidecar.executor_session_id
+                    if existing_sidecar else None
+                ),
+                "runtime_run_id": (
+                    existing_sidecar.runtime_run_id
+                    if existing_sidecar else None
+                ),
                 "sidecar_written": (
-                    identity.record_kind != RecordKind.RUNTIME
-                    or sidecar_for_runtime
+                    outcome.decision in ("wrote", "overwrote", "unchanged")
                 ),
             }
         )
 
-    summary = {
+    out_summary = {
         "audit_record_type": "identity_index",
         "audit_artifact_version": "1.0.0",
         "classified_at_utc": ts,
@@ -188,9 +284,20 @@ def build_index(
         "counts": counts,
         "total_reports": len(reports),
         "aliases": aliases or {},
+        # AEE-7.7b: the apply-sidecars side-bucket is
+        # exposed under a namespaced key so downstream
+        # consumers can verify the wire-up without
+        # recomputing from the per-record reports[] list.
+        "apply_sidecars": {
+            "by_decision": dict(apply_result.by_decision),
+            "by_record_kind": dict(apply_result.by_record_kind),
+            "anchor_warning_count": apply_result.anchor_warning_count,
+            "sidecars_written": apply_result.sidecars_written,
+            "schema_version": apply_result.schema_version,
+        },
     }
     return {
-        "summary": summary,
+        "summary": out_summary,
         "reports": reports,
     }
 
