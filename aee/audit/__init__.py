@@ -63,9 +63,32 @@ from .live_audit import (
     PerTaskVerdict,
     run_audit,
 )
+# AEE-7.7b: call-site migration. The single AEE-7.7b entry
+# point that turns an AEE-7.7a ``AuditSummary`` into persisted
+# ``identity.json`` sidecars next to every ``task.json`` the
+# audit classified as consistent.
+#
+#   from aee.audit import run_audit, apply_sidecars
+#   summary, _, _ = run_audit(reports_root, output_dir)
+#   result = apply_sidecars(reports_root, summary)
+#
+# Re-exported here so a caller only needs ``from aee.audit
+# import ...`` (the audit package is the one-stop namespace).
+from .apply_sidecars import (
+    APPLY_SCHEMA_VERSION,
+    ApplySidecarsResult,
+    PerTaskSidecarOutcome,
+    SidecarDecision,
+    apply_sidecars,
+)
 
 __all__ = [
+    "APPLY_SCHEMA_VERSION",
+    "ApplySidecarsResult",
     "AuditSummary",
+    "PerTaskSidecarOutcome",
     "PerTaskVerdict",
+    "SidecarDecision",
+    "apply_sidecars",
     "run_audit",
 ]
