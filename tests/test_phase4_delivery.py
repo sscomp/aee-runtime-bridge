@@ -10,7 +10,9 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -135,12 +137,31 @@ class TestIntentMismatchDetection(unittest.TestCase):
         TaskManager creates a real row in the live dispatcher DB; we
         track its task_id and tear it down so test runs do not pile up
         6 rows per CI cycle.
+
+        Legacy baseline fix: if the schema is missing (e.g. another
+        test module's setUp unlinked the DB and the schema has not
+        been re-initialised yet), skip the cleanup rather than crash
+        — the underlying test contract (warning_count + intent_mismatch
+        event payload) is the assertion, not the persistence row.
         """
         tids = getattr(self, "_created_task_ids", [])
         if not tids:
             return
-        import sqlite3
-        conn = sqlite3.connect("/home/ubuntu/hermes-runtime-bridge/data/dispatcher.db")
+        db_path = "/home/ubuntu/hermes-runtime-bridge/data/dispatcher.db"
+        if not os.path.exists(db_path):
+            return
+        conn = sqlite3.connect(db_path)
+        # Defensive: confirm schema is initialised. Other test modules
+        # reset db._initialized + unlink the DB on every setUp, so by
+        # the time the cleanup runs the schema may not exist on this
+        # file handle yet.
+        for tbl in ("tasks", "task_events", "task_outputs"):
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (tbl,)
+            ).fetchone()
+            if row is None:
+                conn.close()
+                return
         for tid in tids:
             conn.execute("DELETE FROM task_events WHERE task_id = ?", (tid,))
             conn.execute("DELETE FROM task_outputs WHERE task_id = ?", (tid,))

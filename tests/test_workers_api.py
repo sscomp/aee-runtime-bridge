@@ -190,6 +190,21 @@ class TestWorkersAPIAEE4(unittest.TestCase):
                 db.DB_PATH.unlink()
             except OSError:
                 pass
+        # Legacy baseline fix: also unlink the WAL/SHM sidecar files.
+        # Other test modules (test_phase4_delivery) insert rows in WAL
+        # mode; if those sidecar files survive into a later module, the
+        # task-id counter reads stale rows from the WAL and increments
+        # beyond the current run, which then breaks tests that depend
+        # on a clean slate (e.g. test_log_file_written expects the
+        # first task in this module to be TASK-...-0001, but it gets
+        # TASK-...-0010 because the WAL still holds nine prior rows).
+        for ext in ("-wal", "-shm"):
+            side = db.DB_PATH.with_name(db.DB_PATH.name + ext)
+            if side.exists():
+                try:
+                    side.unlink()
+                except OSError:
+                    pass
         self.client = _build_client()
         self.headers = {"Authorization": "Bearer test-key"}
 
