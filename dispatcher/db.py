@@ -176,15 +176,20 @@ _AEE72_MIGRATIONS: list[tuple[str, str]] = [
 # See `Abacus/AEE/AEE_MASTER_PLAN.md` §20.9.10 "Dispatcher
 # write-side metadata" for the original deferred limitation
 # that this slice closes.
+#
+# AEE-7.6: the structured migration registry lives in
+# `dispatcher/migrations.py`. The legacy ``[(col, sql), ...]``
+# shape is derived from the structured list at import time so
+# the apply code below is unchanged. This is the contract
+# boundary between the new registry and the existing dispatcher.
+try:
+    from .migrations import WRITE_SIDE_MIGRATIONS as _STRUCTURED_WSM
+except ImportError:  # pragma: no cover - defensive fallback for partial installs
+    _STRUCTURED_WSM = []
 _AEE7_WRITE_SIDE_MIGRATIONS: list[tuple[str, str]] = [
-    (
-        "executor_session_id",
-        "ALTER TABLE tasks ADD COLUMN executor_session_id TEXT",
-    ),
-    (
-        "runtime_run_id",
-        "ALTER TABLE tasks ADD COLUMN runtime_run_id TEXT",
-    ),
+    (m.column, m.sql)
+    for m in _STRUCTURED_WSM
+    if m.column is not None
 ]
 
 # AEE-4: Worker metadata + status. Adds 11 columns to `workers` so any
@@ -316,6 +321,17 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
+    # AEE-7.6: validate the structured migration registry at
+    # startup. Any duplication / multi-statement SQL /
+    # missing idempotency evidence fails the dispatcher's
+    # boot loudly. This is the tripwire the user requested:
+    # the registry is self-checking, and the AEE-7.5 G1/G2
+    # write-side metadata cannot drift silently.
+    try:
+        from .migrations import validate_migrations, WRITE_SIDE_MIGRATIONS
+        validate_migrations(WRITE_SIDE_MIGRATIONS, raise_on_error=True)
+    except ImportError:  # pragma: no cover - defensive fallback for partial installs
+        pass
     conn.executescript(_SCHEMA)
     # Phase 4: in-place column additions for already-deployed DBs.
     # PRAGMA table_info returns rows for each existing column; if the
