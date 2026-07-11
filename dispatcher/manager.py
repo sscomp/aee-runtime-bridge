@@ -10,6 +10,7 @@ into it directly; the heavy work (calling Hermes 8642) happens in
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -27,6 +28,16 @@ from .models import (
 )
 from .progress import monotonic, validate_progress
 
+# AEE-7.4 finalization — event-kind SOT.  See
+# ``aee/observability/events.py`` for the canonical inventory.
+# The dispatcher writes to ``task_events.kind``; every literal
+# written here MUST resolve to a member of ``EventKind`` —
+# the tripwire in ``aee/tests/test_aee74_observability.py``
+# will fail the build if a new literal leaks.
+from aee.observability import EventKind
+
+log = logging.getLogger("dispatcher.manager")
+
 _BRIDGE_ROOT = Path(__file__).resolve().parent.parent
 LOGS_DIR = _BRIDGE_ROOT / "logs"
 REPORTS_DIR = _BRIDGE_ROOT / "reports"
@@ -39,6 +50,32 @@ REPORTS_DIR = _BRIDGE_ROOT / "reports"
 def _log_path(task_id: str) -> Path:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     return LOGS_DIR / f"{task_id}.log"
+
+
+# AEE-7.2 observability: error messages may embed stdout, env var
+# dumps, or path strings. We must NOT log the full message into the
+# module logger (which is shipped to syslog / journald). Instead
+# surface a short, sanitized class string: the leading token before
+# the first colon / newline, capped at 64 chars. Full error
+# content stays in the per-task log file (which the user can read
+# on demand) and in the ``tasks.error_message`` column (DB only).
+_SAFE_ERROR_CLASS_LEN = 64
+
+
+def _safe_error_class(error_message: str) -> str:
+    """Return a short, sanitized error class hint.
+
+    AEE-7.2 observability: never echo the full ``error_message``
+    into the module logger because it may contain stdout dumps,
+    file paths from /etc/, or env var values. The dispatcher
+    only needs the leading "category" token (e.g.
+    ``"TimeoutError"``, ``"PolicyViolationError"``,
+    ``"RuntimeNotFoundError"``) to triage failures.
+    """
+    if not error_message:
+        return ""
+    head = error_message.strip().split(":", 1)[0].splitlines()[0]
+    return head[:_SAFE_ERROR_CLASS_LEN]
 
 
 def _append_log(task_id: str, level: str, message: str) -> None:
@@ -79,6 +116,13 @@ _COLUMNS = (
     # `dispatcher/db.py::_AEE1_MIGRATIONS` for the schema origin.
     "runtime_type", "adapter_name", "external_run_id", "worker_id",
     "heartbeat_at", "claim_token_hash", "approval_required", "approval_state",
+    # AEE-7.2: per-job repo_root constraint, see
+    # `dispatcher/db.py::_AEE72_MIGRATIONS` for the schema origin
+    # and `aee/artifacts/policy_factory.py` for the policy
+    # resolution. Legacy tasks have NULL here and the manager
+    # falls back to `ArtifactPolicy.permissive()` — fail-safe,
+    # not fail-open.
+    "repo_root",
 )
 
 
@@ -147,6 +191,7 @@ class TaskManager:
         workdir: Optional[Path] = None,
         initial_status: str = "queued",
         required_capabilities: Optional[List[str]] = None,
+        repo_root: Optional[str] = None,
     ) -> Task:
         """Create a new task. Generates the task_id, sets status, records event.
 
@@ -154,9 +199,23 @@ class TaskManager:
         trimmed, deduped, sorted) and persisted in the
         `required_capabilities_json` column. A `None` or empty
         input is stored as '[]' (no capability filter).
+
+        AEE-7.2: ``repo_root`` is the per-job workspace constraint.
+        It is persisted in the ``repo_root`` column (NULLable) and
+        resolved into an ``ArtifactPolicy`` at ``complete()`` time
+        by ``aee.artifacts.policy_factory.policy_for_repo_root``.
+        ``None`` means "no per-job constraint" — the manager
+        continues to use ``ArtifactPolicy.permissive()`` for that
+        task. We deliberately do **not** broaden the existing
+        default.
         """
         if initial_status not in {"pending", "queued"}:
             raise ValueError(f"initial_status must be pending or queued, got {initial_status}")
+        # AEE-7.2: validate repo_root at the wire boundary, not deep
+        # in the policy factory. Empty string and whitespace are
+        # normalised to None so the DB never sees "" as a repo_root.
+        if repo_root is not None:
+            repo_root = repo_root.strip() or None
         task_id = ids.next_task_id()
         created_at = ids.now_iso()
         commit, branch = _git_info(workdir)
@@ -170,8 +229,9 @@ class TaskManager:
                   progress_pct, created_at,
                   input_text, openai_run_id, session_id, mode,
                   prompt_version, model_name, git_commit, git_branch,
-                  required_capabilities_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  required_capabilities_json,
+                  repo_root
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, title, type, priority, owner, initial_status,
@@ -179,10 +239,25 @@ class TaskManager:
                     input_text, openai_run_id, session_id, mode,
                     prompt_version, model_name, commit, branch,
                     caps_blob,
+                    repo_root,
                 ),
             )
         _append_log(task_id, "INFO", f"created title={title!r} type={type} priority={priority}")
-        self._emit_event(task_id, "created", {
+        # AEE-7.2 observability: one INFO line at task creation
+        # surfaces the per-job repo_root constraint, mode, and
+        # type so the dispatcher log is queryable end-to-end
+        # without joining against the events table. The path
+        # is logged once (per_job_root) — ``input_text`` is
+        # intentionally NOT included.
+        log.info(
+            "manager.create: task_id=%s type=%s mode=%s "
+            "per_job_root=%s",
+            task_id,
+            type,
+            mode,
+            repo_root or "",
+        )
+        self._emit_event(task_id, EventKind.CREATED, {
             "title": title, "type": type, "priority": priority, "owner": owner,
             "session_id": session_id, "mode": mode, "openai_run_id": openai_run_id,
             "prompt_version": prompt_version, "model_name": model_name,
@@ -190,10 +265,13 @@ class TaskManager:
             # downstream consumers (audit, scheduler) see what was
             # required without having to re-fetch the task.
             "required_capabilities": normalized_caps,
+            # AEE-7.2: only emit the field when actually set so the
+            # event log stays compact for the legacy default case.
+            **({"repo_root": repo_root} if repo_root else {}),
         })
         if initial_status == "queued":
             _append_log(task_id, "INFO", "queued — waiting for dispatcher worker")
-            self._emit_event(task_id, "queued", None)
+            self._emit_event(task_id, EventKind.QUEUED, None)
         return self.get(task_id)  # type: ignore[return-value]
 
     # ---- read -------------------------------------------------------------
@@ -267,7 +345,7 @@ class TaskManager:
             (new_status, task_id),
         )
         _append_log(task_id, "INFO", f"status {old} -> {new_status}")
-        self._emit_event(task_id, "status", {"from": old, "to": new_status})
+        self._emit_event(task_id, EventKind.STATUS, {"from": old, "to": new_status})
 
     def queue(self, task_id: str) -> Task:
         self._set_status(task_id, "queued")
@@ -289,7 +367,7 @@ class TaskManager:
                 (hermes_run_id, started_at, task_id),
             )
         _append_log(task_id, "INFO", f"started hermes_run_id={hermes_run_id}")
-        self._emit_event(task_id, "started", {"hermes_run_id": hermes_run_id})
+        self._emit_event(task_id, EventKind.STARTED, {"hermes_run_id": hermes_run_id})
         return self.get_or_raise(task_id)
 
     def progress(self, task_id: str, pct: int, step: Optional[str] = None) -> Task:
@@ -310,13 +388,13 @@ class TaskManager:
                 (pct, step, task_id),
             )
         _append_log(task_id, "PROGRESS", f"{pct}% {step or ''}".rstrip())
-        self._emit_event(task_id, "progress", {"pct": pct, "step": step})
+        self._emit_event(task_id, EventKind.PROGRESS, {"pct": pct, "step": step})
         return self.get_or_raise(task_id)
 
     def log(self, task_id: str, line: str) -> None:
         """Append a free-form line to the task log + record a 'log' event."""
         _append_log(task_id, "LOG", line)
-        self._emit_event(task_id, "log", {"line": line[:500]})
+        self._emit_event(task_id, EventKind.LOG, {"line": line[:500]})
 
     def warning(self, task_id: str, message: str) -> None:
         conn = get_conn()
@@ -325,7 +403,7 @@ class TaskManager:
             (task_id,),
         )
         _append_log(task_id, "WARN", message)
-        self._emit_event(task_id, "warning", {"message": message[:500]})
+        self._emit_event(task_id, EventKind.WARNING, {"message": message[:500]})
 
     def complete(
         self,
@@ -361,6 +439,26 @@ class TaskManager:
         # "completed but unverified" — never silently green.
         delivery = self._verify_expected_delivery(task_id, row["input_text"] or "")
 
+        # AEE-7.2 observability: emit one structured INFO line at
+        # terminal status so operators can grep for `task.complete`
+        # without scanning per-task log files. ``model_name`` and
+        # ``duration_sec`` are safe (no secrets); ``warning_bump``
+        # is the missing-artifact count from Phase 4 / AEE-6.2.
+        # NOTE: ``input_text`` is intentionally NOT included to
+        # avoid leaking the orchestrator's prompt into a
+        # per-line log.
+        log.info(
+            "manager.complete: task_id=%s status=completed "
+            "model=%s duration_sec=%.2f warning_bump=%d "
+            "artifacts=%d missing=%d",
+            task_id,
+            effective_model or "",
+            duration,
+            delivery["warning_bump"],
+            len(delivery.get("artifacts") or []),
+            len(delivery.get("missing_paths") or []),
+        )
+
         with transaction() as conn2:
             conn2.execute(
                 "UPDATE tasks SET status='completed', progress_pct=100, finished_at=?, "
@@ -387,7 +485,7 @@ class TaskManager:
                 f"delivery verification: {delivery['warning_bump']} expected file(s) missing",
             )
             for missing in delivery["missing_paths"]:
-                self._emit_event(task_id, "delivery_unverified", {"missing_path": missing})
+                self._emit_event(task_id, EventKind.DELIVERY_UNVERIFIED, {"missing_path": missing})
         # Phase 4.1: intent-mismatch detection — if the agent's final
         # output ends in a "declarative intent" sentence (now let me
         # write, now writing, will create, ...) AND we have already
@@ -400,9 +498,9 @@ class TaskManager:
         )
         if intent is not None:
             _append_log(task_id, "WARN", f"intent_mismatch: {intent['matched_pattern']!r}")
-            self._emit_event(task_id, "intent_mismatch", intent)
+            self._emit_event(task_id, EventKind.INTENT_MISMATCH, intent)
         _append_log(task_id, "INFO", f"completed duration={duration:.2f}s")
-        self._emit_event(task_id, "completed", {
+        self._emit_event(task_id, EventKind.COMPLETED, {
             "duration_sec": duration, "result_path": result_path,
         })
         return self.get_or_raise(task_id)
@@ -476,9 +574,35 @@ class TaskManager:
         # this call is "best-effort" in the same way the legacy
         # os.stat block was — never raises out.
         from aee.artifacts import ArtifactPipeline, SqliteArtifactRepository
+        # AEE-7.2: read the per-job repo_root from the task and turn
+        # it into an ArtifactPolicy. The factory is fail-safe:
+        # missing/empty repo_root → None, caller keeps its
+        # permissive default. We do **not** silently widen the
+        # default to repo_root; a per-job constraint is opt-in.
+        row = get_conn().execute(
+            "SELECT repo_root FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        repo_root = row["repo_root"] if row else None
+        from aee.artifacts.policy_factory import policy_for_repo_root
+        per_job_policy = policy_for_repo_root(repo_root)
+        if per_job_policy is not None:
+            log.info(
+                "manager._verify_expected_delivery: per-job repo_root enforced task=%s root=%s",
+                task_id,
+                per_job_policy.allowed_roots[0],
+            )
         pipeline = ArtifactPipeline(
-            repo=SqliteArtifactRepository(get_conn())
+            repo=SqliteArtifactRepository(get_conn()),
         )
+        # AEE-7.2: overwrite the pipeline's default policy only when
+        # a per-job constraint was set. ArtifactPipeline.policy is
+        # typed ArtifactPolicy (no None), so we can't pass None
+        # through the constructor — the only safe override is to
+        # assign after construction. A None here means "keep the
+        # pipeline's own permissive default", which is exactly what
+        # the legacy code path did (AEE-6.3 + AEE-6.2).
+        if per_job_policy is not None:
+            pipeline.policy = per_job_policy
         try:
             persisted = pipeline.collect(task_id, candidate_paths)
         except Exception as e:  # pragma: no cover - defensive
@@ -486,10 +610,14 @@ class TaskManager:
             # missing because someone bypassed _init_schema), fall
             # back to a no-artifact delivery so the task still
             # completes. We log but do not raise.
-            import sys
-            print(
-                f"[manager] AEE-6.2 ArtifactPipeline failed: {type(e).__name__}: {e}",
-                file=sys.stderr,
+            #
+            # AEE-7.1: use the module logger (was a ``print(..., file=sys.stderr)``
+            # which bypassed the project's logging config).
+            log.warning(
+                "manager._verify_expected_delivery: AEE-6.2 ArtifactPipeline failed: %s: %s",
+                type(e).__name__,
+                e,
+                exc_info=True,
             )
             return {
                 "artifacts": [],
@@ -604,8 +732,19 @@ class TaskManager:
                 "UPDATE tasks SET status='failed', finished_at=?, duration_sec=?, error_message=? WHERE task_id = ?",
                 (ts, duration, error_message, task_id),
             )
+        # AEE-7.2 observability: terminal-status structured log on
+        # the failed branch. The error message is bounded to 500
+        # chars at the event-emit layer; we do not echo the full
+        # raw stdout / token / env into the module logger.
+        log.warning(
+            "manager.fail: task_id=%s status=failed duration_sec=%.2f "
+            "error_class=%s",
+            task_id,
+            duration,
+            _safe_error_class(error_message),
+        )
         _append_log(task_id, "ERROR", f"failed: {error_message}")
-        self._emit_event(task_id, "failed", {"error": error_message[:500]})
+        self._emit_event(task_id, EventKind.FAILED, {"error": error_message[:500]})
         return self.get_or_raise(task_id)
 
     def timeout(self, task_id: str, reason: str) -> Task:
@@ -630,7 +769,7 @@ class TaskManager:
                 (ts, duration, reason, task_id),
             )
         _append_log(task_id, "WARN", f"timeout: {reason}")
-        self._emit_event(task_id, "timeout", {"reason": reason[:500]})
+        self._emit_event(task_id, EventKind.TIMEOUT, {"reason": reason[:500]})
         return self.get_or_raise(task_id)
 
     def cancel(self, task_id: str) -> Task:
@@ -650,7 +789,7 @@ class TaskManager:
                 (ts, duration, task_id),
             )
         _append_log(task_id, "INFO", f"cancelled duration={duration:.2f}s")
-        self._emit_event(task_id, "cancelled", {"duration_sec": duration})
+        self._emit_event(task_id, EventKind.CANCELLED, {"duration_sec": duration})
         return self.get_or_raise(task_id)
 
     def retry(self, task_id: str) -> Task:
@@ -678,7 +817,7 @@ class TaskManager:
             "UPDATE tasks SET retry_count = retry_count + 1 WHERE task_id = ?",
             (new_task.task_id,),
         )
-        self._emit_event(new_task.task_id, "retry_of", {"original_task_id": task_id})
+        self._emit_event(new_task.task_id, EventKind.RETRY_OF, {"original_task_id": task_id})
         return self.get_or_raise(new_task.task_id)
 
     def attach_openai_run_id(self, task_id: str, openai_run_id: str) -> None:
@@ -687,7 +826,7 @@ class TaskManager:
             "UPDATE tasks SET openai_run_id = ? WHERE task_id = ?",
             (openai_run_id, task_id),
         )
-        self._emit_event(task_id, "openai_run_attached", {"openai_run_id": openai_run_id})
+        self._emit_event(task_id, EventKind.OPENAI_RUN_ATTACHED, {"openai_run_id": openai_run_id})
 
     # ---- output fetch ----------------------------------------------------
 
