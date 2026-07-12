@@ -100,21 +100,101 @@ from .sidecar_inventory import (
     build_sidecar_inventory,
     plan_sidecar_migration,
 )
+# AEE-7.7d: controlled migration executor. The fourth tool in
+# the audit package — the write-side counterpart to the
+# AEE-7.7c read-only inventory. Given an inventory, it stamps
+# a fresh ``identity.json`` for every entry whose status is
+# in the caller's ``status_filter`` (default MISSING +
+# STALE_HASH + STALE_VERSION; RUNTIME always skipped via
+# ``allow_runtime`` gate).
+#
+#   from aee.audit import execute_sidecar_migration
+#   inv = build_sidecar_inventory(reports_root)
+#   result = execute_sidecar_migration(
+#       reports_root, inv, status_filter=..., allow_runtime=False,
+#   )
+#
+# Re-exported here so a caller only needs ``from aee.audit
+# import ...``. The per-task SOT helper (aee.reporting's
+# ``classify_and_persist``) is the actual writer; the audit
+# package re-export only exposes the controlled-execution
+# entry point.
+from .sidecar_migration import (
+    DEFAULT_STATUS_FILTER,
+    MIGRATION_EXEC_SCHEMA_VERSION,
+    MigrationExecutionResult,
+    MigrationStatus,
+    PerTaskMigrationOutcome,
+    execute_sidecar_migration,
+)
+# AEE-7.7e: live-corpus migration dry-run + projection
+# orchestrator. The fifth tool in the audit package — the
+# end-to-end read-only orchestrator that ties together
+# build_sidecar_inventory (AEE-7.7c) →
+# plan_sidecar_migration (AEE-7.7c) →
+# project_migration_execution (AEE-7.7e) in a single call,
+# with a plan/projection reconciliation check and an optional
+# on-disk manifest artifact. The dry-run flow is read-only by
+# contract; the explicit apply flow lives behind a separate
+# ``run_live_migration_apply`` entry point.
+#
+#   from aee.audit import run_live_migration_dryrun
+#   result = run_live_migration_dryrun(
+#       reports_root,
+#       target_policy_version="1.1.0",
+#       write_manifest=True,
+#   )
+#   assert result.reconciliation_passed
+#
+#   # To actually stamp sidecars, use the explicit apply API:
+#   from aee.audit import run_live_migration_apply
+#   exec_result = run_live_migration_apply(reports_root)
+#
+# Re-exported here so a caller only needs ``from aee.audit
+# import ...``. The DTO carries the full inventory, plan, and
+# projection so a downstream post-mortem has the entire chain
+# visible.
+from .live_migration_dryrun import (
+    DEFAULT_TARGET_POLICY_VERSION,
+    LIVE_MIGRATION_DRYRUN_SCHEMA_VERSION,
+    LiveMigrationDryrunResult,
+    PerTaskProjection,
+    ProjectedMigrationResult,
+    ProjectedOutcome,
+    project_migration_execution,
+    run_live_migration_apply,
+    run_live_migration_dryrun,
+)
 
 __all__ = [
     "APPLY_SCHEMA_VERSION",
     "ApplySidecarsResult",
     "AuditSummary",
+    "DEFAULT_STATUS_FILTER",
+    "DEFAULT_TARGET_POLICY_VERSION",
     "INVENTORY_SCHEMA_VERSION",
+    "LIVE_MIGRATION_DRYRUN_SCHEMA_VERSION",
+    "MIGRATION_EXEC_SCHEMA_VERSION",
+    "LiveMigrationDryrunResult",
+    "MigrationExecutionResult",
     "MigrationPlan",
+    "MigrationStatus",
+    "PerTaskMigrationOutcome",
+    "PerTaskProjection",
     "PerTaskSidecarOutcome",
     "PerTaskVerdict",
+    "ProjectedMigrationResult",
+    "ProjectedOutcome",
     "SidecarDecision",
     "SidecarInventoryEntry",
     "SidecarInventoryResult",
     "SidecarStatus",
     "apply_sidecars",
     "build_sidecar_inventory",
+    "execute_sidecar_migration",
     "plan_sidecar_migration",
+    "project_migration_execution",
     "run_audit",
+    "run_live_migration_apply",
+    "run_live_migration_dryrun",
 ]
