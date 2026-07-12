@@ -81,14 +81,40 @@ from .apply_sidecars import (
     SidecarDecision,
     apply_sidecars,
 )
+# AEE-7.7c: read-only inventory + dry-run migration planner.
+# The third tool in the audit package after run_audit (read)
+# and apply_sidecars (write) — this one plans without doing.
+#
+#   from aee.audit import build_sidecar_inventory, plan_sidecar_migration
+#   inv = build_sidecar_inventory(reports_root)
+#   plan = plan_sidecar_migration(inv, target_policy_version="1.1.0")
+#
+# Re-exported here so a caller only needs ``from aee.audit
+# import ...`` (the audit package is the one-stop namespace).
+from .sidecar_inventory import (
+    INVENTORY_SCHEMA_VERSION,
+    MigrationPlan,
+    SidecarInventoryEntry,
+    SidecarInventoryResult,
+    SidecarStatus,
+    build_sidecar_inventory,
+    plan_sidecar_migration,
+)
 
 __all__ = [
     "APPLY_SCHEMA_VERSION",
     "ApplySidecarsResult",
     "AuditSummary",
+    "INVENTORY_SCHEMA_VERSION",
+    "MigrationPlan",
     "PerTaskSidecarOutcome",
     "PerTaskVerdict",
     "SidecarDecision",
+    "SidecarInventoryEntry",
+    "SidecarInventoryResult",
+    "SidecarStatus",
     "apply_sidecars",
+    "build_sidecar_inventory",
+    "plan_sidecar_migration",
     "run_audit",
 ]
