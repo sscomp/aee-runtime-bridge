@@ -85,7 +85,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # Public constants
@@ -741,6 +741,208 @@ def _validate_file_entry(fe: FileEntry, *, group_name: str) -> List[str]:
     return errs
 
 
+# ---------------------------------------------------------------------------
+# Manifest → PlanInput adapter (AEE-7.8 K2)
+# ---------------------------------------------------------------------------
+#
+# Why this surface
+# ----------------
+# K1 shipped a *reader* (load + validate + introspection). The
+# next natural step is a typed *adapter* that flattens a
+# :class:`ManifestDocument` into the per-file input rows a
+# planner (``aee.audit.apply_sidecars`` / ``aee.audit.
+# plan_sidecar_migration``) expects.
+#
+# The current planner in ``sidecar_inventory.py`` walks
+# ``reports/`` directly and produces an aggregate
+# :class:`MigrationPlan`. The K2 adapter is a **read-side**
+# shape probe: given a manifest that *describes* a corpus, what
+# would the per-file input rows look like if a planner wanted
+# to consume them one at a time? K2.5+ can decide whether the
+# real planner should consume :class:`PlanInput` rows instead
+# of walking ``reports/`` — K2 ships the shape, the wire-up
+# is a separate commit.
+#
+# The adapter is intentionally **read-only** (K1 isolation
+# contract preserved): it never writes, never opens a file
+# outside the manifest's own ``source_path``, never imports
+# ``dispatcher``, never touches the live DB, never reads
+# environment variables, never spawns child processes via the shell.
+
+
+@dataclass(frozen=True)
+class PlanInput:
+    """One per-file input row the manifest describes.
+
+    The shape mirrors the manifest's :class:`FileEntry` but is
+    intentionally a *narrow* contract: only the fields a
+    planner needs are exposed as typed attributes. The full
+    per-file extras (e.g. ``imports_dispatcher``,
+    ``writes_to_live_db``, ``schema_version``, ``test_count``)
+    are forwarded via :attr:`extras` as a dict so the dataclass
+    does not need to grow as new optional fields are added to
+    the manifest format.
+
+    Frozen + tuple-of-strings for the helper result so the
+    adapter output can be put in sets, hashed, and
+    JSON-serialized deterministically.
+    """
+
+    group_name: str
+    kind: FileEntryKind
+    path: str
+    sha256: str
+    size: int
+    lines: int
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Render the row back to a dict (for JSON dumps).
+
+        The ``group_name`` and ``kind`` are prepended so the
+        output is self-describing — round-tripping a
+        :class:`PlanInput` through ``json.dumps`` does not
+        lose the discriminator. The ``extras`` are spread
+        last so they cannot accidentally overwrite the
+        required fields.
+        """
+        out: Dict[str, Any] = {
+            "group_name": self.group_name,
+            "kind": self.kind.value,
+            "path": self.path,
+            "sha256": self.sha256,
+            "size": self.size,
+            "lines": self.lines,
+        }
+        for k, v in self.extras.items():
+            if k not in out:
+                out[k] = v
+        return out
+
+
+@dataclass(frozen=True)
+class ManifestToPlanResult:
+    """Result of :func:`manifest_to_plan_inputs`.
+
+    Always non-raising. ``passed=False`` means the adapter
+    refused to project the manifest (validation failed or the
+    doc was empty). ``plan_inputs`` is the projected
+    per-file list (empty on failure). ``warnings`` is a
+    list of human-readable strings — the caller decides
+    whether to surface them (most callers will).
+    """
+
+    passed: bool
+    plan_inputs: Tuple[PlanInput, ...] = ()
+    warnings: Tuple[str, ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "passed": self.passed,
+            "plan_input_count": len(self.plan_inputs),
+            "warning_count": len(self.warnings),
+            "plan_inputs": [p.to_dict() for p in self.plan_inputs],
+            "warnings": list(self.warnings),
+        }
+
+
+def load_manifest_or_default(
+    path: Optional[Union[str, os.PathLike]] = None,
+) -> ManifestDocument:
+    """Load a manifest, or return an empty :class:`ManifestDocument`.
+
+    Mirrors :func:`load_manifest`'s "raise on transport failure,
+    forgive on schema failure" rule for the explicit ``path``
+    case. When ``path is None``, returns an *empty* manifest —
+    a safe default that the adapter can then project into
+    zero :class:`PlanInput` rows.
+
+    Use the explicit ``path=...`` form for real inputs; the
+    ``path=None`` default is for callers that need a sentinel
+    value (e.g. test fixtures, optional command-line flag).
+    The default never reads the canonical
+    ``AEE_7_7d_7e_MANIFEST.json`` from the repo root — that
+    would be a hidden side effect on the importable surface.
+    """
+    if path is None:
+        return ManifestDocument(
+            raw={},
+            groups={},
+            source_path="",
+            on_disk_sha256="",
+            on_disk_size=0,
+            dropped_row_count=0,
+            dropped_group_count=0,
+        )
+    return load_manifest(path)
+
+
+def manifest_to_plan_inputs(
+    doc: ManifestDocument,
+) -> ManifestToPlanResult:
+    """Project a :class:`ManifestDocument` to per-file :class:`PlanInput` rows.
+
+    Read-only adapter. The function:
+
+    1. Runs :func:`validate_manifest` on ``doc``. If
+       ``result.passed is False``, returns
+       :class:`ManifestToPlanResult` with ``passed=False``,
+       empty ``plan_inputs``, and the validator's errors
+       appended to ``warnings``.
+    2. Iterates ``doc.iter_files()`` in deterministic
+       document order (the same order
+       :meth:`ManifestDocument.iter_files` yields — group
+       insertion order, NEW before MODIFIED within each
+       group).
+    3. Builds one :class:`PlanInput` per :class:`FileEntry`,
+       forwarding the file's ``extras`` dict.
+    4. Returns :class:`ManifestToPlanResult` with
+       ``passed=True``, the projected rows, and the
+       validator's *warnings* (not errors — those already
+       gated the projection).
+
+    The function never raises. Schema validation failures,
+    empty manifests, and zero-file groups all return a
+    well-formed :class:`ManifestToPlanResult` with
+    ``passed=False`` and a populated ``warnings`` list. The
+    caller decides what to do with the result.
+    """
+    warnings: List[str] = []
+    validation = validate_manifest(doc)
+    # Errors block projection. Warnings do not.
+    if not validation.passed:
+        for err in validation.errors:
+            warnings.append(f"validation: {err}")
+        return ManifestToPlanResult(
+            passed=False,
+            plan_inputs=(),
+            warnings=tuple(warnings),
+        )
+    # Forward validator warnings (advisory, not blocking).
+    for warn in validation.warnings:
+        warnings.append(f"validation: {warn}")
+
+    plan_inputs: List[PlanInput] = []
+    for fe in doc.iter_files():
+        plan_inputs.append(
+            PlanInput(
+                group_name=fe.group_name,
+                kind=fe.kind,
+                path=fe.path,
+                sha256=fe.sha256,
+                size=fe.size,
+                lines=fe.lines,
+                extras=dict(fe.extras),
+            )
+        )
+
+    return ManifestToPlanResult(
+        passed=True,
+        plan_inputs=tuple(plan_inputs),
+        warnings=tuple(warnings),
+    )
+
+
 __all__ = [
     "FileEntry",
     "FileEntryKind",
@@ -748,7 +950,11 @@ __all__ = [
     "MANIFEST_SCHEMA_VERSION",
     "ManifestDocument",
     "ManifestError",
+    "ManifestToPlanResult",
+    "PlanInput",
     "ValidationResult",
     "load_manifest",
+    "load_manifest_or_default",
+    "manifest_to_plan_inputs",
     "validate_manifest",
 ]

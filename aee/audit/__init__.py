@@ -181,6 +181,22 @@ from .live_migration_dryrun import (
 #
 # Re-exported here so a caller only needs ``from aee.audit
 # import ...`` (the audit package is the one-stop namespace).
+# AEE-7.8 K2: read-only manifest → PlanInput adapter. The
+# typed ``PlanInput`` row + ``manifest_to_plan_inputs``
+# adapter that flattens a :class:`ManifestDocument` into
+# per-file input rows. The adapter is read-only: it never
+# writes, never imports ``dispatcher``, never touches the
+# live DB. K2.5+ can decide whether the real planner should
+# consume ``PlanInput`` rows.
+#
+#   from aee.audit import load_manifest, manifest_to_plan_inputs
+#   doc = load_manifest("AEE_7_7d_7e_MANIFEST.json")
+#   result = manifest_to_plan_inputs(doc)
+#   for plan_input in result.plan_inputs:
+#       print(plan_input.path, plan_input.sha256, plan_input.size)
+#
+# Re-exported here so a caller only needs ``from aee.audit
+# import ...`` (the audit package is the one-stop namespace).
 from .manifest import (
     FileEntry,
     FileEntryKind,
@@ -188,8 +204,12 @@ from .manifest import (
     MANIFEST_SCHEMA_VERSION,
     ManifestDocument,
     ManifestError,
+    ManifestToPlanResult,
+    PlanInput,
     ValidationResult,
     load_manifest,
+    load_manifest_or_default,
+    manifest_to_plan_inputs,
     validate_manifest,
 )
 
@@ -209,6 +229,7 @@ __all__ = [
     "LiveMigrationDryrunResult",
     "ManifestDocument",
     "ManifestError",
+    "ManifestToPlanResult",
     "MigrationExecutionResult",
     "MigrationPlan",
     "MigrationStatus",
@@ -216,6 +237,7 @@ __all__ = [
     "PerTaskProjection",
     "PerTaskSidecarOutcome",
     "PerTaskVerdict",
+    "PlanInput",
     "ProjectedMigrationResult",
     "ProjectedOutcome",
     "SidecarDecision",
@@ -227,6 +249,8 @@ __all__ = [
     "build_sidecar_inventory",
     "execute_sidecar_migration",
     "load_manifest",
+    "load_manifest_or_default",
+    "manifest_to_plan_inputs",
     "plan_sidecar_migration",
     "project_migration_execution",
     "run_audit",
