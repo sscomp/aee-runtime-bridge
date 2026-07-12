@@ -70,7 +70,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from aee.audit.live_audit import AuditSummary, PerTaskVerdict
 from aee.reporting.identity import (
@@ -82,6 +82,14 @@ from aee.reporting.identity import (
     iter_reports,
     read_identity_sidecar,
 )
+# AEE-7.8 K2.5: opt-in wire-up to the manifest → PlanInput
+# adapter. Imported lazily inside :func:`apply_sidecars_with_plan`
+# (NOT at module top) so the K1 import-isolation contract is
+# preserved — a code path that does not opt into the planner
+# must not pull in :mod:`aee.audit.manifest` transitively
+# (the manifest module is read-only and self-contained, but the
+# K2.5 wrapper is opt-in by design, see the function docstring
+# for the full rationale).
 
 
 # Stable schema version for the apply-sidecars DTO. Bumping
@@ -214,6 +222,18 @@ class ApplySidecarsResult:
     # document, but the count lets a test confirm the
     # writer actually wrote a sidecar).
     sidecars_written: int = 0
+    # AEE-7.8 K2.5: optional additive provenance metadata
+    # attached by :func:`apply_sidecars_with_plan` when the
+    # caller opts in via ``manifest_path=...``. ``None`` for
+    # the K2.5-baseline :func:`apply_sidecars` path and for
+    # the wrapper's default ``manifest_path=None`` call. An
+    # :class:`ApplyWithPlanSummary` when the wire-up ran.
+    # NOT in the dataclass ``to_dict`` output (K2.5-baseline
+    # consumers must see the same shape they always saw);
+    # the K2.5 wrapper exposes it via a separate field
+    # accessor — see the ``to_dict_with_plan()`` method
+    # below.
+    plan_input_summary: Optional["ApplyWithPlanSummary"] = None  # type: ignore[name-defined]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -228,6 +248,30 @@ class ApplySidecarsResult:
             "sidecars_written": self.sidecars_written,
             "outcomes": [o.to_dict() for o in self.outcomes],
         }
+
+    def to_dict_with_plan(self) -> Dict[str, Any]:
+        """Return the K2.5-superset ``to_dict()`` shape.
+
+        Identical to :meth:`to_dict` for the K2.5-baseline
+        fields, with one extra key:
+
+        * ``plan_input_summary`` — the
+          :meth:`ApplyWithPlanSummary.to_dict` shape when the
+          wire-up ran, ``None`` when it didn't.
+
+        K2.5-baseline consumers should keep calling
+        :meth:`to_dict` (the K2.5-baseline contract is
+        preserved). K2.5 callers that opted into the wire-up
+        can call :meth:`to_dict_with_plan` to get the full
+        superset.
+        """
+        d = self.to_dict()
+        d["plan_input_summary"] = (
+            self.plan_input_summary.to_dict()
+            if self.plan_input_summary is not None
+            else None
+        )
+        return d
 
     def to_markdown(self) -> str:
         lines: List[str] = []
@@ -715,10 +759,312 @@ def apply_sidecars(
     return result
 
 
+# ---------------------------------------------------------------------------
+# AEE-7.8 K2.5 — opt-in planner wire-up
+# ---------------------------------------------------------------------------
+# Why this lives in this module
+# ------------------------------
+# The AEE-7.8 K2 ship added a read-only manifest → PlanInput
+# adapter (``aee.audit.manifest.manifest_to_plan_inputs``) and a
+# K2 plan report that proposed an *opt-in* wire-up to the sidecar
+# apply path. The K2.5 commit is that wire-up: a single wrapper
+# that:
+#
+# 1. Preserves :func:`apply_sidecars`'s default behavior
+#    byte-for-byte (the existing 22 K2-targeted tests + the AEE-7.7b
+#    regression suite must still pass without modification).
+# 2. Opts in ONLY when the caller supplies ``manifest_path``.
+#    Without ``manifest_path``, the wrapper is a thin pass-through
+#    that returns the identical :class:`ApplySidecarsResult`
+#    that :func:`apply_sidecars` would have produced — same
+#    fields, same iteration order, same SHA-256s on disk.
+# 3. When ``manifest_path`` is supplied, loads the manifest,
+#    projects it to per-file :class:`PlanInput` rows via
+#    :func:`aee.audit.manifest.manifest_to_plan_inputs`, and
+#    tacks an additive ``plan_input_summary`` dict onto the
+#    returned :class:`ApplySidecarsResult`. The DTO is a
+#    superset of the K2.5-baseline shape — every K2.5-baseline
+#    field is preserved, a new optional field is added.
+# 4. Never raises on a malformed manifest. The projection's
+#    ``passed`` / ``warnings`` are surfaced via the summary dict
+#    so a caller can decide whether to inspect them. A
+#    :class:`FileNotFoundError` / :class:`IsADirectoryError`
+#    on a missing ``manifest_path`` is propagated to the
+#    caller — that is an explicit user-supplied input, not a
+#    corpus-level error the wrapper should silently swallow.
+# 5. Never imports :mod:`dispatcher`. The wrapper uses
+#    :mod:`aee.audit.manifest` (read-only) + the existing
+#    SOT helpers in this module. Live DB / subprocess / env
+#    reads remain out of scope.
+#
+# Out of scope (K3+ territory)
+# ----------------------------
+# * Replacing :func:`apply_sidecars`'s inner walk with a
+#   PlanInput-driven planner. The K2.5 wire-up is additive
+#   only — the existing planner still walks ``reports/`` and
+#   writes sidecars. A future K3+ slice may opt in to consume
+#   ``PlanInput`` rows directly.
+# * Plan-input gating (e.g. ``only plan_inputs whose
+#   extras['writes_to_live_db'] is False``). The K2.5 wire-up
+#   does NOT filter the apply pass — the manifest is
+#   provenance metadata, not a gate.
+# * Manifest-write tooling. The K2.5 wire-up is read-only with
+#   respect to the manifest artifact (it never writes
+#   ``AEE_7_7d_7e_MANIFEST.json`` back).
+
+#: Schema version for the K2.5 wire-up summary. Distinct
+#: from :data:`APPLY_SCHEMA_VERSION` so a downstream consumer
+#: can switch on the wire-up's presence without breaking the
+#: K2.5-baseline contract.
+PLAN_APPLY_SCHEMA_VERSION = "1.0.0"
+
+
+@dataclass
+class ApplyWithPlanSummary:
+    """The provenance metadata the K2.5 wire-up adds to
+    :class:`ApplySidecarsResult` when a ``manifest_path`` is
+    supplied.
+
+    The shape is intentionally narrow: it carries the manifest
+    fingerprint + the projection verdict (passed / warning count /
+    plan_input count) and nothing else. A caller that needs the
+    full :class:`ManifestToPlanResult` can re-run
+    :func:`aee.audit.manifest.manifest_to_plan_inputs` on the
+    same ``manifest_path``; the wrapper does not forward the
+    full result to keep the additive DTO small and the
+    :meth:`ApplySidecarsResult.to_dict` byte-shape stable
+    across K2.5 + K3+.
+
+    Attributes
+    ----------
+    schema_version
+        The wire-up schema version. Always
+        :data:`PLAN_APPLY_SCHEMA_VERSION` for K2.5.
+    manifest_source_path
+        The caller-supplied ``manifest_path`` (post-``os.fspath``).
+    manifest_on_disk_sha256
+        The on-disk SHA-256 of the manifest at the time the
+        wrapper was called. Empty when load failed.
+    manifest_on_disk_size
+        The on-disk size of the manifest. Zero when load failed.
+    plan_input_count
+        Number of :class:`PlanInput` rows the adapter projected.
+        Zero when the manifest failed validation or is empty.
+    projection_passed
+        ``True`` iff the projection's
+        :attr:`ManifestToPlanResult.passed` is True. ``False``
+        when the manifest failed validation (the projection
+        is then empty and the warnings list is populated).
+    projection_warning_count
+        Number of warnings the projection emitted. ``0`` is
+        the success case.
+    """
+
+    schema_version: str
+    manifest_source_path: str
+    manifest_on_disk_sha256: str
+    manifest_on_disk_size: int
+    plan_input_count: int
+    projection_passed: bool
+    projection_warning_count: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "manifest_source_path": self.manifest_source_path,
+            "manifest_on_disk_sha256": self.manifest_on_disk_sha256,
+            "manifest_on_disk_size": self.manifest_on_disk_size,
+            "plan_input_count": self.plan_input_count,
+            "projection_passed": self.projection_passed,
+            "projection_warning_count": self.projection_warning_count,
+        }
+
+
+def apply_sidecars_with_plan(
+    reports_root: str | os.PathLike,
+    summary: AuditSummary,
+    *,
+    manifest_path: Optional[Union[str, os.PathLike]] = None,
+    utc_stamp: Optional[str] = None,
+    classified_at_override: Optional[str] = None,
+    policy: Optional[SentinelPolicy] = None,
+    force: bool = False,
+    allow_runtime: bool = True,
+    strict_consistency: bool = True,
+    executor_anchors: Optional[Dict[str, Dict[str, str]]] = None,
+    user_provided_alias: Optional[Dict[str, str]] = None,
+) -> ApplySidecarsResult:
+    """AEE-7.8 K2.5 — opt-in planner wire-up around
+    :func:`apply_sidecars`.
+
+    This is a **thin, additive wrapper** that:
+
+    * Calls :func:`apply_sidecars` with the same arguments,
+      preserving byte-for-byte output (same fields, same
+      iteration order, same on-disk sidecar SHA-256s).
+    * When ``manifest_path is None`` (the default), returns
+      the :class:`ApplySidecarsResult` unchanged — no
+      ``plan_input_summary`` is added. The K2.5-baseline
+      callers do not need to be touched.
+    * When ``manifest_path is not None``, loads the manifest
+      via :func:`aee.audit.manifest.load_manifest`, projects
+      it to per-file :class:`PlanInput` rows via
+      :func:`aee.audit.manifest.manifest_to_plan_inputs`,
+      attaches an :class:`ApplyWithPlanSummary` to the result
+      (as ``result.plan_input_summary`` — ``None`` for
+      K2.5-baseline callers), and returns the augmented
+      DTO. The projection NEVER replaces or short-circuits
+      the apply pass — it is provenance metadata only.
+
+    Parameters
+    ----------
+    reports_root
+        Forwarded verbatim to :func:`apply_sidecars`.
+    summary
+        Forwarded verbatim to :func:`apply_sidecars`.
+    manifest_path
+        Optional path to an AEE-7.7d/7.7e manifest artifact.
+        When ``None`` (the default), the wrapper is a
+        byte-for-byte pass-through. When supplied, the
+        manifest is loaded and projected; the projection
+        is exposed via the additive ``plan_input_summary``
+        field on the returned result.
+    utc_stamp
+        Forwarded verbatim to :func:`apply_sidecars`. Useful
+        for re-applying an old audit at a consistent
+        timestamp.
+    classified_at_override
+        Forwarded verbatim to :func:`apply_sidecars`.
+    policy
+        Forwarded verbatim to :func:`apply_sidecars`.
+    force
+        Forwarded verbatim to :func:`apply_sidecars`.
+    allow_runtime
+        Forwarded verbatim to :func:`apply_sidecars`.
+    strict_consistency
+        Forwarded verbatim to :func:`apply_sidecars`.
+    executor_anchors
+        Forwarded verbatim to :func:`apply_sidecars`.
+    user_provided_alias
+        Forwarded verbatim to :func:`apply_sidecars`.
+
+    Returns
+    -------
+    ApplySidecarsResult
+        Identical to :func:`apply_sidecars`'s return value,
+        with one **additive** field:
+
+        * ``plan_input_summary`` (``Optional[ApplyWithPlanSummary]``)
+          — ``None`` when ``manifest_path is None``; an
+          :class:`ApplyWithPlanSummary` instance when a
+          manifest was supplied.
+
+    Notes
+    -----
+    The wrapper is **opt-in by design** — every existing K2.5
+    caller continues to use :func:`apply_sidecars` directly
+    and sees no behavioural change. The wire-up is **additive
+    only** — the apply pass itself still walks ``reports/``
+    and writes sidecars; the manifest is provenance metadata
+    that future K3+ slices can opt into consuming.
+
+    The wrapper never raises on a malformed manifest. A
+    :class:`aee.audit.manifest.ManifestError` (I/O / JSON parse
+    failure) IS raised to the caller because ``manifest_path``
+    is an explicit user-supplied input — silent swallowing
+    would mask transport-level failures the caller must see.
+
+    A :class:`aee.audit.manifest.ValidationResult` with
+    ``passed=False`` is NOT an exception — it surfaces via
+    ``result.plan_input_summary.projection_passed = False``
+    and ``result.plan_input_summary.projection_warning_count > 0``.
+    The apply pass still runs (the wrapper does not gate
+    apply on manifest validation).
+    """
+    # 1. Delegate to the production planner. All kwargs are
+    #    forwarded verbatim so the apply pass is byte-for-byte
+    #    identical to a direct :func:`apply_sidecars` call.
+    result = apply_sidecars(
+        reports_root,
+        summary,
+        utc_stamp=utc_stamp,
+        classified_at_override=classified_at_override,
+        policy=policy,
+        force=force,
+        allow_runtime=allow_runtime,
+        strict_consistency=strict_consistency,
+        executor_anchors=executor_anchors,
+        user_provided_alias=user_provided_alias,
+    )
+
+    # 2. Opt-in wire-up. ``manifest_path is None`` is the
+    #    K2.5-baseline contract — return the result unchanged.
+    if manifest_path is None:
+        return result
+
+    # 3. Lazy import. Kept out of the module top so the
+    #    K1 import-isolation contract is preserved for code
+    #    paths that do not opt into the wire-up. The
+    #    manifest module is read-only + self-contained
+    #    (no dispatcher, no live DB, no subprocess — see
+    #    ``aee.audit.manifest`` docstring) but the K2.5
+    #    wrapper is opt-in by design, so the import is
+    #    gated on the caller explicitly choosing to opt in.
+    #    ``ManifestError`` is imported here so a caller that
+    #    catches the wire-up's transport-level failure can
+    #    do so via a stable name (the import is a no-op at
+    #    call time — Python caches it on the function's
+    #    globals after the first opt-in call).
+    from aee.audit.manifest import (  # noqa: F401
+        ManifestError,
+        load_manifest,
+        manifest_to_plan_inputs,
+    )
+
+    # 4. Load the manifest. ManifestError (transport-level
+    #    I/O / JSON parse failure) is propagated to the
+    #    caller — the path is an explicit user-supplied
+    #    input, not a corpus-level error the wrapper should
+    #    silently swallow. Any other exception is also
+    #    propagated (defense in depth — the manifest
+    #    module is not expected to raise anything else).
+    doc = load_manifest(manifest_path)
+
+    # 5. Project to PlanInput rows. ``manifest_to_plan_inputs``
+    #    is non-raising: a validation failure surfaces as
+    #    ``passed=False`` + populated ``warnings``; an empty
+    #    manifest surfaces as ``passed=True`` + zero rows.
+    projection = manifest_to_plan_inputs(doc)
+
+    # 6. Attach the additive summary. The new field is
+    #    declared on :class:`ApplySidecarsResult` (with
+    #    default ``None``) so the wrapper can simply assign
+    #    to it — no monkey-patching needed. The
+    #    :meth:`ApplySidecarsResult.to_dict` method
+    #    intentionally does NOT include the new field
+    #    (K2.5-baseline consumers must see the same shape
+    #    they always saw); the K2.5 wrapper exposes it via
+    #    :meth:`ApplySidecarsResult.to_dict_with_plan`.
+    result.plan_input_summary = ApplyWithPlanSummary(
+        schema_version=PLAN_APPLY_SCHEMA_VERSION,
+        manifest_source_path=doc.source_path,
+        manifest_on_disk_sha256=doc.on_disk_sha256,
+        manifest_on_disk_size=doc.on_disk_size,
+        plan_input_count=len(projection.plan_inputs),
+        projection_passed=projection.passed,
+        projection_warning_count=len(projection.warnings),
+    )
+
+    return result
+
+
 __all__ = [
     "APPLY_SCHEMA_VERSION",
     "ApplySidecarsResult",
+    "ApplyWithPlanSummary",
     "PerTaskSidecarOutcome",
+    "PLAN_APPLY_SCHEMA_VERSION",
     "SidecarDecision",
     "apply_sidecars",
+    "apply_sidecars_with_plan",
 ]

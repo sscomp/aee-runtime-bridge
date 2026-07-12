@@ -212,10 +212,35 @@ from .manifest import (
     manifest_to_plan_inputs,
     validate_manifest,
 )
+# AEE-7.8 K2.5: opt-in planner wire-up. The K2.5 entry
+# point that integrates the K1+K2 manifest → PlanInput
+# adapter into the AEE-7.7b sidecar apply path WITHOUT
+# changing default production behavior. The wrapper is
+# additive only — callers that do not opt in (the default
+# ``manifest_path=None``) see a byte-for-byte identical
+# :class:`ApplySidecarsResult` from :func:`apply_sidecars`.
+#
+#   from aee.audit import run_audit, apply_sidecars_with_plan
+#   summary, _, _ = run_audit(reports_root, output_dir)
+#   result = apply_sidecars_with_plan(
+#       reports_root, summary,
+#       manifest_path="AEE_7_7d_7e_MANIFEST.json",  # opt-in
+#   )
+#   if result.plan_input_summary is not None:
+#       print(result.plan_input_summary.plan_input_count)
+#
+# Re-exported here so a caller only needs ``from aee.audit
+# import ...`` (the audit package is the one-stop namespace).
+from .apply_sidecars import (
+    PLAN_APPLY_SCHEMA_VERSION,
+    ApplyWithPlanSummary,
+    apply_sidecars_with_plan,
+)
 
 __all__ = [
     "APPLY_SCHEMA_VERSION",
     "ApplySidecarsResult",
+    "ApplyWithPlanSummary",
     "AuditSummary",
     "DEFAULT_STATUS_FILTER",
     "DEFAULT_TARGET_POLICY_VERSION",
@@ -233,6 +258,7 @@ __all__ = [
     "MigrationExecutionResult",
     "MigrationPlan",
     "MigrationStatus",
+    "PLAN_APPLY_SCHEMA_VERSION",
     "PerTaskMigrationOutcome",
     "PerTaskProjection",
     "PerTaskSidecarOutcome",
@@ -246,6 +272,7 @@ __all__ = [
     "SidecarStatus",
     "ValidationResult",
     "apply_sidecars",
+    "apply_sidecars_with_plan",
     "build_sidecar_inventory",
     "execute_sidecar_migration",
     "load_manifest",
