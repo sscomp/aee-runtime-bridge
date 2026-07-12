@@ -236,9 +236,41 @@ from .apply_sidecars import (
     ApplyWithPlanSummary,
     apply_sidecars_with_plan,
 )
+# AEE-7.8 K3: read-only Audit Gate. The opt-in K3 wrapper
+# that audits the live apply outcome against the projected
+# ``PlanInput`` rows. The K3 surface is additive on top of
+# K2.5 — the K2.5 ``plan_input_summary`` field is preserved
+# untouched, and the new ``audit_report`` field is surfaced
+# via the new ``to_dict_with_audit()`` accessor. The K1 + K2
+# + K2.5 ``to_dict()`` contract is preserved (the new field
+# is omitted from ``to_dict()``).
+#
+#   from aee.audit import run_audit, apply_sidecars_with_audit
+#   summary, _, _ = run_audit(reports_root, output_dir)
+#   result = apply_sidecars_with_audit(
+#       reports_root, summary,
+#       manifest_path="AEE_7_7d_7e_MANIFEST.json",  # opt-in
+#       audit_action="warn",                         # warn / raise / ignore
+#   )
+#   if result.audit_report is not None:
+#       print(result.audit_report.mismatch_count)
+#
+# Re-exported here so a caller only needs ``from aee.audit
+# import ...`` (the audit package is the one-stop namespace).
+from .apply_sidecars import (
+    AUDIT_SCHEMA_VERSION,
+    ApplyAuditError,
+    ApplyAuditMismatch,
+    ApplyAuditReport,
+    apply_sidecars_with_audit,
+)
 
 __all__ = [
     "APPLY_SCHEMA_VERSION",
+    "AUDIT_SCHEMA_VERSION",
+    "ApplyAuditError",
+    "ApplyAuditMismatch",
+    "ApplyAuditReport",
     "ApplySidecarsResult",
     "ApplyWithPlanSummary",
     "AuditSummary",
@@ -272,6 +304,7 @@ __all__ = [
     "SidecarStatus",
     "ValidationResult",
     "apply_sidecars",
+    "apply_sidecars_with_audit",
     "apply_sidecars_with_plan",
     "build_sidecar_inventory",
     "execute_sidecar_migration",
