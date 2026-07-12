@@ -165,6 +165,33 @@ from .live_migration_dryrun import (
     run_live_migration_apply,
     run_live_migration_dryrun,
 )
+# AEE-7.8 K1: read-only manifest support. The loader /
+# validator companion to the AEE-7.7e ``write_manifest=True``
+# artifact. Loads a manifest from disk into typed dataclasses
+# and exposes a small introspection surface (list_group_names,
+# get_group, iter_files, etc.). Pure read — no dispatcher,
+# no live DB, no subprocess.
+#
+#   from aee.audit import load_manifest, validate_manifest
+#   doc = load_manifest("AEE_7_7d_7e_MANIFEST.json")
+#   result = validate_manifest(doc)
+#   assert result.passed
+#   for fe in doc.iter_files():
+#       print(fe.path, fe.sha256)
+#
+# Re-exported here so a caller only needs ``from aee.audit
+# import ...`` (the audit package is the one-stop namespace).
+from .manifest import (
+    FileEntry,
+    FileEntryKind,
+    GroupEntry,
+    MANIFEST_SCHEMA_VERSION,
+    ManifestDocument,
+    ManifestError,
+    ValidationResult,
+    load_manifest,
+    validate_manifest,
+)
 
 __all__ = [
     "APPLY_SCHEMA_VERSION",
@@ -172,10 +199,16 @@ __all__ = [
     "AuditSummary",
     "DEFAULT_STATUS_FILTER",
     "DEFAULT_TARGET_POLICY_VERSION",
+    "FileEntry",
+    "FileEntryKind",
+    "GroupEntry",
     "INVENTORY_SCHEMA_VERSION",
     "LIVE_MIGRATION_DRYRUN_SCHEMA_VERSION",
+    "MANIFEST_SCHEMA_VERSION",
     "MIGRATION_EXEC_SCHEMA_VERSION",
     "LiveMigrationDryrunResult",
+    "ManifestDocument",
+    "ManifestError",
     "MigrationExecutionResult",
     "MigrationPlan",
     "MigrationStatus",
@@ -189,12 +222,15 @@ __all__ = [
     "SidecarInventoryEntry",
     "SidecarInventoryResult",
     "SidecarStatus",
+    "ValidationResult",
     "apply_sidecars",
     "build_sidecar_inventory",
     "execute_sidecar_migration",
+    "load_manifest",
     "plan_sidecar_migration",
     "project_migration_execution",
     "run_audit",
     "run_live_migration_apply",
     "run_live_migration_dryrun",
+    "validate_manifest",
 ]
