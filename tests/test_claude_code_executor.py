@@ -650,3 +650,353 @@ async def test_inflight_cleaned_after_cancelled(
     assert cancel.cancelled is True
     # FIX-4: the entry is gone after cancel.
     assert res.external_run_id not in cce._inflight
+
+
+# --- TASK-M6: Auth environment pass-through security tests -----------
+#
+# These tests cover the contract in TASK-M6 §6. We use only
+# synthetic credentials ("*-not-real") and never inspect real
+# auth tokens. Values are referenced as "must not be present in
+# output X" — never asserted to be a specific string the test
+# itself owns (except the test-owned synthetic ones).
+
+# Synthetic test secrets. These are NOT real credentials; they
+# only exist to prove the helper does not echo them into argv,
+# raw payloads, or error messages.
+SYNTHETIC_SECRETS = {
+    "ANTHROPIC_API_KEY": "test-anthropic-key-not-real",
+    "ANTHROPIC_AUTH_TOKEN": "test-anthropic-token-not-real",
+    "CLAUDE_CODE_OAUTH_TOKEN": "test-oauth-token-not-real",
+    "CLAUDE_CODE_API_KEY": "test-claude-api-key-not-real",
+    "CLAUDE_CODE_ENTRYPOINT": "test-claude-entrypoint-not-real",
+    "CLAUDE_CONFIG_DIR": "/tmp/test-claude-config-not-real",
+}
+
+# Variables that the helper MUST NOT forward, even when set.
+UNRELATED_SECRETS = {
+    "AWS_SECRET_ACCESS_KEY": "test-aws-should-not-leak",
+    "GITHUB_TOKEN": "test-github-should-not-leak",
+    "DATABASE_URL": "test-pg-should-not-leak",
+    "BRIDGE_API_KEY": "test-bridge-should-not-leak",
+    "GPT_BRIDGE_API_KEY": "test-gpt-should-not-leak",
+    "SSH_AUTH_SOCK": "/tmp/test-ssh-should-not-leak",
+}
+
+
+def test_build_runner_env_forwards_allowlisted_auth_vars():
+    """Requirement 1: allow-listed auth variables are forwarded
+    when present in the parent mapping.
+    """
+    parent = dict(SYNTHETIC_SECRETS)
+    parent["PATH"] = "/usr/bin"
+    parent["HOME"] = "/home/ubuntu"
+    out = cce.build_runner_environment(parent)
+    for k, v in SYNTHETIC_SECRETS.items():
+        assert k in out, f"missing allow-listed key: {k}"
+        assert out[k] == v, f"value mismatch for {k}"
+    # And the base vars too (they must keep being forwarded).
+    assert out["PATH"] == "/usr/bin"
+    assert out["HOME"] == "/home/ubuntu"
+
+
+def test_build_runner_env_forwards_allowlisted_config_vars():
+    """TASK-M6 §5 (final set based on actual environment and Claude
+    CLI behavior): non-secret Claude config variables
+    (``ANTHROPIC_BASE_URL``, model aliases) are forwarded when
+    present. Without ``ANTHROPIC_BASE_URL`` the Claude CLI
+    cannot reach a custom endpoint and the auth token is
+    rejected with HTTP 401.
+    """
+    parent = {
+        "ANTHROPIC_BASE_URL": "https://example.invalid",
+        "ANTHROPIC_MODEL": "minimax-m3:cloud",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "minimax-sonnet",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "minimax-opus",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "minimax-haiku",
+        "CLAUDE_CODE_EXECPATH": "/usr/local/bin/claude",
+        "PATH": "/usr/bin",
+    }
+    out = cce.build_runner_environment(parent)
+    for k, v in parent.items():
+        assert out.get(k) == v, f"missing/wrong config var: {k}={out.get(k)!r}"
+    # And the allow-list of config keys must be exactly the
+    # documented set (so a future change cannot silently widen
+    # the surface).
+    assert cce.CLAUDE_CONFIG_ENV_ALLOWLIST == (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "CLAUDE_CODE_EXECPATH",
+    )
+
+
+def test_build_runner_env_omits_missing_auth_vars():
+    """Requirement 2: missing auth variables are omitted from
+    the child env.
+    """
+    out = cce.build_runner_environment({})
+    for k in cce.CLAUDE_AUTH_ENV_ALLOWLIST:
+        assert k not in out, f"unexpected key in empty-output: {k}"
+    # And the base / fake-runner lists too.
+    for k in cce.PASS_THROUGH_BASE + cce.PASS_THROUGH_FAKE_RUNNER:
+        assert k not in out, f"unexpected base/fake key: {k}"
+
+
+def test_build_runner_env_omits_empty_auth_vars():
+    """Requirement 3: empty-string auth variables are omitted.
+    """
+    parent = {
+        "ANTHROPIC_API_KEY": "",
+        "ANTHROPIC_AUTH_TOKEN": "non-empty-ok",
+        "CLAUDE_CODE_OAUTH_TOKEN": "",
+        "PATH": "/usr/bin",
+    }
+    out = cce.build_runner_environment(parent)
+    assert "ANTHROPIC_API_KEY" not in out
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in out
+    # Non-empty still forwarded.
+    assert out["ANTHROPIC_AUTH_TOKEN"] == "non-empty-ok"
+    assert out["PATH"] == "/usr/bin"
+
+
+def test_build_runner_env_does_not_forward_unrelated_secrets():
+    """Requirement 4: variables not in any allow-list are not
+    forwarded.
+    """
+    parent = dict(UNRELATED_SECRETS)
+    # Also throw in a fake-runner marker to make sure we are
+    # not too restrictive.
+    parent["FAKE_RUNNER_MODE"] = "pass"
+    out = cce.build_runner_environment(parent)
+    for k in UNRELATED_SECRETS:
+        assert k not in out, f"unrelated secret leaked: {k}"
+    # FAKE_RUNNER_MODE is the only thing that should survive
+    # (plus the empty base/auth lists).
+    assert out.get("FAKE_RUNNER_MODE") == "pass"
+    # The set of keys in ``out`` must be a subset of the union
+    # of the three allow-lists. (Empty-string entries dropped.)
+    allowed_set = set(
+        cce.PASS_THROUGH_BASE + cce.PASS_THROUGH_FAKE_RUNNER + cce.CLAUDE_AUTH_ENV_ALLOWLIST
+    )
+    assert set(out.keys()).issubset(allowed_set), (
+        f"unexpected keys: {set(out.keys()) - allowed_set}"
+    )
+
+
+def test_build_runner_env_does_not_copy_full_parent_environ():
+    """Requirement 9: the full parent environment is never
+    copied. Start with a parent containing 30 random keys
+    and a single allow-listed key, and assert only the
+    allow-listed one survives.
+    """
+    parent = {f"RANDOM_KEY_{i}": f"v{i}" for i in range(30)}
+    parent["PATH"] = "/x"
+    out = cce.build_runner_environment(parent)
+    # No random key may appear.
+    for k in parent:
+        if k.startswith("RANDOM_KEY_"):
+            assert k not in out, f"random key leaked: {k}"
+    # Only the single allow-listed key remains.
+    assert out == {"PATH": "/x"}, f"unexpected output: {out}"
+
+
+@pytest.mark.asyncio
+async def test_argv_does_not_carry_secret_values(
+    adapter, fake_runner_env, monkeypatch
+):
+    """Requirement 5: secret values do not appear in the
+    constructed argv list of the Runner subprocess.
+    """
+    # Inject synthetic secrets into the parent env so the
+    # helper has something to forward.
+    for k, v in SYNTHETIC_SECRETS.items():
+        monkeypatch.setenv(k, v)
+    for k, v in UNRELATED_SECRETS.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("FAKE_RUNNER_MODE", "pass")
+
+    spec = {
+        "task_id": "TASK-NOSECRETS-ARGV",
+        "run_id": "RUN-NOSECRETS-ARGV",
+        "repo_path": fake_runner_env["repo"],
+        "mode": "normal",
+        "timeout_seconds": 60,
+    }
+    job = _make_job(spec)
+    res = await adapter.submit(job)
+    run = cce._inflight[res.external_run_id]
+    argv = run.argv
+    # No synthetic secret value may appear in the argv list.
+    forbidden = set(SYNTHETIC_SECRETS.values()) | set(UNRELATED_SECRETS.values())
+    for entry in argv:
+        assert entry not in forbidden, (
+            f"secret value leaked into argv: {entry!r}"
+        )
+    _wait_for_exit(run.process, timeout=10.0)
+
+
+def test_helper_returned_dict_does_not_carry_unrelated_secret_values():
+    """Requirement 6: the helper's returned dict must not carry
+    unrelated secret values, even if they appear in the parent.
+    """
+    parent = dict(SYNTHETIC_SECRETS)
+    parent.update(UNRELATED_SECRETS)
+    out = cce.build_runner_environment(parent)
+    # Allowed: SYNTHETIC_SECRETS values
+    # Forbidden: UNRELATED_SECRETS values
+    forbidden_values = set(UNRELATED_SECRETS.values())
+    for v in out.values():
+        assert v not in forbidden_values, f"unrelated secret leaked: {v!r}"
+
+
+def test_routing_decision_log_does_not_carry_secret_values():
+    """Requirement 6: the executor_router's RoutingDecision.to_dict
+    output must not carry secret values. We assert by feeding the
+    router metadata dict that includes secret-shaped keys and
+    confirming the rendered decision string has no value.
+    """
+    from aee.runtimes.executor_router import (
+        RoutingDecision,
+        select_executor,
+        validate_metadata,
+    )
+    # Inject a secret-shaped metadata value alongside a
+    # well-formed key.
+    meta = {
+        "executor": "claude_code",
+        "repo_path": "/home/ubuntu/Abacus",
+        "watermark": "test-secret-not-real",
+    }
+    # The router does not actually inspect 'watermark'; we are
+    # checking that the routing decision dict we build does not
+    # echo the secret value.
+    validate_metadata(meta)
+    decision = select_executor(meta, available_adapters=("claude_code",))
+    rendered = decision.to_dict()
+    # Recursively check: no value in the rendered decision is
+    # the secret.
+    def _walk(obj):
+        if isinstance(obj, dict):
+            for v in obj.values():
+                yield from _walk(v)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                yield from _walk(v)
+        else:
+            yield obj
+    for v in _walk(rendered):
+        assert v != "test-secret-not-real", (
+            f"secret value leaked into routing decision: {v!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_adapter_error_message_does_not_carry_secret_values(
+    adapter, fake_runner_env, monkeypatch
+):
+    """Requirement 7: secret values do not appear in adapter
+    error messages.
+    """
+    for k, v in SYNTHETIC_SECRETS.items():
+        monkeypatch.setenv(k, v)
+    # Build a job that triggers an AdapterRuntimeError: missing
+    # repo_path. The error text must not echo the auth env.
+    class _BadJob:
+        spec = {
+            "task_id": "TASK-ERR",
+            "run_id": "RUN-ERR",
+            "mode": "normal",
+            "timeout_seconds": 60,
+            # repo_path intentionally missing -> raises.
+        }
+        task_id = "TASK-ERR"
+        title = "err"
+        mode = "normal"
+        priority = 50
+        input = "x"
+        session_id = None
+        client_source = "test"
+        model_name = None
+        runtime_type = "claude_code"
+        adapter_name = "claude_code"
+        external_run_id = None
+
+    with pytest.raises(cce.AdapterRuntimeError) as excinfo:
+        await adapter.submit(_BadJob())
+    err_text = str(excinfo.value)
+    for v in SYNTHETIC_SECRETS.values():
+        assert v not in err_text, (
+            f"secret value leaked into error message: {v!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_submit_result_raw_does_not_carry_secret_values(
+    adapter, fake_runner_env, monkeypatch
+):
+    """Requirement 8: secret values do not appear in
+    ``RuntimeSubmitResult.raw`` (the value the watcher / API
+    layer will serialize back to the caller).
+    """
+    for k, v in SYNTHETIC_SECRETS.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("FAKE_RUNNER_MODE", "pass")
+
+    spec = {
+        "task_id": "TASK-RAW",
+        "run_id": "RUN-RAW",
+        "repo_path": fake_runner_env["repo"],
+        "mode": "normal",
+        "timeout_seconds": 60,
+    }
+    job = _make_job(spec)
+    res = await adapter.submit(job)
+    # Convert raw to a JSON string to recursively check.
+    raw = res.raw or {}
+    # Build a flat list of all string values.
+    def _flat(obj):
+        if isinstance(obj, dict):
+            for v in obj.values():
+                yield from _flat(v)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                yield from _flat(v)
+        else:
+            yield obj
+    forbidden = set(SYNTHETIC_SECRETS.values())
+    found = [v for v in _flat(raw) if v in forbidden]
+    assert not found, f"secret values leaked into raw: {found}"
+    # Also sanity-check that to_dict is also clean.
+    res_dict = res.to_dict()
+    found2 = [v for v in _flat(res_dict) if v in forbidden]
+    assert not found2, f"secret values leaked into to_dict: {found2}"
+    run = cce._inflight[res.external_run_id]
+    _wait_for_exit(run.process, timeout=10.0)
+
+
+@pytest.mark.asyncio
+async def test_existing_fake_runner_determinism_preserved(
+    adapter, fake_runner_env, monkeypatch
+):
+    """Requirement 10: existing fake-runner test behavior
+    remains deterministic. Re-run a happy-path submit + poll
+    with FAKE_RUNNER_MODE=pass and assert the verified
+    manifest path is still produced.
+    """
+    monkeypatch.setenv("FAKE_RUNNER_MODE", "pass")
+    spec = {
+        "task_id": "TASK-DETERM",
+        "run_id": "RUN-DETERM",
+        "repo_path": fake_runner_env["repo"],
+        "mode": "normal",
+        "timeout_seconds": 60,
+    }
+    res = await adapter.submit(_make_job(spec))
+    run = cce._inflight[res.external_run_id]
+    _wait_for_exit(run.process, timeout=10.0)
+    poll = await adapter.poll(res.external_run_id)
+    assert poll.is_terminal is True
+    assert poll.status == "completed"
+    assert run.verified_manifest.exists()

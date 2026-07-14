@@ -58,7 +58,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from aee.adapters.base import (
     RuntimeAdapter,
@@ -101,6 +101,81 @@ _CANCEL_GRACE_SECONDS = 5.0
 
 # Supported schema version mirrored from the manifest verifier.
 _SUPPORTED_SCHEMA_VERSION = "1.0.0"
+
+# --- TASK-M6: Auth environment pass-through -------------------------
+#
+# The installed ``claude`` CLI requires at least one of
+# ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` to start. We
+# carry these through to the Runner subprocess via an explicit
+# allow-list; we never copy ``os.environ`` wholesale (the parent
+# process holds unrelated secrets like ``AWS_SECRET_ACCESS_KEY``,
+# ``GITHUB_TOKEN``, ``DATABASE_URL``, ``BRIDGE_API_KEY``,
+# ``GPT_BRIDGE_API_KEY``, ``SSH_AUTH_SOCK``). Values are not
+# logged, not returned, not stored — only key presence/absence is
+# observable.
+#
+# Two complementary allow-lists, both non-secret:
+#
+# * ``CLAUDE_AUTH_ENV_ALLOWLIST`` — auth material. The ticket
+#   §5 list is the authoritative starting point; the actual
+#   set MUST be revisited if/when the Claude CLI adopts a new
+#   auth env var.
+# * ``CLAUDE_CONFIG_ENV_ALLOWLIST`` — non-secret configuration
+#   (custom API base URL, model alias overrides, exec path).
+#   Without ``ANTHROPIC_BASE_URL`` set, the CLI falls back to
+#   the public Anthropic API and any custom-endpoint auth
+#   token returns HTTP 401 (TASK-M6 §7 smoke evidence).
+
+CLAUDE_AUTH_ENV_ALLOWLIST = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_API_KEY",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CONFIG_DIR",
+)
+
+# Non-secret Claude config. These are operational tunings, not
+# credentials. The smoke failure on HEAD before this list was
+# added proved that without ``ANTHROPIC_BASE_URL`` the CLI
+# cannot reach a custom endpoint and the auth token is rejected
+# with HTTP 401.
+CLAUDE_CONFIG_ENV_ALLOWLIST = (
+    # Custom endpoint URL — non-secret, points to e.g. an
+    # internal proxy or a hosted Claude-compatible API.
+    "ANTHROPIC_BASE_URL",
+    # Model alias overrides (Sonnet / Opus / Haiku defaults).
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    # Path to the claude CLI binary the runner should invoke.
+    # Usually identical to the parent's; carried through for
+    # parallelism with CLAUDE_CODE_ENTRYPOINT.
+    "CLAUDE_CODE_EXECPATH",
+)
+
+# Non-secret base vars the Runner subprocess needs in order to
+# even import ``scripts.claude_code_runner`` (``PATH``,
+# ``PYTHONPATH``) and to behave like a normal Unix process
+# (``HOME``, ``LANG``, ``LC_ALL``). These are not auth material;
+# they are infrastructure. They were already passed through by
+# the previous hand-rolled child env.
+PASS_THROUGH_BASE = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "PYTHONPATH",
+)
+
+# Test-only carry-over: ``FAKE_RUNNER_MODE`` is consumed by
+# ``scripts.fake_runner`` to select pass/fail/hang behavior. It
+# is intentionally isolated in its own list so it is obvious
+# nothing in the base / auth list overlaps with test fixtures.
+PASS_THROUGH_FAKE_RUNNER = (
+    "FAKE_RUNNER_MODE",
+)
 
 
 # --- Module-level state -----------------------------------------------
@@ -221,22 +296,16 @@ class ClaudeCodeExecutorAdapter:
         )
         # Launch
         try:
-            # Forward only the environment the Runner is allowed
-            # to see. We deliberately do NOT pass ``os.environ``
-            # wholesale — the production Runner filters its own
-            # env; here we only carry through the few keys the
-            # fake Runner (and any well-behaved future Runner)
-            # needs to read.
-            child_env = {
-                "PATH": os.environ.get("PATH", ""),
-                "HOME": os.environ.get("HOME", ""),
-                "LANG": os.environ.get("LANG", ""),
-                "LC_ALL": os.environ.get("LC_ALL", ""),
-                "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
-                "FAKE_RUNNER_MODE": os.environ.get("FAKE_RUNNER_MODE", "pass"),
-            }
-            # Drop empties so the child env stays minimal.
-            child_env = {k: v for k, v in child_env.items() if v}
+            # TASK-M6: build the child env via the explicit
+            # allow-list helper. ``os.environ`` is NEVER copied
+            # wholesale — only the keys in
+            # ``PASS_THROUGH_BASE`` / ``PASS_THROUGH_FAKE_RUNNER``
+            # / ``CLAUDE_AUTH_ENV_ALLOWLIST`` are forwarded, and
+            # only when present and non-empty. Secret values are
+            # never logged, returned, or stored in
+            # ``RuntimeSubmitResult.raw`` — this mapping is
+            # consumed only by ``Popen`` below.
+            child_env = build_runner_environment(os.environ)
             proc = subprocess.Popen(  # noqa: S603 — see argv construction
                 argv,
                 cwd=self._runner_cwd,
@@ -623,6 +692,53 @@ def _summarise_verification_errors(errors: List[str]) -> str:
     return "verification failed: " + ",".join(errors[:3])
 
 
+def build_runner_environment(parent: Mapping[str, str]) -> Dict[str, str]:
+    """Build the child environment for the Runner subprocess.
+
+    TASK-M6: explicit allow-list pass-through. Only keys that are
+    present, non-empty, and listed in :data:`PASS_THROUGH_BASE`,
+    :data:`PASS_THROUGH_FAKE_RUNNER`,
+    :data:`CLAUDE_CONFIG_ENV_ALLOWLIST`, or
+    :data:`CLAUDE_AUTH_ENV_ALLOWLIST` are forwarded. The full
+    parent environment is never copied. Secret values (auth
+    tokens) are returned to the caller so Popen can pass them to
+    the child; they are NEVER logged, returned to the API, or
+    stored in ``RuntimeSubmitResult.raw`` — this function only
+    builds the mapping.
+
+    Order is stable: base vars first, then fake-runner marker,
+    then non-secret Claude config (base URL, model aliases), then
+    auth allow-list. Tests assert the exact key set; order does
+    not affect behavior but is deterministic.
+
+    Args:
+        parent: The parent process environment (typically
+            ``os.environ``). The mapping is read-only here.
+
+    Returns:
+        A new ``dict`` containing only the allow-listed,
+        non-empty keys. Empty values are dropped.
+    """
+    out: Dict[str, str] = {}
+    for key in PASS_THROUGH_BASE:
+        v = parent.get(key)
+        if v:
+            out[key] = v
+    for key in PASS_THROUGH_FAKE_RUNNER:
+        v = parent.get(key)
+        if v:
+            out[key] = v
+    for key in CLAUDE_CONFIG_ENV_ALLOWLIST:
+        v = parent.get(key)
+        if v:
+            out[key] = v
+    for key in CLAUDE_AUTH_ENV_ALLOWLIST:
+        v = parent.get(key)
+        if v:
+            out[key] = v
+    return out
+
+
 # Protocol satisfaction at import time (matches FakeAdapter style).
 assert isinstance(ClaudeCodeExecutorAdapter(), RuntimeAdapter)  # type: ignore[misc]
 
@@ -632,4 +748,10 @@ __all__ = [
     "ClaudeConcurrencyError",
     "DEFAULT_RUNS_ROOT",
     "DEFAULT_RUNNER_CWD",
+    # TASK-M6 exports
+    "CLAUDE_AUTH_ENV_ALLOWLIST",
+    "CLAUDE_CONFIG_ENV_ALLOWLIST",
+    "PASS_THROUGH_BASE",
+    "PASS_THROUGH_FAKE_RUNNER",
+    "build_runner_environment",
 ]

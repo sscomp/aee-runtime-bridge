@@ -117,6 +117,31 @@ components:
           example:
             - /home/ubuntu/macro-report/PHASE2B_PLAN_AND_DIFF_PROPOSAL.md
             - /home/ubuntu/macro-report/phase2a/scaffold.py
+        # TASK-M6: optional executor-routing metadata. The
+        # dispatcher feeds this dict into
+        # ``aee.runtimes.executor_router.validate_metadata`` which
+        # enforces the actual shape and value rules (with stable
+        # error codes). The field is intentionally open-form
+        # (``additionalProperties: true``) because the router
+        # re-validates it; declaring it here just makes a strict
+        # OpenAPI client accept the key. ``metadata`` is NEVER
+        # required and never silently forwarded to Hermes-only
+        # callers — the existing ``required: [input]`` is
+        # unchanged.
+        metadata:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: |
+            Optional executor-routing and execution metadata.
+            Recognized keys: executor ("hermes" | "claude_code"),
+            repo_path, working_mode, expected_branch, expected_head,
+            allow_commit, human_approved, required_artifacts,
+            test_command, model, fallback_model, brief. When absent
+            the request is dispatched via the existing Hermes path
+            (legacy behavior). See
+            ``aee.runtimes.executor_router.validate_metadata`` for
+            the full validation contract.
 
     CreateRunResponse:
       type: object
