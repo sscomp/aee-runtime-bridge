@@ -49,6 +49,45 @@ from config import load as config_load
 # adapter owns its own transport config.
 
 
+def _claude_code_completion_gate(
+    t,
+    raw: Optional[Dict[str, Any]],
+) -> tuple[bool, str]:
+    """TASK-M2: second defense-in-depth line for Claude Code.
+
+    The adapter is expected to have already verified the
+    manifest before reporting ``completed``. The watcher still
+    inspects the raw payload: if the adapter's verifier failed
+    (or the manifest is missing entirely), we refuse the
+    transition and let the manager mark the task ``failed``
+    instead. This guarantees that ``runner process exit ==
+    Hermes completed`` can never hold for Claude Code tasks.
+
+    Returns:
+        (ok, error_message) — ``ok=True`` means the gate is
+        satisfied; ``ok=False`` includes a short reason for
+        ``manager.fail`` to surface.
+    """
+    if not raw:
+        return False, "adapter returned no raw payload"
+    # The adapter attaches the verification block under
+    # ``raw['verification']`` (set by the adapter's poll()).
+    ver = raw.get("verification") or {}
+    if not isinstance(ver, dict):
+        return False, "verification block missing or malformed"
+    if ver.get("verified") is not True:
+        errors = ver.get("verification_errors") or []
+        # Keep the first 3 codes so the message stays bounded.
+        reason = ",".join(str(e) for e in errors[:3]) or "verified=false"
+        return False, f"manifest gate failed: {reason}"
+    # Manifest path is recorded by the adapter; sanity-check it
+    # resolves inside the expected run dir.
+    manifest_path = raw.get("verified_manifest")
+    if not manifest_path:
+        return False, "verified_manifest path missing from adapter raw"
+    return True, ""
+
+
 def _translate_status(upstream_status: str) -> tuple[str, int, Optional[str]]:
     """Return (dispatcher_status, pct, step) given a runtime status.
 
@@ -279,6 +318,25 @@ class Watcher:
             usage = poll_result.usage
             raw = dict(poll_result.raw) if poll_result.raw else None
             if new_status == "completed":
+                # TASK-M2: completion gate. For Claude Code runs
+                # the adapter's ``completed`` status is a *claim*;
+                # it has already run the verifier once. We re-run
+                # the verifier here as the second defense-in-depth
+                # line: the watcher is the place that can refuse
+                # the transition, because the adapter could in
+                # principle be replaced by an implementation that
+                # returns ``completed`` without actually verifying
+                # the manifest. Legacy Hermes tasks bypass this
+                # gate completely (no behaviour change for them).
+                if (t.adapter_name or "hermes") == "claude_code":
+                    ok, err = _claude_code_completion_gate(t, raw)
+                    if not ok:
+                        self._manager.fail(
+                            t.task_id,
+                            f"manifest_missing_or_subprocess_failed: {err}",
+                        )
+                        self._run_started.pop(external_id, None)
+                        return
                 self._manager.complete(
                     t.task_id, output_text=output_text, usage=usage, raw=raw,
                 )

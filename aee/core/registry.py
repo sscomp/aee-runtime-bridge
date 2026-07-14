@@ -110,23 +110,35 @@ def bootstrap_defaults(force: bool = False) -> None:
 
 
 def _register_aee7_defaults() -> None:
-    """AEE-7.1: register the claude_code AEE-2 adapter shim.
+    """AEE-7.1 / TASK-M2 / TASK-M3: register the ``claude_code`` adapter.
 
-    Idempotent: if the shim is already registered, this is a
-    no-op. If the import fails (e.g. slim install), the shim
-    is silently skipped — legacy ``adapter_name="hermes"``
-    tasks still work.
+    Fail-closed (TASK-M3 FIX-3):
+
+    * If the verified :class:`ClaudeCodeExecutorAdapter` cannot be
+      imported (any exception), ``claude_code`` is *not* registered
+      at all. There is **no silent fallback** to the legacy
+      :class:`aee.orchestrator.aee2_shim.ClaudeCodeRuntimeAdapter`:
+      an explicit ``metadata.executor="claude_code"`` request must
+      either route to the verified adapter (which gates completion
+      on a verified manifest) or fail with ``executor_unavailable``
+      (the router raises :class:`ExecutorUnavailable` and the API
+      layer returns 503). Silently routing to an unverified shim
+      would violate the contract.
+
+    * Idempotent: if ``claude_code`` is already registered, this is
+      a no-op. We *replace* any prior registration under the same
+      name so a previous (older) shim does not silently win.
     """
     if "claude_code" in adapter_registry.names():
         return
-    try:
-        from aee.orchestrator.aee2_shim import ClaudeCodeRuntimeAdapter
-    except Exception:  # noqa: BLE001 - defensive
-        return
-    try:
-        adapter_registry.register(ClaudeCodeRuntimeAdapter(), replace=True)
-    except Exception:  # noqa: BLE001 - defensive
-        pass
+    # TASK-M2 / TASK-M3 FIX-3: only the verified adapter is
+    # accepted. If it fails to import, ``claude_code`` stays
+    # unregistered; the router will then raise
+    # ``ExecutorUnavailable`` and the API returns 503. We
+    # deliberately do NOT fall back to a legacy shim — that
+    # would silently bypass the manifest gate.
+    from aee.adapters.claude_code_executor import ClaudeCodeExecutorAdapter
+    adapter_registry.register(ClaudeCodeExecutorAdapter(), replace=True)
 
 
 # ---------------------------------------------------------------------------

@@ -306,6 +306,32 @@ class CreateRunRequest(BaseModel):
             "don't pass it keep the column NULL."
         ),
     )
+    # TASK-M2 (TASK-M2 — Executor Router + Claude Adapter + Verified
+    # Manifest Gate MVP): optional ``metadata`` field carries
+    # executor-routing hints. ``None`` (the default) keeps the
+    # existing Hermes path completely unchanged. Recognized keys:
+    #   - executor:          "hermes" | "claude_code"
+    #   - repo_path:         absolute, allow-listed git repo path
+    #   - working_mode:      e.g. "isolated_directory"
+    #   - expected_branch:   runner pin
+    #   - expected_head:     runner pin
+    #   - allow_commit:      bool, requires human_approved
+    #   - human_approved:    bool
+    #   - required_artifacts: list of relative paths
+    #   - test_command:      single string (no shell composition)
+    #   - model / fallback_model
+    metadata: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "TASK-M2 executor router metadata. Optional. When "
+            "absent, the request is dispatched via the existing "
+            "Hermes path. When present, ``executor`` selects the "
+            "target backend (currently 'claude_code' or 'hermes'); "
+            "the other keys are forwarded to the executor. See "
+            "``aee.runtimes.executor_router.validate_metadata`` "
+            "for the full validation contract."
+        ),
+    )
 
     @field_validator("mode")
     @classmethod
@@ -650,6 +676,79 @@ async def create_run(
         runtime_type=task.runtime_type or "hermes",
         adapter_name=task.adapter_name or "hermes",
     )
+    # ----- TASK-M2: executor router. Validate the optional
+    # ``metadata`` and, when present, override the ``adapter_name``
+    # / ``runtime_type`` based on the explicit opt-in. Legacy
+    # callers that pass no ``metadata`` keep the existing path
+    # unchanged. We deliberately do *not* silently fall back: if
+    # the caller asked for ``claude_code`` and the adapter is not
+    # available, we fail with a 503 (rather than downgrade to
+    # Hermes).
+    if body.metadata is not None:
+        from aee.runtimes.executor_router import (
+            ExecutorUnavailable,
+            ExecutorValidationError,
+            select_executor,
+            validate_metadata,
+        )
+        try:
+            validate_metadata(body.metadata)
+        except ExecutorValidationError as exc:
+            manager.fail(task_id, f"executor metadata invalid: {exc.code}")
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": exc.code,
+                    "message": exc.message,
+                },
+            ) from exc
+        try:
+            decision = select_executor(
+                body.metadata,
+                available_adapters=adapter_registry.names(),
+            )
+        except ExecutorUnavailable as exc:
+            manager.fail(task_id, str(exc))
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "executor_unavailable",
+                    "message": str(exc),
+                },
+            ) from exc
+        # Apply the routing decision by overriding the Job's
+        # adapter_name (the registry key). runtime_type follows.
+        job.adapter_name = decision.selected_executor
+        job.runtime_type = decision.selected_executor
+        # For ``claude_code`` we pack the metadata into ``Job.spec``
+        # so the adapter can pick it up. We deliberately do *not*
+        # merge into ``job.input`` — the brief is forwarded
+        # verbatim via ``metadata.brief`` (or falls back to input).
+        if decision.selected_executor == "claude_code":
+            spec_dict = dict(body.metadata or {})
+            # Promote the original input to ``spec.brief`` so the
+            # adapter can forward it to the Runner.
+            spec_dict.setdefault("brief", body.input)
+            spec_dict.setdefault("task_id", task_id)
+            # The dispatcher's external run_id is what the watcher
+            # will poll. We let the adapter generate it via
+            # ``_new_run_id()`` (UUID-based) and then write it back
+            # to the dispatcher via the existing
+            # ``submit_result.external_run_id`` path — no need to
+            # pin run_id in spec.
+            spec_dict.pop("run_id", None)
+            job.spec = spec_dict
+        # Audit log entry — small but enough to trace which path
+        # the router took for a given task.
+        try:
+            manager.log(
+                task_id,
+                f"router: requested={decision.requested_executor!r} "
+                f"selected={decision.selected_executor!r} "
+                f"source={decision.selection_source!r}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
     adapter = adapter_registry.get(job.adapter_name)
     try:
         submit_result = await adapter.submit(job)
