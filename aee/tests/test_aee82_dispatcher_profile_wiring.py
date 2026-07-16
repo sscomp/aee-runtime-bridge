@@ -300,23 +300,47 @@ class BackwardCompatTests(unittest.TestCase):
 class IsolationContractTests(unittest.TestCase):
     """Verify AEE-8.2 does not touch safety.py or break descriptor isolation."""
 
-    def test_safety_py_not_modified(self):
-        """safety.py must NOT have a profile parameter (AEE-8.2 is storage-only)."""
+    def test_safety_py_profile_param_is_optional(self):
+        """safety.py may have an OPTIONAL profile parameter (AEE-8.3).
+
+        AEE-8.2 asserted safety.py had NO profile arg (storage-only
+        phase). AEE-8.3 intentionally adds ``profile: Optional[str] =
+        None`` to ``evaluate()`` to activate profile-aware enforcement.
+        This test verifies the parameter is OPTIONAL (defaults to None),
+        preserving backward compatibility — the AEE-8.2 isolation
+        contract is superseded by AEE-8.3.
+        """
         import ast
         safety_path = _ROOT / "dispatcher" / "safety.py"
         with open(safety_path, "r") as f:
             source = f.read()
         tree = ast.parse(source)
-        # Walk the AST looking for any function with 'profile' in its args
+        # Find evaluate() and verify profile param is optional (has a default).
+        found_evaluate = False
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                arg_names = [a.arg for a in node.args.args]
-                self.assertNotIn(
-                    "profile",
-                    arg_names,
-                    f"safety.py function {node.name!r} has a 'profile' arg — "
-                    "AEE-8.2 must NOT modify safety.py",
-                )
+                if node.name == "evaluate":
+                    found_evaluate = True
+                    arg_names = [a.arg for a in node.args.args]
+                    self.assertIn(
+                        "profile",
+                        arg_names,
+                        "safety.py evaluate() must have a 'profile' arg (AEE-8.3)",
+                    )
+                    # Verify it has a default value (Optional[str] = None)
+                    # args.args and args.defaults don't align by index;
+                    # defaults align to the LAST N args.
+                    num_defaults = len(node.args.defaults)
+                    num_args = len(node.args.args)
+                    # profile should be in the defaulted tail
+                    defaulted_args = node.args.args[num_args - num_defaults:]
+                    defaulted_names = [a.arg for a in defaulted_args]
+                    self.assertIn(
+                        "profile",
+                        defaulted_names,
+                        "safety.py evaluate() 'profile' arg must have a default (AEE-8.3 backward compat)",
+                    )
+        self.assertTrue(found_evaluate, "safety.py must have an evaluate() function")
 
     def test_descriptor_no_forbidden_imports(self):
         """aee.profiles.descriptor must not import dispatcher/sqlite3/subprocess."""

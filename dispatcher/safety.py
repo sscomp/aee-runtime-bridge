@@ -65,7 +65,116 @@ def _has_path_op(cmd: str) -> bool:
     return bool(re.search(r"[<>]|/[\w/.\-]+", cmd))
 
 
-def evaluate(input_text: str, mode: str = "normal") -> SafetyDecision:
+# ---------------------------------------------------------------------------
+# AEE-8.3 — Profile-aware enforcement intent detection (best-effort).
+#
+# These helpers detect *intent* from the input text so the safety gate
+# can reject cross-profile violations BEFORE the task is sent upstream.
+# They are intentionally conservative: false positives (rejecting a
+# legitimate operation under a restricted profile) are acceptable;
+# false negatives (allowing a restricted operation) are not.
+#
+# Patterns are substring/regex, consistent with the existing safety.py
+# approach. They do NOT import the descriptor module — that import is
+# lazy, inside evaluate(), to preserve the isolation contract.
+# ---------------------------------------------------------------------------
+
+# Cron-creation intent: creating scheduled jobs, cron entries, etc.
+_CRON_INTENT_PATTERNS: List[str] = [
+    r"\bcron\b",
+    r"\bcrontab\b",
+    r"\bcronjob\b",
+    r"\bschedule[d]?\s+(?:job|task)\b",
+    r"\badd-schedule\b",
+    r"\bhermes\s+cron\b",
+]
+
+# Subagent-delegation intent: spawning or delegating to subagents.
+_SUBAGENT_INTENT_PATTERNS: List[str] = [
+    r"\bdelegate\b",
+    r"\bdelegate_task\b",
+    r"\bsubagent\b",
+    r"\bsub-agent\b",
+    r"\bsub\s+agent\b",
+    r"\bspawn\s+(?:a\s+)?(?:subagent|agent)\b",
+]
+
+# Write/mutation intent: file writes, DB mutations, git mutations,
+# package installs, deploys, restarts. Used only for is_read_only
+# profiles (edge). Non-read-only profiles (full, mini, developer)
+# are not gated by these patterns.
+_WRITE_INTENT_PATTERNS: List[str] = [
+    r"\bwrite_file\b",
+    r"\bmkdir\b",
+    r"\brm\b\s",
+    r"\bmv\b\s",
+    r"\bcp\b\s",
+    r"\btouch\b\s",
+    r"\btee\b",
+    r">>\s",
+    r"\s>\s",
+    r"\bINSERT\s+INTO\b",
+    r"\bDELETE\s+FROM\b",
+    r"\bDROP\s+TABLE\b",
+    r"\bCREATE\s+TABLE\b",
+    r"\bALTER\s+TABLE\b",
+    r"\bUPDATE\s+.*\bSET\b",
+    r"git\s+commit",
+    r"git\s+push",
+    r"git\s+merge",
+    r"git\s+rebase",
+    r"git\s+stash",
+    r"pip\s+install",
+    r"apt\s+install",
+    r"npm\s+install",
+    r"\bdeploy\b",
+    r"\brestart\b",
+]
+
+
+def _has_cron_intent(text: str) -> bool:
+    """Heuristic: does the text contain cron-creation intent?"""
+    for pat in _CRON_INTENT_PATTERNS:
+        try:
+            if re.search(pat, text, flags=re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _has_subagent_intent(text: str) -> bool:
+    """Heuristic: does the text contain subagent-delegation intent?"""
+    for pat in _SUBAGENT_INTENT_PATTERNS:
+        try:
+            if re.search(pat, text, flags=re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _has_write_intent(text: str) -> bool:
+    """Heuristic: does the text contain write/mutation intent?
+
+    Used only for is_read_only profiles. Conservative: matches common
+    shell redirects, file-manipulation commands, DB write keywords,
+    git mutations, package installs, and deploy/restart verbs.
+    """
+    for pat in _WRITE_INTENT_PATTERNS:
+        try:
+            if re.search(pat, text, flags=re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def evaluate(
+    input_text: str,
+    mode: str = "normal",
+    profile: Optional[str] = None,
+) -> SafetyDecision:
     """Evaluate `input_text` against the safety policy.
 
     Returns a SafetyDecision with action ∈ {allow, block, require_approval}.
@@ -174,6 +283,78 @@ def evaluate(input_text: str, mode: str = "normal") -> SafetyDecision:
                 reason=f"approval required: matches {substr!r}",
                 matched=substr,
                 needs_human=True,
+            )
+
+    # 5) AEE-8.3 — Profile-aware enforcement (read-only activation).
+    # When a profile is supplied, lazily import the descriptor and use
+    # its enforcement fields to reject cross-profile violations BEFORE
+    # the task is sent upstream. This is the activation point for the
+    # descriptor's can_create_cron / can_delegate_subagents /
+    # is_read_only fields (AEE-8.1 contract). profile=None means no
+    # enforcement — backward compatible with all pre-AEE-8.3 callers.
+    if profile is not None and profile != "":
+        # Lazy import: preserves isolation contract (no module-top
+        # import of aee.profiles.descriptor in safety.py).
+        from aee.profiles.descriptor import (
+            get_descriptor,
+            UnknownProfileError,
+        )
+
+        try:
+            desc = get_descriptor(profile)
+        except UnknownProfileError:
+            # Unknown profile: defer to AEE-8.1 validation contract.
+            # Do NOT build a second profile parser in the safety layer.
+            # Re-raise so the caller sees the original error with the
+            # full diagnostic (expected one of [...]).
+            raise
+
+        # 5a) is_read_only profile (edge): reject any write/mutation.
+        if desc.is_read_only and _has_write_intent(text):
+            return SafetyDecision(
+                action="block",
+                reason=(
+                    f"profile {desc.name!r} is read-only; "
+                    f"write/mutation intent detected"
+                ),
+                matched=desc.name,
+                meta={
+                    "profile": desc.name,
+                    "violation": "is_read_only",
+                    "capability": "is_read_only",
+                },
+            )
+
+        # 5b) can_create_cron=False: reject cron-creation intent.
+        if not desc.can_create_cron and _has_cron_intent(text):
+            return SafetyDecision(
+                action="block",
+                reason=(
+                    f"profile {desc.name!r} cannot create cron jobs; "
+                    f"cron-creation intent detected"
+                ),
+                matched=desc.name,
+                meta={
+                    "profile": desc.name,
+                    "violation": "can_create_cron",
+                    "capability": "can_create_cron",
+                },
+            )
+
+        # 5c) can_delegate_subagents=False: reject subagent delegation.
+        if not desc.can_delegate_subagents and _has_subagent_intent(text):
+            return SafetyDecision(
+                action="block",
+                reason=(
+                    f"profile {desc.name!r} cannot delegate subagents; "
+                    f"subagent-delegation intent detected"
+                ),
+                matched=desc.name,
+                meta={
+                    "profile": desc.name,
+                    "violation": "can_delegate_subagents",
+                    "capability": "can_delegate_subagents",
+                },
             )
 
     return SafetyDecision(action="allow", reason="passed all safety checks")
