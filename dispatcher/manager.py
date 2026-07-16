@@ -131,6 +131,10 @@ _COLUMNS = (
     # which is aliased to `runtime_run_id` for non-Hermes runtimes).
     # Both are NULLable; legacy tasks keep NULL.
     "executor_session_id", "runtime_run_id",
+    # AEE-8.2: read-only profile storage. Persisted at create()
+    # time from the wire contract; not enforced. Legacy rows
+    # have NULL here and the Task dataclass defaults to None.
+    "profile",
 )
 
 
@@ -201,6 +205,7 @@ class TaskManager:
         required_capabilities: Optional[List[str]] = None,
         repo_root: Optional[str] = None,
         executor_session_id: Optional[str] = None,
+        profile: Optional[str] = None,
     ) -> Task:
         """Create a new task. Generates the task_id, sets status, records event.
 
@@ -240,6 +245,12 @@ class TaskManager:
         # callers passing "" don't pollute the column.
         if executor_session_id is not None:
             executor_session_id = executor_session_id.strip() or None
+        # AEE-8.2: same wire-boundary normalisation for profile —
+        # strip + None-on-empty so the DB never sees "" as a profile.
+        # The profile is stored but NOT enforced; this is purely
+        # storage plumbing.
+        if profile is not None:
+            profile = profile.strip() or None
         task_id = ids.next_task_id()
         created_at = ids.now_iso()
         commit, branch = _git_info(workdir)
@@ -255,8 +266,9 @@ class TaskManager:
                   prompt_version, model_name, git_commit, git_branch,
                   required_capabilities_json,
                   repo_root,
-                  executor_session_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  executor_session_id,
+                  profile
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, title, type, priority, owner, initial_status,
@@ -266,6 +278,7 @@ class TaskManager:
                     caps_blob,
                     repo_root,
                     executor_session_id,
+                    profile,
                 ),
             )
         _append_log(task_id, "INFO", f"created title={title!r} type={type} priority={priority}")

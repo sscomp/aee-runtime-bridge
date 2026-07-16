@@ -598,6 +598,10 @@ async def create_run(
                     input_text=body.input,
                     session_id=body.session_id or DEFAULT_SESSION_ID,
                     mode=body.mode,
+                    # AEE-8.2: persist profile on rejected tasks too
+                    # so the audit trail is consistent. The profile
+                    # is stored but NOT enforced.
+                    profile=body.profile,
                 )
                 manager.fail(t.task_id, f"safety reject: {decision.reason} (matched={decision.matched!r})")
             except Exception:  # noqa: BLE001
@@ -693,6 +697,12 @@ async def create_run(
         # `manager.create(..., executor_session_id=...)` kwarg.
         # Optional — None when the caller didn't pass one.
         executor_session_id=body.executor_session_id,
+        # AEE-8.2: forward the caller's profile selection from
+        # the wire contract to the dispatcher's
+        # `manager.create(..., profile=...)` kwarg. Stored but
+        # NOT enforced — no safety-gate, no toolset restriction.
+        # Optional — None when the caller didn't pass one.
+        profile=body.profile,
     )
     task_id = task.task_id
     # Record the source + override note on the task log. This is the audit

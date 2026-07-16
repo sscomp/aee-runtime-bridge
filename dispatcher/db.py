@@ -154,6 +154,23 @@ _AEE72_MIGRATIONS: list[tuple[str, str]] = [
 ]
 
 
+# AEE-8.2: read-only profile storage column on ``tasks``. The
+# ``profile`` field is persisted at ``manager.create(...)`` time
+# from the wire contract (``CreateRunRequest.profile``). It is
+# NULLable — legacy tasks that pre-date AEE-8.2 keep NULL, and
+# callers that don't pass ``profile`` also get NULL. The field
+# is **not** enforced: no safety-gate, no toolset restriction,
+# no routing change reads it. This is the storage-only plumbing
+# phase; enforcement is AEE-8.3 or later. Same idempotent
+# ``PRAGMA table_info`` pattern as AEE-7.2.
+_AEE82_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "profile",
+        "ALTER TABLE tasks ADD COLUMN profile TEXT",
+    ),
+]
+
+
 # AEE-7.13 follow-up: when the live DB was rebuilt after the
 # forensic-recovery incident, the AEE-7.5 + AEE-7.2 write-side
 # columns were stamped ``NOT NULL DEFAULT ''`` instead of NULLable.
@@ -393,6 +410,16 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if row is None:
             conn.execute(stmt)
+    # AEE-8.2: read-only profile storage column on `tasks`.
+    # Same idempotent pragma pattern as AEE-7.2; legacy rows
+    # keep NULL.
+    for col, stmt in _AEE82_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
     # AEE write-side metadata: executor_session_id + runtime_run_id
     # columns on `tasks`. Same idempotent pragma pattern as AEE-7.2;
     # legacy rows keep their NULL values.
@@ -549,6 +576,18 @@ def run_migrations() -> list[str]:
         if row is None:
             conn.execute(stmt)
             print(f"[db] AEE-7.2 migration: added tasks.{col}", file=sys.stderr)
+            added.append(col)
+    # AEE-8.2: read-only profile storage column on `tasks`.
+    # Same idempotent pragma pattern as AEE-7.2; legacy rows
+    # keep NULL.
+    for col, stmt in _AEE82_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(f"[db] AEE-8.2 migration: added tasks.{col}", file=sys.stderr)
             added.append(col)
     # AEE write-side metadata: executor_session_id + runtime_run_id
     # columns on `tasks`. Same idempotent pragma pattern as AEE-7.2;

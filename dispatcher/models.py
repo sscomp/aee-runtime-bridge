@@ -105,6 +105,15 @@ class Task:
     #   `manager.start(...)` time.
     executor_session_id: Optional[str] = None
     runtime_run_id: Optional[str] = None
+    # AEE-8.2: read-only profile storage. The profile field is
+    # persisted on the ``tasks`` row at ``create()`` time but is
+    # NOT enforced — no safety-gate, no toolset restriction, no
+    # routing change. ``None`` (the default) preserves the
+    # pre-AEE-8.2 behavior byte-for-byte; legacy tasks round-trip
+    # with ``None``. See ``aee/profiles/descriptor.py`` for the
+    # descriptor contract and ``AEE_PROFILE_UNIFICATION_DECISION_MINI.md``
+    # §5 for the phase scope.
+    profile: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
