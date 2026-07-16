@@ -141,7 +141,7 @@ def build_index(
     # ``aee.audit`` is not on the import path (it always is in
     # the bridge repo, but tests in isolation may need the
     # local-only path).
-    from aee.audit import apply_sidecars, run_audit
+    from aee.audit import apply_sidecars_with_audit, run_audit
 
     ts = classified_at_utc or _now_utc()
     policy = SentinelPolicy()
@@ -181,7 +181,7 @@ def build_index(
         user_alias_map[alias_value] = alias_key
 
     # --- Step 3: turn the summary into persisted sidecars ---
-    apply_result = apply_sidecars(
+    apply_result = apply_sidecars_with_audit(
         reports_root,
         summary,
         utc_stamp=ts,
