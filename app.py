@@ -306,6 +306,26 @@ class CreateRunRequest(BaseModel):
             "don't pass it keep the column NULL."
         ),
     )
+    # AEE-8.1: optional ``profile`` field. ``None`` (the default)
+    # keeps the existing behavior completely unchanged — the
+    # dispatcher sees ``full``. When set to ``mini``, ``edge``, or
+    # ``developer``, the profile descriptor is resolved at dispatch
+    # time (read-only plumbing; no source branching, no runtime
+    # mutation, no toolset enforcement yet — those are later
+    # phases). See ``aee.profiles.descriptor`` for the full
+    # contract and ``AEE_PROFILE_UNIFICATION_DECISION_MINI.md`` §5
+    # for the phase scope.
+    profile: Optional[str] = Field(
+        None,
+        description=(
+            "AEE-8.1 profile selector. Optional. One of: "
+            "full, mini, edge, developer. Defaults to 'full' "
+            "when omitted or empty. Unknown values are rejected "
+            "at schema validation time. This field is read-only "
+            "plumbing — it does not change any call site behavior "
+            "until a later phase wires it into the dispatcher."
+        ),
+    )
     # TASK-M2 (TASK-M2 — Executor Router + Claude Adapter + Verified
     # Manifest Gate MVP): optional ``metadata`` field carries
     # executor-routing hints. ``None`` (the default) keeps the
@@ -348,6 +368,34 @@ class CreateRunRequest(BaseModel):
         if v not in {"research", "coding", "ops", "review", "normal"}:
             raise ValueError("type must be one of: research, coding, ops, review, normal")
         return v
+
+    @field_validator("profile")
+    @classmethod
+    def _profile_allowed(cls, v: Optional[str]) -> Optional[str]:
+        # AEE-8.1: validate the profile field at schema boundary.
+        # None / empty / whitespace → None (caller did not opt in;
+        # the dispatcher will default to "full" downstream). Known
+        # profile names pass through. Unknown values raise
+        # ValueError so Pydantic surfaces a 422 to the caller.
+        # We do NOT import aee.profiles here to keep the schema
+        # module isolation-safe; the validator is a pure string
+        # check against the canonical set.
+        if v is None:
+            return v
+        if not isinstance(v, str):
+            raise ValueError(
+                f"profile must be a string, got {type(v).__name__}"
+            )
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        known = {"full", "mini", "edge", "developer"}
+        if cleaned not in known:
+            raise ValueError(
+                f"profile must be one of: full, mini, edge, developer; "
+                f"got {cleaned!r}"
+            )
+        return cleaned
 
 
 class CreateRunResponse(BaseModel):
