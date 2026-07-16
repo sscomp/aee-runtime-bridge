@@ -120,6 +120,8 @@ def build_index(
     telegram_message_id: Optional[str] = None,
     sidecar_for_runtime: bool = False,
     classified_at_utc: Optional[str] = None,
+    manifest_path: Optional[str] = None,
+    audit_action: str = "warn",
 ) -> Dict[str, Any]:
     """Walk reports, classify, write sidecars + index. Returns
     the summary dict (also written to ``audit_dir``).
@@ -184,6 +186,8 @@ def build_index(
     apply_result = apply_sidecars_with_audit(
         reports_root,
         summary,
+        manifest_path=manifest_path,
+        audit_action=audit_action,
         utc_stamp=ts,
         classified_at_override=ts,
         policy=policy,
@@ -375,6 +379,30 @@ def main(argv: Optional[List[str]] = None) -> int:
             "(default: only FIXTURE/UNKNOWN get a sidecar)."
         ),
     )
+    p.add_argument(
+        "--manifest-path",
+        default=None,
+        help=(
+            "Optional path to an AEE-7.7d/7.7e manifest "
+            "artifact. When supplied, the audit gate loads "
+            "the manifest, projects it to PlanInput rows, "
+            "and compares against the live apply outcomes. "
+            "When omitted (default), the wrapper is a "
+            "byte-for-byte pass-through."
+        ),
+    )
+    p.add_argument(
+        "--audit-action",
+        default="warn",
+        choices=("warn", "raise", "ignore"),
+        help=(
+            "Three-valued policy controlling what the audit "
+            "gate does on a non-empty audit. Allowed values: "
+            "warn (default, attach report and return), raise "
+            "(raise ApplyAuditError on mismatch), ignore "
+            "(compute but do not attach the report)."
+        ),
+    )
     args = p.parse_args(argv)
 
     aliases = dict(args.alias) if args.alias else {}
@@ -392,6 +420,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         commit_shas=list(args.commit_sha or []),
         telegram_message_id=args.telegram_message_id,
         sidecar_for_runtime=args.sidecar_for_runtime,
+        manifest_path=args.manifest_path,
+        audit_action=args.audit_action,
     )
     summary = result["summary"]
     reports = result["reports"]
