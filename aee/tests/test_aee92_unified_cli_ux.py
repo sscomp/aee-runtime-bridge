@@ -489,17 +489,30 @@ class NoSideEffectsTests(unittest.TestCase):
         self.assertNotIn("os.popen(", src)
 
     def test_install_dispatch_is_dry_run(self) -> None:
-        """The dispatch output explicitly says ``backend_implemented : False``."""
+        """The dispatch output says ``backend_implemented : True`` + ``executed : False``.
+
+        Updated for Epic 9.3 (§21.3): the installer backend is now
+        wired, so ``backend_implemented`` flipped from ``False`` to
+        ``True``. The ``executed : False`` line carries the dry-run
+        guarantee (no side effects). The §21.2 "no side effects"
+        invariant is preserved by the lazy import + dry-run default.
+        """
         buf = io.StringIO()
         with patch("sys.stdout", buf):
             rc = main(["install", "--profile", "full"])
         self.assertEqual(rc, EXIT_OK)
         out = buf.getvalue()
-        self.assertIn("backend_implemented : False", out)
+        self.assertIn("backend_implemented : True", out)
+        self.assertIn("executed            : False", out)
         self.assertIn("side effects        : none", out)
 
     def test_install_json_output_shape(self) -> None:
-        """``--json`` emits a JSON object with the expected keys."""
+        """``--json`` emits a JSON object with the expected keys.
+
+        Updated for Epic 9.3 (§21.3): ``backend_implemented`` is now
+        ``True`` and the payload carries ``plan`` + ``preflight`` +
+        ``executed: False``.
+        """
         import json
         buf = io.StringIO()
         with patch("sys.stdout", buf):
@@ -511,7 +524,10 @@ class NoSideEffectsTests(unittest.TestCase):
         self.assertEqual(payload["default_profile"], DEFAULT_PROFILE)
         self.assertEqual(payload["known_profiles"], list(KNOWN_PROFILES))
         self.assertEqual(payload["dry_run"], True)
-        self.assertEqual(payload["backend_implemented"], False)
+        self.assertEqual(payload["backend_implemented"], True)
+        self.assertEqual(payload["executed"], False)
+        self.assertIn("plan", payload)
+        self.assertIn("preflight", payload)
         self.assertIn("descriptor", payload)
         self.assertEqual(payload["descriptor"]["name"], "mini")
 

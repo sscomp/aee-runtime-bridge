@@ -59,6 +59,14 @@ EXIT_PARSE_ERROR = 2
 #: that argparse accepts as a string but ``parse_profile`` rejects).
 EXIT_PROFILE_ERROR = 3
 
+#: Exit code returned when installer pre-flight fails (§21.3).
+EXIT_PRE_FLIGHT_FAILED = 4
+
+#: Exit code returned when an existing install with a different
+#: profile is detected (§21.3 "profile switch requires uninstall +
+#: reinstall").
+EXIT_PROFILE_SWITCH_REJECTED = 5
+
 
 def _profile_choices_help() -> str:
     """Build the ``--profile`` help string from the canonical tuple."""
@@ -204,27 +212,73 @@ def _install_dispatch(
     *,
     json_output: bool = False,
 ) -> int:
-    """Run the (spec-level) ``install`` dispatch contract.
+    """Run the ``install`` dispatch contract (§21.2 CLI + §21.3 backend).
 
-    This function performs **no** installer backend work. It reads
-    the canonical :class:`ProfileDescriptor` for the resolved profile
-    and emits a human-readable (or JSON) summary of what the profile
-    means. The real installer backend is §21.3 (separately
-    authorizable).
+    This function delegates to the §21.3 :class:`InstallerBackend` to
+    build an :class:`InstallPlan` and run read-only pre-flight. It
+    performs **no** side effects: the backend is constructed with
+    ``dry_run=True``, and ``execute(dry_run=False)`` is not called
+    here (the shell-level execution path is a separately authorizable
+    follow-up).
 
     Defence in depth: even though argparse ``choices`` already rejects
     unknown profiles, we call :func:`parse_profile` here so that any
     future code path that bypasses argparse (e.g. a programmatic
     caller) still gets canonical validation.
+
+    Exit code mapping (composed with the backend's exit codes):
+      * ``EXIT_OK`` (0) — plan + pre-flight succeeded.
+      * ``EXIT_PROFILE_ERROR`` (3) — unknown profile.
+      * ``EXIT_PRE_FLIGHT_FAILED`` (4) — pre-flight failed (e.g. repo
+        root missing).
+      * ``EXIT_PROFILE_SWITCH_REJECTED`` (5) — existing install with
+        a different profile detected (§21.3 "profile switch requires
+        uninstall + reinstall").
     """
+    # Imported lazily to keep the §21.2 "no installer backend side
+    # effects" invariant intact at module-import time — the backend
+    # module is only loaded when ``install`` is actually dispatched.
+    from aee.installer import (
+        InstallerBackend,
+        ProfileSwitchRejectedError,
+        PreFlightFailedError,
+    )
+
     try:
         canonical = parse_profile(profile)
-        descriptor = get_descriptor(canonical)
     except UnknownProfileError as exc:
         msg = "error: {prog}: {err}\n".format(prog=PROG_NAME, err=exc)
         sys.stderr.write(msg)
         return EXIT_PROFILE_ERROR
 
+    backend = InstallerBackend(dry_run=True)
+    try:
+        plan = backend.plan(canonical)
+        result = backend.execute(canonical, dry_run=True)
+    except UnknownProfileError as exc:
+        msg = "error: {prog}: {err}\n".format(prog=PROG_NAME, err=exc)
+        sys.stderr.write(msg)
+        return EXIT_PROFILE_ERROR
+
+    if not result.preflight.ok:
+        # Distinguish profile-switch rejection from generic pre-flight
+        # failure by inspecting the existing-profile field (§21.3).
+        if (
+            result.preflight.existing_profile is not None
+            and result.preflight.existing_profile != canonical
+        ):
+            msg = "error: {prog}: {err}\n".format(
+                prog=PROG_NAME, err=result.preflight.reason
+            )
+            sys.stderr.write(msg)
+            return EXIT_PROFILE_SWITCH_REJECTED
+        msg = "error: {prog}: pre-flight failed: {reason}\n".format(
+            prog=PROG_NAME, reason=result.preflight.reason
+        )
+        sys.stderr.write(msg)
+        return EXIT_PRE_FLIGHT_FAILED
+
+    descriptor = plan.descriptor
     if json_output:
         import json
         payload = {
@@ -234,18 +288,25 @@ def _install_dispatch(
             "known_profiles": list(KNOWN_PROFILES),
             "descriptor": descriptor.to_dict(),
             "dry_run": True,
-            "backend_implemented": False,
+            "backend_implemented": True,
+            "executed": False,
+            "plan": plan.to_dict(),
+            "preflight": result.preflight.to_dict(),
             "note": (
-                "Epic 9.2 ships the CLI parsing/dispatch contract only; "
-                "the installer backend is §21.3 (separately authorizable)."
+                "Epic 9.3 installer backend (§21.3) is wired; dry-run "
+                "plan + read-only pre-flight only. The shell-level "
+                "execution path (system user, env file, supervisord "
+                "reload, smoke test) is a separately authorizable "
+                "follow-up."
             ),
         }
         sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True))
         sys.stdout.write("\n")
         return EXIT_OK
 
+    step_ids = [s.step_id for s in plan.steps]
     lines = [
-        "aee install (dry-run / spec-level dispatch contract)",
+        "aee install (dry-run / §21.3 installer backend)",
         "  profile (resolved)  : {p}".format(p=canonical),
         "  default profile     : {d}".format(d=DEFAULT_PROFILE),
         "  known profiles      : {k}".format(k=", ".join(KNOWN_PROFILES)),
@@ -256,8 +317,12 @@ def _install_dispatch(
         "  can_dispatch        : {cd}".format(cd=descriptor.can_dispatch),
         "  can_create_cron     : {cc}".format(cc=descriptor.can_create_cron),
         "  is_read_only        : {ro}".format(ro=descriptor.is_read_only),
-        "  backend_implemented : False (§21.3 not yet authorized)",
-        "  side effects        : none (this slice is parsing-only)",
+        "  backend_implemented : True (§21.3)",
+        "  executed            : False (dry-run; shell path not authorized)",
+        "  plan steps          : {n} ({ids})".format(
+            n=len(plan.steps), ids=", ".join(step_ids)
+        ),
+        "  side effects        : none (dry-run; read-only pre-flight)",
     ]
     sys.stdout.write("\n".join(lines) + "\n")
     return EXIT_OK
@@ -307,6 +372,8 @@ __all__ = [
     "EXIT_OK",
     "EXIT_PARSE_ERROR",
     "EXIT_PROFILE_ERROR",
+    "EXIT_PRE_FLIGHT_FAILED",
+    "EXIT_PROFILE_SWITCH_REJECTED",
     "main",
 ]
 
