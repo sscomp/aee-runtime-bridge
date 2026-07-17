@@ -134,14 +134,48 @@ class ProfileDescriptor:
     #: Whether the profile is read-only with respect to the DB.
     #: ``edge`` is the only profile where this is ``True``.
     is_read_only: bool = False
+    # ----------------------------------------------------------------
+    # Epic 9.1 — Canonical Product Profile Matrix (§21.1) additive
+    # fields. These encode the capability matrix that the Master Plan
+    # documents; the code is the enforcement. Defaults preserve the
+    # ``full`` profile's behavior so existing callers that do not
+    # read these fields see no change.
+    # ----------------------------------------------------------------
+    #: Whether the profile may accept dispatch (``POST /runs``).
+    #: ``edge`` is False (read-only inspection surface).
+    can_dispatch: bool = True
+    #: Whether the profile may run long-running pipelines.
+    #: Only ``full`` is True; ``mini``/``edge``/``developer`` are False.
+    can_long_running_pipelines: bool = True
+    #: Graph query access level. One of ``"full"``, ``"subset"``,
+    #: ``"read_only"``, ``"sandbox"``. Per §21.1 matrix.
+    graph_queries: str = "full"
+    #: Observability event access level. Same vocabulary as
+    #: :attr:`graph_queries`.
+    observability_events: str = "full"
+    #: DB write access level. One of ``"full"``, ``"dispatch_only"``,
+    #: ``"disabled"``, ``"tempdir_only"``. Per §21.1 matrix.
+    db_writes: str = "full"
+    #: Production DB access level. One of ``"full"``, ``"read_only"``,
+    #: ``"blocked"``. Per §21.1 matrix.
+    production_db_access: str = "full"
+    #: Structured toolset identifier (machine-readable). The
+    #: human-readable form is :attr:`toolset_restriction`. One of
+    #: ``"full"``, ``"terminal_file_web_subset"``,
+    #: ``"file_read_web_read"``, ``"full_sandbox"``.
+    toolset: str = "full"
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable dict representation.
 
         The shape is stable and additive: new fields are only ever
         appended to the end. Callers must not rely on key order.
+        Epic 9.1 appends the §21.1 matrix fields after the AEE-8.1
+        fields; pre-Epic-9.1 callers that only read AEE-8.1 keys
+        are unaffected.
         """
         return {
+            # --- AEE-8.1 fields (unchanged) ---
             "name": self.name,
             "purpose": self.purpose,
             "audience": self.audience,
@@ -151,6 +185,14 @@ class ProfileDescriptor:
             "can_create_cron": self.can_create_cron,
             "can_delegate_subagents": self.can_delegate_subagents,
             "is_read_only": self.is_read_only,
+            # --- Epic 9.1 §21.1 matrix fields (additive) ---
+            "can_dispatch": self.can_dispatch,
+            "can_long_running_pipelines": self.can_long_running_pipelines,
+            "graph_queries": self.graph_queries,
+            "observability_events": self.observability_events,
+            "db_writes": self.db_writes,
+            "production_db_access": self.production_db_access,
+            "toolset": self.toolset,
         }
 
 
@@ -193,6 +235,14 @@ _DESCRIPTORS: Dict[str, ProfileDescriptor] = {
         can_create_cron=True,
         can_delegate_subagents=True,
         is_read_only=False,
+        # Epic 9.1 §21.1 matrix (full row):
+        can_dispatch=True,
+        can_long_running_pipelines=True,
+        graph_queries="full",
+        observability_events="full",
+        db_writes="full",
+        production_db_access="full",
+        toolset="full",
     ),
     "mini": ProfileDescriptor(
         name="mini",
@@ -218,6 +268,14 @@ _DESCRIPTORS: Dict[str, ProfileDescriptor] = {
         can_create_cron=False,
         can_delegate_subagents=False,
         is_read_only=False,
+        # Epic 9.1 §21.1 matrix (mini row):
+        can_dispatch=True,
+        can_long_running_pipelines=False,
+        graph_queries="subset",
+        observability_events="subset",
+        db_writes="dispatch_only",
+        production_db_access="full",
+        toolset="terminal_file_web_subset",
     ),
     "edge": ProfileDescriptor(
         name="edge",
@@ -238,6 +296,14 @@ _DESCRIPTORS: Dict[str, ProfileDescriptor] = {
         can_create_cron=False,
         can_delegate_subagents=False,
         is_read_only=True,
+        # Epic 9.1 §21.1 matrix (edge row):
+        can_dispatch=False,
+        can_long_running_pipelines=False,
+        graph_queries="read_only",
+        observability_events="read_only",
+        db_writes="disabled",
+        production_db_access="read_only",
+        toolset="file_read_web_read",
     ),
     "developer": ProfileDescriptor(
         name="developer",
@@ -259,6 +325,14 @@ _DESCRIPTORS: Dict[str, ProfileDescriptor] = {
         can_create_cron=False,
         can_delegate_subagents=True,
         is_read_only=False,
+        # Epic 9.1 §21.1 matrix (developer row):
+        can_dispatch=True,
+        can_long_running_pipelines=False,
+        graph_queries="sandbox",
+        observability_events="sandbox",
+        db_writes="tempdir_only",
+        production_db_access="blocked",
+        toolset="full_sandbox",
     ),
 }
 

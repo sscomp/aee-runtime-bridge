@@ -234,12 +234,23 @@ class DescriptorFieldValuesTests(unittest.TestCase):
     def test_to_dict_has_all_fields(self) -> None:
         d = get_descriptor("full")
         dct = d.to_dict()
-        expected_keys = {
+        # AEE-8.1 baseline keys (always present, unchanged).
+        aee81_keys = {
             "name", "purpose", "audience", "runtime_footprint",
             "safety_tier", "toolset_restriction",
             "can_create_cron", "can_delegate_subagents", "is_read_only",
         }
-        self.assertEqual(set(dct.keys()), expected_keys)
+        # Epic 9.1 §21.1 additive matrix keys.
+        epic91_keys = {
+            "can_dispatch", "can_long_running_pipelines",
+            "graph_queries", "observability_events",
+            "db_writes", "production_db_access", "toolset",
+        }
+        # Contract supersession (Epic 9.1): to_dict() now returns
+        # AEE-8.1 keys ∪ Epic 9.1 keys. Existing callers that only
+        # read AEE-8.1 keys are unaffected (additive).
+        self.assertTrue(aee81_keys.issubset(set(dct.keys())))
+        self.assertEqual(set(dct.keys()), aee81_keys | epic91_keys)
 
     def test_to_dict_values_match(self) -> None:
         d = get_descriptor("mini")
