@@ -1,0 +1,245 @@
+# AEE Epic 9.7 §21.7 — CI/CD Matrix Workflow
+#
+# Master Plan §21.7 (line 7786-7790):
+#
+#   Purpose: Single CI/CD pipeline that tests all four profiles. A
+#   regression in `mini` is caught before merge, not after a B2
+#   deployment breaks.
+#
+#   Proposal: One CI workflow with matrix job
+#   `profile: [full, mini, edge, developer]`. Each job runs
+#   `install.sh --profile ${{ matrix.profile }}` → smoke test →
+#   targeted tests → regression suite. `full` runs the complete
+#   suite; `mini`/`edge`/`developer` run subset suites. All 4 jobs
+#   must pass for merge to `master`. Each job runs in its own
+#   container with its own tempdir DB.
+#
+# Acceptance (§21.A item 7):
+#
+#   §21.7 — CI/CD matrix runs 4 profile jobs; all 4 green on `master`.
+#
+# Safety contract (workorder §5):
+#
+# * Provider-neutral. The CI host is `python:3.11-slim` (matches the
+#   §21.5 Dockerfile base). No AWS / GCP / Azure / Terraform
+#   reference appears in this workflow.
+# * Dry-run-first install. Every job invokes
+#   `bash install.sh --profile <p> --dry-run`. The `--execute` path
+#   is out of scope for §21.7 and remains separately authorizable
+#   per §21.3.
+# * No production deploy. No `docker push`, no `kubectl`, no
+#   registry login, no release publish, no secret mutation.
+# * Per-job isolation. Each matrix job runs in its own container
+#   with its own tempdir DB (per §21.7 line 7790). The
+#   `services:` block is intentionally absent — no shared DB.
+# * Single source of truth. The four profile names, the subset
+#   suites, and the container image come from `aee.ci.matrix`
+#   (Python). The `include:` matrix below mirrors that module; the
+#   `aee.tests.test_aee97_cicd_matrix` targeted tests verify the
+#   two agree.
+#
+# This workflow does NOT:
+#   - push to any registry
+#   - deploy to any environment
+#   - modify repository secrets
+#   - enable a formal release
+#   - touch a production database
+#   - invoke `terraform`, `aws`, `gcloud`, or `az`
+#
+# Trigger: pull request to `master` (the §21.7 "all 4 must pass for
+# merge to `master`" gate) + push to `master` (regression on merge).
+#
+name: AEE CI Matrix (§21.7)
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+# Fail fast is intentional: if one profile job fails, the others
+# may continue (so the operator sees the full failure profile), but
+# the workflow as a whole is not OK until all 4 are green.
+# `needs_all_green` is enforced by the `merge-gate` job below.
+jobs:
+  # -----------------------------------------------------------------
+  # Matrix job — one per profile. The `include` block is the
+  # declarative mirror of `aee.ci.matrix.CI_MATRIX_JOBS`. The
+  # `aee.tests.test_aee97_cicd_matrix` targeted tests verify that
+  # the Python source of truth and this YAML agree.
+  # -----------------------------------------------------------------
+  profile-job:
+    name: Profile ${{ matrix.profile }}
+    runs-on: ubuntu-latest
+    # Per §21.7 line 7790: "Each job runs in its own container".
+    # The container image matches `aee.ci.matrix.CONTAINER_IMAGE`
+    # and the §21.5 Dockerfile `FROM python:3.11-slim` base.
+    container:
+      image: python:3.11-slim
+      # Per §21.7 line 7790: "its own tempdir DB". The tempdir is
+      # created in the `Setup` step below; no shared volume.
+      env:
+        AEE_DB_PATH: /tmp/aee-${{ matrix.profile }}.db
+        AEE_PROFILE: ${{ matrix.profile }}
+        PYTHONPATH: ${{ github.workspace }}
+    strategy:
+      # Do NOT cancel siblings on first failure — the operator
+      # benefits from seeing the full failure profile across all 4
+      # profiles (matches the §21.7 "catch regression in mini
+      # before merge" intent; cancelling on first fail would hide
+      # concurrent regressions).
+      fail-fast: false
+      matrix:
+        include:
+          - profile: full
+            suite_kind: full
+          - profile: mini
+            suite_kind: subset
+          - profile: edge
+            suite_kind: subset
+          - profile: developer
+            suite_kind: subset
+
+    steps:
+      # ---------------------------------------------------------------
+      # Checkout — shallow fetch is enough for the test suite.
+      # ---------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ---------------------------------------------------------------
+      # Setup — install unittest dependencies. The AEE test suite
+      # is stdlib-only (`unittest`); no `pip install` is required
+      # for the targeted tests. `python3 -m unittest discover` is
+      # the canonical runner.
+      # ---------------------------------------------------------------
+      - name: Setup Python
+        run: |
+          python3 --version
+          python3 -c "import unittest; print('unittest ok')"
+
+      # ---------------------------------------------------------------
+      # Per-job tempdir DB (§21.7 line 7790). Each profile gets
+      # its own SQLite file under /tmp; no shared DB, no
+      # cross-job contamination.
+      # ---------------------------------------------------------------
+      - name: Setup tempdir DB
+        run: |
+          mkdir -p /tmp
+          echo "AEE_DB_PATH=$AEE_DB_PATH"
+          # Ensure a fresh DB file (defence in depth; the runner
+          # container is already fresh, but this makes the
+          # isolation explicit and survives a re-run).
+          rm -f "$AEE_DB_PATH" "$AEE_DB_PATH-wal" "$AEE_DB_PATH-shm" 2>/dev/null || true
+
+      # ---------------------------------------------------------------
+      # Step 1 — Install (dry-run, §21.7 line 7790 + workorder §5).
+      # `install.sh --profile <p> --dry-run` is the canonical
+      # install step. The `--execute` path is out of scope for
+      # §21.7 (per §21.3, the shell-level execution path is
+      # separately authorizable).
+      # ---------------------------------------------------------------
+      - name: Install (dry-run)
+        run: bash install.sh --profile ${{ matrix.profile }} --dry-run
+
+      # ---------------------------------------------------------------
+      # Step 2 — Smoke test (§21.7 line 7790). In this slice the
+      # smoke is a no-op exit-0 placeholder, because the §21.3
+      # shell-level execution path is not authorized (the
+      # installer backend's `execute(dry_run=False)` raises
+      # `ExecuteNotAuthorizedError`). No production service is
+      # started. The placeholder is explicit so this workflow can
+      # be audited for the absence of a real smoke invocation.
+      # ---------------------------------------------------------------
+      - name: Smoke (placeholder — §21.3 execute path not authorized)
+        run: python3 -c "import sys; sys.exit(0)"
+
+      # ---------------------------------------------------------------
+      # Step 3 — Targeted tests (§21.7 line 7790). `full` runs the
+      # complete AEE suite via unittest discovery; the three
+      # subset profiles run the per-profile subset from
+      # `aee.ci.matrix.SUBSET_SUITES_BY_PROFILE`. The subset list
+      # is duplicated here only because GitHub Actions cannot
+      # import Python modules; the targeted test
+      # `test_aee97_cicd_matrix` verifies the two agree.
+      # ---------------------------------------------------------------
+      - name: Targeted tests (full suite)
+        if: matrix.suite_kind == 'full'
+        run: |
+          PYTHONPATH=. python3 -m unittest discover -s aee/tests -p 'test_aee9*.py' -v
+
+      - name: Targeted tests (mini subset)
+        if: matrix.profile == 'mini'
+        run: |
+          PYTHONPATH=. python3 -m unittest \
+            aee.tests.test_aee91_canonical_profile_matrix \
+            aee.tests.test_aee92_unified_cli_ux \
+            aee.tests.test_aee93_installer_backend \
+            aee.tests.test_aee96_provider_neutral_deployment \
+            aee.tests.test_aee97_cicd_matrix \
+            -v
+
+      - name: Targeted tests (edge subset)
+        if: matrix.profile == 'edge'
+        run: |
+          PYTHONPATH=. python3 -m unittest \
+            aee.tests.test_aee91_canonical_profile_matrix \
+            aee.tests.test_aee93_installer_backend \
+            aee.tests.test_aee94_runtime_profile_selection \
+            aee.tests.test_aee95_docker_profiles \
+            aee.tests.test_aee96_provider_neutral_deployment \
+            aee.tests.test_aee97_cicd_matrix \
+            -v
+
+      - name: Targeted tests (developer subset)
+        if: matrix.profile == 'developer'
+        run: |
+          PYTHONPATH=. python3 -m unittest \
+            aee.tests.test_aee91_canonical_profile_matrix \
+            aee.tests.test_aee92_unified_cli_ux \
+            aee.tests.test_aee93_installer_backend \
+            aee.tests.test_aee95_docker_profiles \
+            aee.tests.test_aee96_provider_neutral_deployment \
+            aee.tests.test_aee97_cicd_matrix \
+            -v
+
+      # ---------------------------------------------------------------
+      # Step 4 — Shell wrapper regression (§21.3 install.sh). The
+      # shell wrapper integration tests run on every profile,
+      # because `install.sh --profile <p> --dry-run` is the entry
+      # point every matrix job exercises.
+      # ---------------------------------------------------------------
+      - name: Shell wrapper regression
+        run: bash tests/test_install_shell_wrapper.sh
+
+  # -----------------------------------------------------------------
+  # Merge gate — the §21.7 "All 4 jobs must pass for merge to
+  # `master`" enforcement point. This job does NOT run tests; it
+  # only depends on the 4 profile jobs and is required by branch
+  # protection. It is the single source of truth for "is the
+  # matrix green?".
+  # -----------------------------------------------------------------
+  merge-gate:
+    name: Merge Gate (all 4 profiles green)
+    runs-on: ubuntu-latest
+    needs: [profile-job]
+    # `always()` is intentional: even if a profile job is skipped
+    # or cancelled, the merge gate runs and fails (because a
+    # skipped job is not a green job per §21.7).
+    if: ${{ always() }}
+    steps:
+      - name: Enforce all-green
+        # GitHub Actions `needs.<job>.result` is one of:
+        #   success | failure | cancelled | skipped
+        # Per §21.7, only `success` for all 4 profiles is a green
+        # matrix. Anything else is a failure.
+        run: |
+          set -e
+          echo "profile-job result: ${{ needs.profile-job.result }}"
+          if [ "${{ needs.profile-job.result }}" != "success" ]; then
+            echo "::error::§21.7 merge gate failed: profile-job did not succeed (got ${{ needs.profile-job.result }}). All 4 profiles must be green for merge to master."
+            exit 1
+          fi
+          echo "§21.7 merge gate: all 4 profiles green. OK to merge."
