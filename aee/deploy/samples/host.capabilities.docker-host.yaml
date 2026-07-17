@@ -1,0 +1,38 @@
+# AEE Epic 9.6 §21.6.B — Host Capability Document: generic Docker host
+
+# Reference Host Capability Document for a generic Docker host
+# (Master Plan §21.6.F). Used for CI (§21.7), sandbox, and any
+# operator who has Docker but not a specific cloud account.
+#
+# The `provider_hint: docker` field is INFORMATIONAL ONLY. Selection
+# uses `class: docker-host`.
+
+host:
+  name: docker-host-generic
+  class: docker-host
+  provider_hint: docker
+  os: linux
+  arch: x86_64
+  python: ">=3.11"
+  filesystem: posix
+  supervisor: docker
+  network_egress: direct
+  tunnel_kind: none
+  inbound_allowed: false
+  db_path_writable: true
+  tempdir_writable: true
+  persistent_paths:
+    - /var/lib/docker/volumes/aee-data
+
+runtime_profile:
+  supported: [full, mini, edge, developer]
+  default: mini
+  resource_floor:
+    full:      { cpu: 2, mem_mb: 4096, disk_mb: 2048 }
+    mini:      { cpu: 1, mem_mb: 1024, disk_mb: 1024 }
+    edge:      { cpu: 1, mem_mb: 1024, disk_mb: 512  }
+    developer: { cpu: 1, mem_mb: 1024, disk_mb: 512  }
+
+upstream_llm:
+  reachable: true
+  endpoint_kind: openai-compatible

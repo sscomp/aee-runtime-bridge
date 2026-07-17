@@ -1,0 +1,38 @@
+# AEE Epic 9.6 §21.6.B — Host Capability Document: B2 (MacBook Pro laptop)
+
+# Reference Host Capability Document for the B2 host (MacBook Pro
+# laptop). Matches today's B2 deployment (Master Plan §21.6.F):
+#   * launchd (or tmux fallback) process supervisor
+#   * no tunnel by default
+#   * inbound_allowed: false
+#   * profile=developer reference host
+#
+# The `provider_hint: apple` field is INFORMATIONAL ONLY. Selection
+# uses `class: laptop`.
+
+host:
+  name: b2-macbook
+  class: laptop
+  provider_hint: apple
+  os: darwin
+  arch: arm64
+  python: ">=3.11"
+  filesystem: posix
+  supervisor: launchd
+  network_egress: direct
+  tunnel_kind: none
+  inbound_allowed: false
+  db_path_writable: true
+  tempdir_writable: true
+  persistent_paths:
+    - /Users
+
+runtime_profile:
+  supported: [developer]
+  default: developer
+  resource_floor:
+    developer: { cpu: 1, mem_mb: 1024, disk_mb: 512 }
+
+upstream_llm:
+  reachable: true
+  endpoint_kind: openai-compatible

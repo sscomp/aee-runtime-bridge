@@ -1,0 +1,45 @@
+# AEE Epic 9.6 §21.6.B — Host Capability Document: M2 (Abacus.ai container)
+
+# This is the reference Host Capability Document for the M2 host
+# (Abacus.ai container). It matches today's M2 deployment (Master
+# Plan §21.6.F):
+#   * supervisord process supervisor
+#   * Cloudflare Tunnel for egress (no inbound)
+#   * /home/ubuntu persistent across container resets
+#   * /tmp is wiped on container reset
+#   * profile=full reference host
+#
+# The `provider_hint: abacus` field is INFORMATIONAL ONLY. AEE Core
+# and the installer MUST NOT branch on it. It exists purely for
+# operator observability and audit logs. The `class: container`
+# field drives adapter selection (§21.6.B last paragraph).
+
+host:
+  name: m2-abacus
+  class: container
+  provider_hint: abacus
+  os: linux
+  arch: x86_64
+  python: ">=3.11"
+  filesystem: posix
+  supervisor: supervisord
+  network_egress: tunnel
+  tunnel_kind: cloudflared
+  inbound_allowed: false
+  db_path_writable: true
+  tempdir_writable: true
+  persistent_paths:
+    - /home/ubuntu
+
+runtime_profile:
+  supported: [full, mini, edge, developer]
+  default: full
+  resource_floor:
+    full:      { cpu: 2, mem_mb: 4096, disk_mb: 2048 }
+    mini:      { cpu: 1, mem_mb: 1024, disk_mb: 1024 }
+    edge:      { cpu: 1, mem_mb: 1024, disk_mb: 512  }
+    developer: { cpu: 1, mem_mb: 1024, disk_mb: 512  }
+
+upstream_llm:
+  reachable: true
+  endpoint_kind: openai-compatible

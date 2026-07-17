@@ -1,0 +1,44 @@
+# AEE Epic 9.6 §21.6.B — Host Capability Document: N2 (Zo.computer container)
+
+# Reference Host Capability Document for the N2 host (Zo.computer
+# container). Matches today's N2 deployment (Master Plan §21.6.F):
+#   * Zo-native process supervisor
+#   * egress-only (no inbound)
+#   * profile=mini reference host
+#
+# The `provider_hint: zo` field is INFORMATIONAL ONLY. Selection uses
+# `class: container`. Operators deploying on N2 should pass
+# `--adapter zo` explicitly OR use a host.capabilities.yaml with
+# `provider_hint: zo` (informational) and the installer's `--adapter`
+# flag. The class-based default for `container` is `abacus` (the M2
+# reference); N2 is the explicit-override path for the same class.
+
+host:
+  name: n2-zo
+  class: container
+  provider_hint: zo
+  os: linux
+  arch: x86_64
+  python: ">=3.11"
+  filesystem: posix
+  supervisor: zo-native
+  network_egress: tunnel
+  tunnel_kind: cloudflared
+  inbound_allowed: false
+  db_path_writable: true
+  tempdir_writable: true
+  persistent_paths:
+    - /home/n2
+    - /home/user
+
+runtime_profile:
+  supported: [mini, edge, developer]
+  default: mini
+  resource_floor:
+    mini:      { cpu: 1, mem_mb: 1024, disk_mb: 1024 }
+    edge:      { cpu: 1, mem_mb: 1024, disk_mb: 512  }
+    developer: { cpu: 1, mem_mb: 1024, disk_mb: 512  }
+
+upstream_llm:
+  reachable: true
+  endpoint_kind: openai-compatible
