@@ -36,6 +36,12 @@ import argparse
 import sys
 from typing import List, Optional
 
+# §21.8 Release Strategy — the canonical unified product version.
+# ``aee.__version__`` is the single source of truth for the version
+# string; ``aee --version`` and ``aee.release.changelog`` both read
+# this attribute (no parallel hard-coded literal).
+from aee import __version__ as _AEE_VERSION
+
 # Canonical source of truth — NO parallel hard-coded matrix.
 from aee.profiles.descriptor import (
     DEFAULT_PROFILE,
@@ -96,6 +102,22 @@ def _build_parser() -> argparse.ArgumentParser:
             "Master Plan §21.2 — Expose profile selection at the CLI "
             "so an operator can choose full / mini / edge / developer "
             "per invocation without editing config."
+        ),
+    )
+    # §21.8 Release Strategy — ``aee --version`` returns the unified
+    # product version (``2.0.0-rc1`` on first Epic 9 release, ``2.0.0``
+    # GA when §21.10 completes). The version string is the canonical
+    # ``aee.__version__`` attribute — argparse ``action="version"``
+    # prints it to stdout and exits 0. There is no parallel hard-coded
+    # version literal here; the canonical source is ``aee.__version__``.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="{prog} {ver}".format(prog=PROG_NAME, ver=_AEE_VERSION),
+        help=(
+            "Print the unified AEE product version (per §21.8) and "
+            "exit. The version follows SemVer: MAJOR per Epic / MINOR "
+            "per sub-section / PATCH per bugfix."
         ),
     )
     # Global --profile flag. ``choices`` is the canonical tuple; this
