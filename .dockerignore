@@ -1,0 +1,38 @@
+# AEE Epic 9.5 — .dockerignore (Master Plan §21.5).
+#
+# Exclude build-irrelevant / volatile / sensitive paths from the
+# Docker build context to keep the image lean and avoid leaking
+# runtime state into the image.
+
+.git
+.gitignore
+data/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Reports / scratch artifacts (kept in repo for audit but not needed
+# in the image).
+*.md
+!README.md
+
+# Hermes runtime / env files (never bake secrets into images).
+.env
+.env.*
+*.key
+*.pem
+*.crt
+
+# Test fixtures not needed at run time.
+tests/
+aee/tests/
+
+# SSH / cloud config (runtime-only).
+.ssh/
+.cloudflared/
