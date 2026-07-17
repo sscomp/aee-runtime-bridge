@@ -479,10 +479,21 @@ def check_session_allowed(session_id: str) -> None:
         )
 
 
-def danger_check(text: str, mode: str = "normal") -> SafetyDecision:
+def danger_check(
+    text: str,
+    mode: str = "normal",
+    profile: Optional[str] = None,
+) -> SafetyDecision:
     """Phase 2 P3: replaced by safety.evaluate() (allowlist + blocklist
-    + approval gate). Kept as a thin wrapper for backward compat."""
-    return safety_evaluate(text, mode=mode)
+    + approval gate). Kept as a thin wrapper for backward compat.
+
+    Epic 9.4 §21.4: ``profile`` is forwarded to
+    :func:`dispatcher.safety.evaluate` so the AEE-8.3 profile-aware
+    enforcement (is_read_only / can_create_cron / can_delegate_subagents)
+    is activated at the dispatch-time safety gate. ``None`` preserves
+    pre-Epic-9.4 behaviour (no profile enforcement).
+    """
+    return safety_evaluate(text, mode=mode, profile=profile)
 
 
 # ---------------------------------------------------------------------------
@@ -585,8 +596,47 @@ async def create_run(
 ) -> CreateRunResponse:
     source = require_auth(authorization)
 
+    # -------------------------------------------------------------------------
+    # Epic 9.4 §21.4 — Runtime Profile Selection (single resolution point).
+    #
+    # The profile is resolved **once, at dispatch time**, here in the
+    # ``POST /runs`` handler. Resolution path (per Master Plan §21.4):
+    #
+    #   body.profile (validated against KNOWN_PROFILES by the Pydantic
+    #       field_validator on CreateRunRequest) → if absent, fall back to
+    #       DEFAULT_PROFILE ("full") → stored on Task.profile (AEE-8.2) →
+    #       safety.py:evaluate(profile=...) enforces (AEE-8.3) → dispatcher
+    #       passes to runtime adapter.
+    #
+    # No other code path resolves the profile. We use ``parse_profile``
+    # from the descriptor module so the canonical default + validation
+    # logic lives in one place (AEE-8.1 contract). ``body.profile`` has
+    # already been schema-validated to be one of {full, mini, edge,
+    # developer} or None; ``parse_profile`` maps None → "full".
+    # -------------------------------------------------------------------------
+    from aee.profiles.descriptor import parse_profile as _parse_profile
+    resolved_profile = _parse_profile(body.profile)
+
+    # Epic 9.4 §21.4 — edge profile: activate runtime-level DB
+    # query_only enforcement. ``set_db_profile`` is a process-wide
+    # opt-in; ``edge`` causes every subsequent ``get_conn()`` to emit
+    # ``PRAGMA query_only=1``. Any other profile clears the mode so
+    # the dispatcher can write. This is the §21.4 "edge special case":
+    # "``profile=edge`` wraps the DB connection factory in
+    # ``dispatcher/db.py`` to emit ``PRAGMA query_only=1`` on every
+    # connection. Runtime-level enforcement, not just intent detection."
+    from dispatcher import db as _db_module
+    _db_module.set_db_profile(resolved_profile)
+
     # Phase 2 P3: safety policy (allowlist + blocklist + approval gate).
-    decision = danger_check(body.input, mode=body.mode or "normal")
+    # Epic 9.4 §21.4: forward the resolved profile to the safety gate so
+    # AEE-8.3 profile-aware enforcement (is_read_only / can_create_cron /
+    # can_delegate_subagents) is activated at dispatch time.
+    decision = danger_check(
+        body.input,
+        mode=body.mode or "normal",
+        profile=resolved_profile,
+    )
     if decision.action == "block":
         manager = TaskManager()
         m = config_load("safety")
@@ -601,7 +651,10 @@ async def create_run(
                     # AEE-8.2: persist profile on rejected tasks too
                     # so the audit trail is consistent. The profile
                     # is stored but NOT enforced.
-                    profile=body.profile,
+                    # Epic 9.4 §21.4: store the *resolved* profile
+                    # (None → "full" via parse_profile) so the audit
+                    # trail reflects the actual dispatch-time profile.
+                    profile=resolved_profile,
                 )
                 manager.fail(t.task_id, f"safety reject: {decision.reason} (matched={decision.matched!r})")
             except Exception:  # noqa: BLE001
@@ -702,7 +755,11 @@ async def create_run(
         # `manager.create(..., profile=...)` kwarg. Stored but
         # NOT enforced — no safety-gate, no toolset restriction.
         # Optional — None when the caller didn't pass one.
-        profile=body.profile,
+        # Epic 9.4 §21.4: store the *resolved* profile (None →
+        # "full" via parse_profile at the top of create_run) so
+        # the Task.profile field always carries the canonical
+        # profile that was active at dispatch time, never None.
+        profile=resolved_profile,
     )
     task_id = task.task_id
     # Record the source + override note on the task log. This is the audit
@@ -710,6 +767,9 @@ async def create_run(
     # routed to MiniMax-M3.
     manager.log(task_id, f"client_source={source!r}")
     manager.log(task_id, override_note)
+    # Epic 9.4 §21.4: record the resolved profile on the task log so
+    # operators can confirm which profile was active at dispatch time.
+    manager.log(task_id, f"profile={resolved_profile!r}")
 
     # ----- Call upstream via RuntimeAdapter (AEE-2 seam).
     # AEE-2: instead of hardcoding `httpx.AsyncClient.post(
@@ -868,6 +928,11 @@ async def create_run(
             "was_forced": resolved.was_forced,
             "reason": resolved.reason,
             "caller_model": body.model_name,
+            # Epic 9.4 §21.4: surface the resolved profile so the
+            # caller can confirm which profile was active at dispatch
+            # time. ``body.profile`` may be None; ``resolved_profile``
+            # is always one of {full, mini, edge, developer}.
+            "profile": resolved_profile,
         },
     )
 

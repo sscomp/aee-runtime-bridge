@@ -359,6 +359,46 @@ _local = threading.local()
 _init_lock = threading.Lock()
 _initialized = False
 
+# Epic 9.4 §21.4 — Runtime-level DB enforcement for the ``edge`` profile.
+#
+# When the active profile is ``edge``, every connection opened by
+# ``get_conn()`` emits ``PRAGMA query_only=1`` after the standard
+# pragmas. This makes SQLite reject any INSERT/UPDATE/DELETE at the
+# driver level — a defense-in-depth backstop behind the safety gate's
+# intent detection (AEE-8.3). The default is ``None`` (no query_only
+# pragma), preserving pre-Epic-9.4 behaviour for ``full`` / ``mini``
+# / ``developer`` and for all callers that never opt in.
+#
+# The variable is module-level (not thread-local) because the profile
+# is resolved once at dispatch time (per §21.4: "one unambiguous
+# selection point") and applies to all connections opened under that
+# dispatch. The bridge runs a single uvicorn worker, so there is one
+# process-wide profile active at any time. Setting it is an explicit
+# opt-in by ``app.py:create_run`` when ``resolved_profile == "edge"``.
+_db_profile: Optional[str] = None
+
+
+def set_db_profile(profile: Optional[str]) -> None:
+    """Epic 9.4 §21.4 — set the active DB profile.
+
+    Called by ``app.py:create_run`` after resolving the profile at
+    dispatch time. When ``profile == "edge"``, subsequent connections
+    opened by :func:`get_conn` emit ``PRAGMA query_only=1``. Any other
+    value (including ``None``) clears the read-only mode.
+
+    This is a process-wide setting because the bridge runs a single
+    uvicorn worker and the profile is resolved once per dispatch (per
+    §21.4 "one unambiguous selection point"). It is NOT thread-local
+    because the bridge's threadpool serves one dispatch at a time.
+    """
+    global _db_profile
+    _db_profile = profile
+
+
+def get_db_profile() -> Optional[str]:
+    """Epic 9.4 §21.4 — return the currently active DB profile."""
+    return _db_profile
+
 
 def _ensure_dir() -> None:
     DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -369,6 +409,12 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    # Epic 9.4 §21.4 — edge profile: emit PRAGMA query_only=1 so SQLite
+    # rejects any write at the driver level. This is the runtime-level
+    # enforcement backstop behind the safety gate's intent detection
+    # (AEE-8.3). See ``set_db_profile`` for the activation contract.
+    if _db_profile == "edge":
+        conn.execute("PRAGMA query_only=1")
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
