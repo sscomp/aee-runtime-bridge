@@ -802,6 +802,16 @@ async def create_run(
     # the caller asked for ``claude_code`` and the adapter is not
     # available, we fail with a 503 (rather than downgrade to
     # Hermes).
+    #
+    # ``executor_decision`` is hoisted to the function scope so
+    # the response's ``routing`` block can surface the actual
+    # selected executor as observable evidence (TASK-20260719-0046).
+    # ``None`` is the legacy/default sentinel — it means "no
+    # executor metadata was supplied, default Hermes path was
+    # taken". The response carries both ``requested_executor``
+    # and ``selected_executor`` so the caller can verify that an
+    # explicit request was honored (not silently overridden).
+    executor_decision = None  # set to RoutingDecision inside the metadata branch
     if body.metadata is not None:
         from aee.runtimes.executor_router import (
             ExecutorUnavailable,
@@ -867,6 +877,10 @@ async def create_run(
             )
         except Exception:  # noqa: BLE001
             pass
+        # Stash the decision so the response builder below can
+        # surface the actual selected executor as observable
+        # routing evidence (TASK-20260719-0046 §4).
+        executor_decision = decision
     adapter = adapter_registry.get(job.adapter_name)
     try:
         submit_result = await adapter.submit(job)
@@ -933,6 +947,19 @@ async def create_run(
             # time. ``body.profile`` may be None; ``resolved_profile``
             # is always one of {full, mini, edge, developer}.
             "profile": resolved_profile,
+            # TASK-20260719-0046 §4: surface the executor routing
+            # decision as observable evidence. ``executor_decision``
+            # is None when the caller passed no ``metadata`` (legacy
+            # default-Hermes path); otherwise it carries the
+            # requested and selected executor plus the selection
+            # source. This lets the caller verify that an explicit
+            # ``executor=claude_code`` request was honored (not
+            # silently downgraded). See
+            # ``aee.runtimes.executor_router.RoutingDecision.to_dict``
+            # for the schema.
+            "executor": (
+                executor_decision.to_dict() if executor_decision is not None else None
+            ),
         },
     )
 
