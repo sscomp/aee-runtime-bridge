@@ -589,6 +589,144 @@ async def health() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+@app.get("/runs")
+async def list_runs_endpoint(
+    authorization: Optional[str] = Header(None),
+    limit: int = Query(20, ge=1, le=100, description="Maximum number of runs to return (1..100)."),
+    status: Optional[str] = Query(
+        None,
+        description="Filter by canonical run status. One of: queued, started, running, completed, failed, timeout, cancelled.",
+    ),
+    executor: Optional[str] = Query(
+        None,
+        description="Filter by selected_executor (e.g. 'claude-code-cli' or 'hermes').",
+    ),
+    since: Optional[str] = Query(
+        None,
+        description="ISO-8601 timestamp; only runs with created_at >= since are returned.",
+    ),
+) -> Dict[str, Any]:
+    """List recent runs (newest first) from the durable ``executor_runs`` store.
+
+    This endpoint is a **pure read** of persisted state. It does NOT
+    perform Hermes reconciliation, launch any executor, poll
+    upstream, mutate run state, or scan the repo. It reads only from
+    the ``executor_runs`` SQLite table (populated best-effort by
+    ``POST /runs/executor``).
+
+    Ordering is newest-first by ``created_at`` with a deterministic
+    tie-breaker on ``run_id`` (DESC) so two runs sharing a timestamp
+    have a stable order across calls.
+
+    Query parameters:
+      * ``limit``    — integer, default 20, min 1, max 100.
+      * ``status``   — optional canonical status filter.
+      * ``executor`` — optional selected_executor filter.
+      * ``since``    — optional ISO-8601 timestamp filter on created_at.
+
+    Response envelope:
+      ``{ "items": [<canonical run summary>, ...],
+         "count": <int>,
+         "limit": <int>,
+         "filters": { "status": ..., "executor": ..., "since": ... } }``
+
+    Each item is the canonical envelope returned by
+    ``GET /runs/{run_id}`` (without the ``source`` / ``is_terminal``
+    convenience tags — those are added here for list consumers).
+
+    Invalid ``limit`` is rejected by FastAPI's ``Query(ge=1, le=100)``
+    with a 422. Invalid ``status`` or malformed ``since`` return a
+    deterministic 400 with a structured ``{code, message}`` body.
+    """
+    require_auth(authorization)
+
+    # Validate ``status`` against the canonical vocabulary. An
+    # unknown value is a deterministic 400 (not a silent empty list)
+    # so callers can distinguish "no runs with this status" from
+    # "this status string is not recognised".
+    from dispatcher.executor_runs import CANONICAL_RUN_STATUSES
+
+    if status is not None and status not in CANONICAL_RUN_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_status",
+                "message": (
+                    f"status {status!r} is not a canonical run status; "
+                    f"expected one of: {sorted(CANONICAL_RUN_STATUSES)}"
+                ),
+                "valid_statuses": sorted(CANONICAL_RUN_STATUSES),
+            },
+        )
+
+    # Validate ``since`` — accept any ISO-8601 string that
+    # ``datetime.fromisoformat`` can parse (Python 3.11 handles the
+    # trailing ``Z``). A malformed value is a deterministic 400.
+    since_normalized: Optional[str] = None
+    if since is not None:
+        from datetime import datetime, timezone
+
+        try:
+            # fromisoformat in 3.11 accepts "...Z" but normalises to
+            # a tz-aware datetime; we re-serialise to the bridge's
+            # canonical ``%Y-%m-%dT%H:%M:%SZ`` shape so the lexical
+            # comparison against stored created_at strings is sound.
+            parsed = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            since_normalized = parsed.astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_since",
+                    "message": (
+                        f"since {since!r} is not a valid ISO-8601 timestamp; "
+                        f"expected a value like '2026-07-22T00:00:00Z'"
+                    ),
+                },
+            ) from exc
+
+    from dispatcher.db import get_conn
+    from dispatcher.executor_runs import list_runs as _list_runs
+
+    try:
+        conn = get_conn()
+        rows = _list_runs(
+            conn,
+            limit=limit,
+            status=status,
+            selected_executor=executor,
+            since=since_normalized,
+        )
+    except Exception:  # pragma: no cover - defensive
+        rows = []
+
+    # Augment each item with the convenience tags that
+    # GET /runs/{run_id} also adds so list consumers do not have to
+    # re-derive them.
+    terminal_statuses = {"completed", "failed", "timeout", "cancelled"}
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        env = dict(row)
+        env.setdefault("source", "executor_runs")
+        env["is_terminal"] = env.get("status") in terminal_statuses
+        items.append(env)
+
+    return {
+        "items": items,
+        "count": len(items),
+        "limit": limit,
+        "filters": {
+            "status": status,
+            "executor": executor,
+            "since": since_normalized if since is not None else None,
+        },
+    }
+
+
 @app.post("/runs", response_model=CreateRunResponse)
 async def create_run(
     body: CreateRunRequest,

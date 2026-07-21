@@ -302,6 +302,85 @@ def list_recent_runs(
     return out
 
 
+# Canonical status vocabulary accepted by the run-store layer. The
+# executor_runs table records whatever the executor reports, but the
+# public GET /runs endpoint validates the ``status`` query parameter
+# against this set so an unknown value is a deterministic 400 rather
+# than a silent empty result.
+CANONICAL_RUN_STATUSES = frozenset({
+    "queued", "started", "running", "completed", "failed", "timeout", "cancelled",
+})
+
+
+def list_runs(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 20,
+    status: Optional[str] = None,
+    selected_executor: Optional[str] = None,
+    since: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """List recent runs (newest first) with bounded pagination/filtering.
+
+    Read-only: performs a single SELECT against the
+    ``executor_runs`` table. Does not call upstream Hermes, launch an
+    executor, mutate run state, or scan the repo.
+
+    Ordering is newest-first by ``created_at`` with a deterministic
+    tie-breaker on ``run_id`` (DESC) so two runs that share a
+    ``created_at`` timestamp have a stable order across calls.
+
+    Parameters
+    ----------
+    limit:
+        Maximum number of rows to return (1..100). The caller is
+        responsible for clamping; this function trusts the value
+        passed.
+    status:
+        Optional canonical status filter (one of
+        ``CANONICAL_RUN_STATUSES``). The caller validates the value.
+    selected_executor:
+        Optional filter on the ``selected_executor`` column
+        (``claude-code-cli`` or ``hermes``).
+    since:
+        Optional ISO-8601 timestamp; only runs with
+        ``created_at >= since`` are returned. Compared lexically
+        against the stored ISO-8601 ``created_at`` strings, which is
+        correct for the ``%Y-%m-%dT%H:%M:%SZ`` format written by
+        ``_now_iso``.
+
+    Returns a list of canonical envelopes (the same shape returned
+    by :func:`get_run`), ordered newest-first. An empty list is
+    returned when no rows match the filters.
+    """
+    clauses: List[str] = []
+    params: List[Any] = []
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if selected_executor:
+        clauses.append("selected_executor = ?")
+        params.append(selected_executor)
+    if since:
+        clauses.append("created_at >= ?")
+        params.append(since)
+    sql = "SELECT run_id FROM executor_runs"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    # Deterministic ordering: newest created_at first, run_id DESC
+    # as a stable tie-breaker so two runs sharing a created_at
+    # timestamp always come back in the same order.
+    sql += " ORDER BY created_at DESC, run_id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        got = get_run(conn, r["run_id"])
+        if got is not None:
+            out.append(got)
+    return out
+
+
 def init_executor_runs(conn: sqlite3.Connection) -> None:
     """Module-level init guard for ``ensure_schema``.
 
@@ -320,5 +399,7 @@ __all__ = [
     "upsert_run",
     "get_run",
     "list_recent_runs",
+    "list_runs",
     "init_executor_runs",
+    "CANONICAL_RUN_STATUSES",
 ]

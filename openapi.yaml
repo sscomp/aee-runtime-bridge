@@ -289,6 +289,46 @@ components:
         includes `run_id`, `status`, `last_event`, `output`, `usage`, and
         SSE event history. The bridge does not interpret the inner fields.
 
+    RunSummaryItem:
+      type: object
+      description: |
+        One run summary as returned in the ``items`` array of
+        ``GET /runs``. Mirrors the canonical envelope returned by
+        ``GET /runs/{run_id}`` with the ``source`` and ``is_terminal``
+        convenience tags included for list consumers.
+      properties:
+        run_id: { type: string }
+        requested_executor: { type: string, nullable: true }
+        selected_executor: { type: string }
+        status: { type: string, enum: [queued, started, running, completed, failed, cancelled, timeout, unknown] }
+        progress: { type: number, format: float, minimum: 0, maximum: 1 }
+        created_at: { type: string, nullable: true, description: 'ISO-8601 UTC timestamp.' }
+        updated_at: { type: string, nullable: true, description: 'ISO-8601 UTC timestamp.' }
+        completed_at: { type: string, nullable: true, description: 'ISO-8601 UTC timestamp; null while running.' }
+        is_terminal: { type: boolean, description: 'True when status is completed/failed/cancelled/timeout.' }
+        source: { type: string, enum: [executor_runs, dispatcher_tasks], description: 'Which store served the row.' }
+        artifact_paths: { type: array, items: { type: string } }
+        error: { type: string, nullable: true }
+
+    RunListResponse:
+      type: object
+      description: |
+        Response envelope for ``GET /runs``. Returns recent runs
+        newest-first, with the count, the applied limit, and the
+        active filters echoed back.
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/RunSummaryItem' }
+        count: { type: integer, description: 'Number of items returned.' }
+        limit: { type: integer, description: 'The limit applied (1..100).' }
+        filters:
+          type: object
+          properties:
+            status: { type: string, nullable: true }
+            executor: { type: string, nullable: true }
+            since: { type: string, nullable: true, description: 'Normalised ISO-8601 timestamp or null.' }
+
     RunSummary:
       type: object
       properties:
@@ -347,6 +387,52 @@ paths:
                   hermes_base_url: { type: string }
 
   /runs:
+    get:
+      operationId: hermesListRuns
+      summary: List recent runs (newest first) from the durable executor_runs store.
+      description: |
+        Read-only list of recent runs persisted by POST /runs/executor.
+        Does NOT perform Hermes reconciliation, launch an executor, poll
+        upstream, mutate run state, or scan the repo. Ordering is
+        newest-first by created_at with a deterministic tie-breaker on
+        run_id (DESC) so two runs sharing a timestamp have a stable
+        order across calls.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [queued, started, running, completed, failed, timeout, cancelled]
+        - name: executor
+          in: query
+          schema: { type: string, description: 'Filter by selected_executor (e.g. claude-code-cli or hermes).' }
+        - name: since
+          in: query
+          schema: { type: string, description: 'ISO-8601 timestamp; only runs with created_at >= since are returned.' }
+      responses:
+        '200':
+          description: List of runs (newest first).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunListResponse' }
+        '400':
+          description: Invalid status or malformed since timestamp.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '422':
+          description: Invalid limit (out of 1..100 range).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
     post:
       operationId: hermesCreateRun
       summary: Start a new Hermes M2 run. Returns run_id for polling.

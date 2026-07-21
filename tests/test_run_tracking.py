@@ -262,10 +262,18 @@ def test_malformed_run_id(monkeypatch, tmp_path, bad_id):
 def test_empty_run_id_is_deterministic(monkeypatch, tmp_path):
     """An empty run_id path segment does not 500; it returns a
     deterministic 4xx (405 from the /runs POST route — the empty
-    segment collapses to ``/runs`` which is POST-only)."""
+    segment collapses to ``/runs`` which is POST-only).
+
+    Note: with the GET /runs list endpoint now declared on the same
+    path, ``GET /runs/`` is normalised to ``GET /runs`` and returns
+    a 200 empty list — also deterministic and never launches an
+    executor. Both 200 (empty list) and 4xx are acceptable per the
+    work-order's "deterministic" requirement; what matters is no
+    500 and no executor launch.
+    """
     client, _app, key = make_client(monkeypatch, tmp_path)
     resp = client.get("/runs/", headers={"Authorization": f"Bearer {key}"})
-    assert resp.status_code in {400, 404, 405}
+    assert resp.status_code in {200, 400, 404, 405}
     # The work-order's "deterministic" requirement is satisfied: the
     # response is stable and never launches an executor.
 

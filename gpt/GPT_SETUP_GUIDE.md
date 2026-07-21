@@ -295,7 +295,105 @@ Add this to the action's *Instructions* (after the existing
 
 ---
 
-## 8. Rollback (disable the action without deleting the GPT)
+## 8. List recent runs (`GET /runs`)
+
+`GET /runs` is the read-only list endpoint for the durable
+`executor_runs` store. It does NOT launch any executor, poll
+upstream Hermes, mutate run state, or scan the repo. Use it to find
+recent failures, currently running jobs, or the latest completed
+runs — all without dispatching new work.
+
+### Query parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | integer | 20 | Max runs to return (1..100). |
+| `status` | string | — | Filter by canonical status: `queued`, `started`, `running`, `completed`, `failed`, `timeout`, `cancelled`. |
+| `executor` | string | — | Filter by `selected_executor` (e.g. `claude-code-cli` or `hermes`). |
+| `since` | string | — | ISO-8601 timestamp; only runs with `created_at >= since` are returned. Example: `2026-07-22T00:00:00Z`. |
+
+Ordering is newest-first by `created_at` with a deterministic
+tie-breaker on `run_id` (DESC), so two runs sharing a timestamp have
+a stable order across calls.
+
+### Response envelope
+
+```json
+{
+  "items": [<canonical run summary>, ...],
+  "count": 3,
+  "limit": 20,
+  "filters": { "status": null, "executor": null, "since": null }
+}
+```
+
+Each item includes at minimum: `run_id`, `requested_executor`,
+`selected_executor`, `status`, `progress`, `created_at`,
+`updated_at`, `completed_at`, `is_terminal`, `source`,
+`artifact_paths`, `error`.
+
+### Example: recent failures
+
+```bash
+curl -sS -H "Authorization: Bearer ${AEE_BRIDGE_TOKEN}" \
+  "${AEE_RUNTIME_BRIDGE_BASE_URL}/runs?status=failed&limit=10" | jq
+```
+
+### Example: currently running jobs
+
+```bash
+curl -sS -H "Authorization: Bearer ${AEE_BRIDGE_TOKEN}" \
+  "${AEE_RUNTIME_BRIDGE_BASE_URL}/runs?status=running" | jq
+```
+
+### Example: latest completed runs (newest 5)
+
+```bash
+curl -sS -H "Authorization: Bearer ${AEE_BRIDGE_TOKEN}" \
+  "${AEE_RUNTIME_BRIDGE_BASE_URL}/runs?status=completed&limit=5" | jq
+```
+
+### Example: runs since a timestamp
+
+```bash
+curl -sS -H "Authorization: Bearer ${AEE_BRIDGE_TOKEN}" \
+  "${AEE_RUNTIME_BRIDGE_BASE_URL}/runs?since=2026-07-22T00:00:00Z&limit=50" | jq
+```
+
+### Example: runs from a specific executor
+
+```bash
+curl -sS -H "Authorization: Bearer ${AEE_BRIDGE_TOKEN}" \
+  "${AEE_RUNTIME_BRIDGE_BASE_URL}/runs?executor=hermes&limit=20" | jq
+```
+
+### Deterministic error envelopes
+
+| Case | HTTP | `code` | Shape |
+|------|-----|--------|-------|
+| Invalid `status` (not in canonical set) | 400 | `invalid_status` | `{ "code", "message", "valid_statuses" }` |
+| Malformed `since` (not ISO-8601) | 400 | `invalid_since` | `{ "code", "message" }` |
+| `limit` out of range (0 or >100) | 422 | — | FastAPI validation error |
+| Missing / invalid bearer token | 401 | — | upstream auth error |
+
+### Notes for the GPT instruction text
+
+Add this to the action's *Instructions* (after the existing
+`aee_get_run_status` guidance):
+
+> To find recent runs without dispatching new work, call
+> `aee_list_runs` with optional `status`, `executor`, `since`, and
+> `limit` query parameters. The endpoint is read-only — it never
+> launches an executor or polls upstream. Use
+> `status=failed&limit=10` to see recent failures,
+> `status=running` to see in-flight jobs, or
+> `status=completed&limit=5` for the latest results. Treat HTTP
+> 400 as a permanent client error (invalid filter value); HTTP 200
+> with `count: 0` means no runs matched the filters (not an error).
+
+---
+
+## 9. Rollback (disable the action without deleting the GPT)
 
 1. In the GPT builder, open the action.
 2. Toggle the action **off** (or delete just the action). The GPT itself
@@ -308,7 +406,7 @@ turned off.
 
 ---
 
-## 9. Natural-language action description for the GPT
+## 10. Natural-language action description for the GPT
 
 Paste this into the action's *Instructions* (or the GPT's main
 instructions):
@@ -327,7 +425,7 @@ instructions):
 
 ---
 
-## 10. Files in this guide
+## 11. Files in this guide
 
 | File | Purpose |
 |------|---------|

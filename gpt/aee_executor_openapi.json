@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "AEE Executor Run",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "AEE Runtime Bridge executor dispatch tool. Exposes read-only capability discovery via GET /executors, and dispatches an explicit executor (claude-code-cli or hermes) via POST /runs/executor, running the worker prompt verbatim and returning a full evidence envelope: selected_executor, routing decision, run_id, task_id, status, progress, artifact_paths, stdout_summary, stderr_summary, exit_code, timeout_state, cancel_state, git_evidence, artifact_verification, telegram_result, and runtime_identity. When executor=claude-code-cli the real Claude Code CLI is invoked and its selection is honored (no silent MiniMax-M3 override)."
   },
   "servers": [
@@ -231,6 +231,62 @@
           "message": { "type": "string" },
           "run_id": { "type": "string" }
         }
+      },
+      "RunSummaryItem": {
+        "type": "object",
+        "description": "Canonical summary of a single executor run, as persisted in the durable executor_runs store. All fields are read directly from persisted state; GET /runs never launches an executor, polls upstream, or mutates run state.",
+        "properties": {
+          "run_id": { "type": "string", "description": "Stable run identifier (ULID-style)." },
+          "requested_executor": { "type": ["string", "null"], "description": "Executor requested by the caller; null when omitted (default executor)." },
+          "selected_executor": { "type": "string", "description": "Executor actually selected by the routing layer (claude-code-cli or hermes)." },
+          "status": { "type": "string", "description": "Canonical run status: queued, started, running, completed, failed, timeout, or cancelled." },
+          "progress": { "type": ["integer", "null"], "description": "0..100 progress percent, if available." },
+          "created_at": { "type": ["string", "null"], "format": "date-time", "description": "ISO-8601 timestamp the run was created." },
+          "updated_at": { "type": ["string", "null"], "format": "date-time", "description": "ISO-8601 timestamp the run was last updated." },
+          "completed_at": { "type": ["string", "null"], "format": "date-time", "description": "ISO-8601 timestamp the run reached a terminal state; null while in flight." },
+          "is_terminal": { "type": "boolean", "description": "True when status is completed, failed, timeout, or cancelled." },
+          "source": { "type": ["string", "null"], "description": "Origin of the run (e.g. 'gpt', 'cron', 'api')." },
+          "artifact_paths": { "type": "array", "items": { "type": "string" }, "description": "Absolute filesystem paths the run was expected to produce (may be empty)." },
+          "error": { "type": ["string", "null"], "description": "Terminal error message, if any; null when no error." }
+        }
+      },
+      "RunListResponse": {
+        "type": "object",
+        "description": "Envelope returned by GET /runs. items are ordered newest-first by created_at with a deterministic tie-breaker on run_id (DESC). count is the number of items returned (may be less than limit). limit is the effective limit applied. filters echoes the active filter values (null when not supplied).",
+        "required": ["items", "count", "limit", "filters"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/RunSummaryItem" } },
+          "count": { "type": "integer", "description": "Number of items in items (count <= limit)." },
+          "limit": { "type": "integer", "description": "Effective limit applied to this response (1..100)." },
+          "filters": {
+            "type": "object",
+            "description": "Echo of the active filter values; each is null when not supplied.",
+            "properties": {
+              "status": { "type": ["string", "null"] },
+              "executor": { "type": ["string", "null"] },
+              "since": { "type": ["string", "null"], "format": "date-time" }
+            }
+          }
+        }
+      },
+      "InvalidStatusError": {
+        "type": "object",
+        "description": "Returned with HTTP 400 when the status query parameter is not a canonical run status.",
+        "required": ["code", "message", "valid_statuses"],
+        "properties": {
+          "code": { "type": "string", "enum": ["invalid_status"] },
+          "message": { "type": "string" },
+          "valid_statuses": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "InvalidSinceError": {
+        "type": "object",
+        "description": "Returned with HTTP 400 when the since query parameter is not a parseable ISO-8601 timestamp.",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string", "enum": ["invalid_since"] },
+          "message": { "type": "string" }
+        }
       }
     }
   },
@@ -238,6 +294,33 @@
     { "bearerAuth": [] }
   ],
   "paths": {
+    "/runs": {
+      "get": {
+        "summary": "List recent runs",
+        "description": "Read-only list of recent executor runs from the durable executor_runs store, newest-first. Does NOT launch an executor, poll upstream, mutate state, or scan the repo. Supports filtering by status, executor, and created_at >= since. limit defaults to 20 (range 1..100).",
+        "operationId": "aee_list_runs",
+        "tags": [{"name": "runs"}, {"name": "read-only"}],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}, "description": "Maximum number of runs to return (1..100)."},
+          {"name": "status", "in": "query", "required": false, "schema": {"type": "string", "enum": ["queued", "started", "running", "completed", "failed", "timeout", "cancelled"]}, "description": "Filter by canonical run status."},
+          {"name": "executor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter by selected_executor (e.g. claude-code-cli or hermes)."},
+          {"name": "since", "in": "query", "required": false, "schema": {"type": "string", "format": "date-time"}, "description": "ISO-8601 timestamp; only runs with created_at >= since are returned."}
+        ],
+        "responses": {
+          "200": {
+            "description": "Recent runs, newest-first.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunListResponse"}}}
+          },
+          "400": {
+            "description": "Invalid status or since filter value.",
+            "content": {"application/json": {"schema": {"oneOf": [{"$ref": "#/components/schemas/InvalidStatusError"}, {"$ref": "#/components/schemas/InvalidSinceError"}]}}}
+          },
+          "401": {"description": "Missing or invalid bearer token."},
+          "422": {"description": "limit out of range (FastAPI validation error)."}
+        }
+      }
+    },
     "/executors": {
       "get": {
         "summary": "Read-only executor capability discovery.",
