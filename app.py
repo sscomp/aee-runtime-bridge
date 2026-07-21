@@ -1056,6 +1056,187 @@ async def list_executors(
     }
 
 
+async def _maybe_reconcile_hermes_run(
+    run_id: str,
+    persisted: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Bounded reconciliation: poll upstream Hermes once for a non-terminal run.
+
+    Work-order TASK-AEE-HERMES-COMPLETION-SYNC.  Only Hermes-dispatched
+    runs (``selected_executor == "hermes"``) that are still in a
+    non-terminal state (``queued``/``running``/``started``) are
+    reconciled.  The function awaits ``adapter.poll(external_run_id)``
+    exactly once and, if the upstream reports a terminal state,
+    updates the durable ``executor_runs`` row in-place with the final
+    fields.  Any error (adapter unavailable, upstream 404, transient
+    HTTP error, non-terminal upstream report) is swallowed — the
+    stale in-flight envelope is returned unchanged so callers can
+    keep polling.  Idempotent: a row that is already terminal is
+    returned as-is without any upstream call.
+
+    Returns the (possibly updated) envelope dict.  Never raises.
+
+    Safety:
+      * No executor launch — only a read-only GET on Hermes 8642.
+      * No mutation of unrelated rows.
+      * Bounded — exactly one upstream call per GET, and only when
+        the row is non-terminal + Hermes-dispatched.
+    """
+    _TERMINAL = {"completed", "failed", "timeout", "cancelled"}
+    try:
+        if persisted.get("selected_executor") != "hermes":
+            return persisted
+        if persisted.get("status") in _TERMINAL:
+            return persisted
+    except Exception:  # pragma: no cover - defensive
+        return persisted
+
+    # Tests inject a stub adapter into ``adapter_registry``; the
+    # production path uses ``HermesAdapter`` (registered by
+    # ``bootstrap_defaults``).  When the registry does not have
+    # one we fall back to building a default adapter from the env.
+    from aee.adapters.base import (
+        RuntimePollResult,
+        UnknownExternalRunError,
+        RuntimeError as AdapterRuntimeError,
+    )
+    from aee.core.registry import adapter_registry
+
+    adapter = None
+    try:
+        adapter = adapter_registry.get("hermes")
+    except Exception:  # pragma: no cover - registry miss falls through
+        adapter = None
+    if adapter is None:
+        try:
+            from aee.adapters.hermes_adapter import build_default as _build_hermes
+            adapter = _build_hermes()
+        except Exception:  # pragma: no cover - env not configured
+            return persisted
+
+    poll_result: Optional[RuntimePollResult] = None
+    try:
+        poll_result = await adapter.poll(run_id)
+    except UnknownExternalRunError:
+        # Upstream no longer tracks the run.  Persist a ``timeout``
+        # state so callers see a deterministic terminal envelope
+        # instead of an endless in-flight row.  This mirrors the
+        # watcher's handling of UnknownExternalRunError.
+        return _persist_terminal_reconciliation(
+            run_id, persisted,
+            status="timeout",
+            error=f"upstream Hermes no longer tracks run_id={run_id!r}",
+        )
+    except AdapterRuntimeError:
+        # Transient upstream error — leave the row in-flight.
+        return persisted
+    except Exception:  # pragma: no cover - defensive
+        return persisted
+
+    if poll_result is None:
+        return persisted
+    if not poll_result.is_terminal:
+        return persisted
+
+    # Translate the poll result into the persisted envelope.  Hermes'
+    # output/error/usage become the new stdout_summary/error/usage.
+    raw = dict(poll_result.raw) if isinstance(poll_result.raw, dict) else None
+    out_text = poll_result.output
+    err_text = poll_result.error or (raw.get("error") if raw else None) or ""
+    new_status = (poll_result.status or "").lower() or "completed"
+    if new_status not in _TERMINAL:
+        new_status = "completed" if new_status in {"completed", "succeeded", "success"} else "failed"
+
+    return _persist_terminal_reconciliation(
+        run_id, persisted,
+        status=new_status,
+        stdout_summary=_truncate_for_envelope(out_text),
+        error=str(err_text)[:2000] if err_text else None,
+    )
+
+
+def _truncate_for_envelope(text: Any, cap: int = 2000) -> str:
+    if not text:
+        return ""
+    s = str(text)
+    if len(s) <= cap:
+        return s
+    return s[:cap] + "...[truncated]"
+
+
+def _persist_terminal_reconciliation(
+    run_id: str,
+    persisted: Dict[str, Any],
+    *,
+    status: str,
+    stdout_summary: Optional[str] = None,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Update the durable ``executor_runs`` row with the final state.
+
+    Idempotent: ``upsert_run`` does ``INSERT OR REPLACE`` keyed by
+    ``run_id``.  ``created_at`` is preserved by ``upsert_run``; the
+    new ``completed_at`` is stamped only if the row was not already
+    terminal.  The envelope returned by ``upsert_run`` is the same
+    shape as ``get_run``, so callers can return it directly.
+    """
+    try:
+        from dispatcher.db import get_conn
+        from dispatcher.executor_runs import upsert_run
+        envelope = dict(persisted)
+        envelope["status"] = status
+        envelope["progress"] = 1.0
+        if stdout_summary is not None:
+            envelope["stdout_summary"] = stdout_summary
+        if error is not None:
+            envelope["error"] = error
+        # Preserve the existing routing/runtime_identity/etc. fields
+        # by passing them through verbatim — upsert_run will re-encode
+        # them.  ``completed_at`` is stamped by upsert_run when the
+        # status is terminal.
+        conn = get_conn()
+        return upsert_run(
+            conn,
+            run_id=run_id,
+            requested_executor=envelope.get("requested_executor"),
+            selected_executor=envelope.get("selected_executor", "hermes"),
+            task_id=envelope.get("task_id"),
+            status=status,
+            progress=1.0,
+            exit_code=envelope.get("exit_code"),
+            timeout_state=envelope.get("timeout_state"),
+            cancel_state=envelope.get("cancel_state"),
+            stdout_summary=envelope.get("stdout_summary", "") or "",
+            stderr_summary=envelope.get("stderr_summary", "") or "",
+            artifact_paths=envelope.get("artifact_paths") or [],
+            artifact_verification=envelope.get("artifact_verification") or [],
+            git_evidence=envelope.get("git_evidence"),
+            telegram_result=envelope.get("telegram_result") or {},
+            runtime_identity=envelope.get("runtime_identity"),
+            routing=envelope.get("routing") or {},
+            error=error if error is not None else envelope.get("error"),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        import sys
+        print(
+            f"[reconcile] persistence failed for run_id={run_id!r}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        # Fall back to the in-memory envelope with the new state so
+        # the GET response still reflects the terminal state even if
+        # the durable write failed (the next GET will retry the write
+        # via upsert_run idempotently).
+        out = dict(persisted)
+        out["status"] = status
+        out["progress"] = 1.0
+        if stdout_summary is not None:
+            out["stdout_summary"] = stdout_summary
+        if error is not None:
+            out["error"] = error
+        return out
+
+
 def _persist_executor_run(envelope: Dict[str, Any]) -> None:
     """Persist a POST /runs/executor response envelope to executor_runs.
 
@@ -1387,6 +1568,21 @@ async def get_run(
     except Exception:  # pragma: no cover - defensive
         persisted = None
     if persisted is not None:
+        # Work-order TASK-AEE-HERMES-COMPLETION-SYNC: when the
+        # persisted row was dispatched via the ``hermes`` executor
+        # and is still in a non-terminal state (queued/running),
+        # attempt ONE bounded reconciliation poll against the
+        # upstream Hermes 8642. If Hermes reports a terminal state,
+        # the row is updated in-place with the final fields and the
+        # freshly-stamped envelope is returned. If Hermes is
+        # unreachable, reports a non-terminal state, or the run is
+        # not found upstream, the stale in-flight envelope is
+        # returned unchanged (callers continue polling). The
+        # reconciliation is idempotent: a terminal row is never
+        # re-polled (terminal rows are returned as-is), and an
+        # already-reconciled row carries the final state so a
+        # duplicate GET does not re-launch any upstream call.
+        persisted = await _maybe_reconcile_hermes_run(run_id, persisted)
         # The persisted envelope already matches the canonical
         # shape; add the source tag so callers can tell which
         # store served the response.
