@@ -1,0 +1,29 @@
+{
+  "supported_executors": [
+    "claude-code-cli",
+    "hermes"
+  ],
+  "executor_aliases": {
+    "claude-code-cli": "claude-code-cli",
+    "claude_code": "claude-code-cli",
+    "claude-code": "claude-code-cli",
+    "claudecode": "claude-code-cli"
+  },
+  "claude_cli_binary": "/home/ubuntu/.local/bin/claude",
+  "default_executor": "claude-code-cli",
+  "default_timeout_sec": 120,
+  "max_timeout_sec": 7200,
+  "max_turns": 50,
+  "bare": false,
+  "output_format": "text",
+  "stdout_summary_cap": 2000,
+  "stderr_summary_cap": 1000,
+  "artifact_sha256": true,
+  "extra_cli_args": [
+    "--allowedTools=Write,Edit,Bash"
+  ],
+  "repo_allowlist": [
+    "/home/ubuntu",
+    "/tmp"
+  ]
+}

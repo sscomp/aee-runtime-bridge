@@ -964,6 +964,299 @@ async def create_run(
     )
 
 
+# ---------------------------------------------------------------------------
+# Final-mile executor endpoint: POST /runs/executor
+# ---------------------------------------------------------------------------
+# A dedicated, GPT-callable executor dispatch surface (work order
+# TASK_AEE_CLAUDE_CODE_EXECUTOR_WIRING). Additive only: it does NOT
+# touch ``create_run`` or the GPT -> MiniMax-M3 routing layer above.
+# The endpoint never calls ``resolve_model_for_source``, so MiniMax-M3
+# can never be forced here — ``routing.effective_executor`` always
+# reflects the user-requested executor verbatim.
+#
+# Contract: validate config -> select executor -> launch -> track ->
+# verify artifacts/evidence -> report. No second planner/orchestrator.
+from aee.runtimes.executor_api import ExecutorRunRequest  # noqa: E402
+
+
+def _attempt_telegram(subject: str, text: str) -> Dict[str, Any]:
+    """Best-effort Telegram notification for an executor run.
+
+    Uses bridge-env ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID`` only.
+    Never raises; returns a truthful ``telegram_result`` dict:
+    ``{success, message_id, recipient}`` on success, or
+    ``{success: False, skipped: <reason>}`` when creds are absent /
+    the send fails. The separate report-time Telegram send (§9) uses
+    ``hermes send`` directly and is not this function's concern.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return {
+            "success": False,
+            "skipped": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not configured in bridge env",
+        }
+    import json as _json
+    import urllib.error as _urlerr
+    import urllib.parse as _urlparse
+    import urllib.request as _urlreq
+    payload = _urlparse.urlencode({
+        "chat_id": chat_id,
+        "text": f"{subject}\n\n{text}",
+        "disable_web_page_preview": "true",
+    }).encode("utf-8")
+    req = _urlreq.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=payload,
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with _urlreq.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        if not data.get("ok"):
+            return {"success": False, "skipped": f"telegram not ok: {data!r}"}
+        msg_id = (data.get("result") or {}).get("message_id")
+        return {"success": True, "message_id": msg_id, "recipient": chat_id}
+    except (_urlerr.URLError, _urlerr.HTTPError, OSError, ValueError) as exc:
+        return {"success": False, "skipped": f"{type(exc).__name__}: {exc}"}
+
+
+@app.get("/executors")
+async def list_executors(
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    """Read-only executor capability discovery (work-order Part A).
+
+    Returns the executors this bridge currently supports, the configured
+    default, and the alias map that canonicalises a requested name to its
+    wire value. Pure read-only: no dispatch, no task creation, no executor
+    launch, no runtime mutation, no side effects. Exists only so a GPT /
+    operator can discover capabilities before calling
+    ``POST /runs/executor``.
+    """
+    require_auth(authorization)
+    from aee.runtimes.executor_config import load_executor_config, supported_executors
+
+    cfg = load_executor_config()
+    supported = supported_executors(cfg)
+    aliases_raw = cfg.get("executor_aliases") or {}
+    # Surface only the non-identity aliases (the example in the work order
+    # excludes the ``claude-code-cli -> claude-code-cli`` self-map). Keys
+    # and values are kept verbatim from config; unknown shapes are skipped.
+    aliases: Dict[str, str] = {}
+    if isinstance(aliases_raw, dict):
+        for k, v in aliases_raw.items():
+            if isinstance(k, str) and isinstance(v, str) and k != v:
+                aliases[k] = v
+    return {
+        "supported_executors": supported,
+        "default_executor": cfg.get("default_executor"),
+        "aliases": aliases,
+    }
+
+
+@app.post("/runs/executor")
+async def create_executor_run(
+    body: ExecutorRunRequest,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    """Dispatch to an explicit executor and return the full evidence envelope.
+
+    Supported executors (config-driven, see ``config/executor.json``):
+    ``claude-code-cli`` (direct Claude Code CLI; aliases ``claude_code``,
+    ``claude-code``) and ``hermes`` (legacy Hermes provider). The
+    response carries ``selected_executor`` / ``requested_executor`` /
+    ``routing`` plus the full evidence envelope (artifact_paths,
+    stdout_summary, stderr_summary, exit_code, timeout_state,
+    cancel_state, git_evidence, artifact_verification,
+    telegram_result, runtime_identity). No silent fallback; unsupported
+    executors return a deterministic 400 ``unsupported_executor``.
+    """
+    source = require_auth(authorization)
+    from aee.runtimes.executor_config import (
+        canonical_executor,
+        load_executor_config,
+        supported_executors,
+    )
+    from aee.runtimes.executor_api import build_routing, build_executor_response
+    from aee.runtimes.executor_envelope import (
+        collect_git_evidence,
+        truncate_summary,
+        verify_artifacts,
+    )
+    from aee.runtimes.runtime_identity import collect_runtime_identity
+
+    cfg = load_executor_config()
+    requested = body.executor
+    defaulted = requested is None
+    effective_request = requested if requested is not None else cfg.get("default_executor")
+    selected = canonical_executor(effective_request, cfg)
+    if selected is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "unsupported_executor",
+                "message": (
+                    f"executor {requested!r} is not supported; "
+                    f"accepted aliases canonicalise to 'claude-code-cli' or 'hermes'"
+                ),
+                "supported_executors": supported_executors(cfg),
+            },
+        )
+
+    # repo_path: default to the Abacus repo (a real git worktree) so
+    # git_evidence is meaningful even when the caller omits it. Enforce
+    # the configured allow-list; reject escapes.
+    repo_path = body.repo_path or "/home/ubuntu/Abacus"
+    allowlist = [p for p in (cfg.get("repo_allowlist") or []) if isinstance(p, str)]
+    if not any(
+        repo_path == p or repo_path.startswith(p.rstrip("/") + "/")
+        for p in allowlist
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "repo_path_not_allowed",
+                "message": (
+                    f"repo_path {repo_path!r} is outside the configured allow-list"
+                ),
+                "allowed": allowlist,
+            },
+        )
+
+    timeout = int(body.timeout_sec or cfg.get("default_timeout_sec", 120))
+    timeout = min(timeout, int(cfg.get("max_timeout_sec", 7200)))
+
+    # Truthful routing: was_forced is always False on this endpoint —
+    # the GPT -> MiniMax-M3 layer is never consulted. effective_executor
+    # echoes the user's choice verbatim (canonicalised).
+    routing = build_routing(
+        requested=requested,
+        selected=selected,
+        selection_source=("default" if defaulted else "explicit"),
+        effective_executor=selected,
+        effective_model=None,
+        was_forced=False,
+        reason=("default" if defaulted else "explicit_executor_opt_in"),
+    )
+
+    if selected == "claude-code-cli":
+        from aee.runtimes.executor_cli import ClaudeCodeCliRunner
+
+        if body.max_turns is not None:
+            runner = ClaudeCodeCliRunner(
+                binary=str(cfg.get("claude_cli_binary") or "/home/ubuntu/.local/bin/claude"),
+                max_turns=int(body.max_turns),
+                output_format=str(cfg.get("output_format") or "text"),
+                bare=bool(cfg.get("bare", False)),
+                extra_cli_args=[str(a) for a in (cfg.get("extra_cli_args") or [])] or None,
+            )
+        else:
+            runner = ClaudeCodeCliRunner.from_config(cfg)
+        result = await runner.run(
+            prompt=body.prompt,
+            cwd=repo_path,
+            timeout_sec=timeout,
+            expected_artifacts=body.expected_artifacts,
+        )
+        artifact_verification = verify_artifacts(
+            body.expected_artifacts,
+            compute_sha256=bool(cfg.get("artifact_sha256", True)),
+        )
+        git_evidence = collect_git_evidence(repo_path)
+        telegram_result = _attempt_telegram(
+            f"AEE executor run {result.run_id}: {result.status}",
+            f"executor={selected}\nstatus={result.status}\nexit_code={result.exit_code}",
+        )
+        progress = 1.0 if result.status in ("completed", "failed", "timeout", "cancelled") else 0.0
+        runtime_identity = collect_runtime_identity(
+            selected_executor=selected, cfg=cfg
+        )
+        return build_executor_response(
+            requested_executor=requested,
+            selected_executor=selected,
+            run_id=result.run_id,
+            status=result.status,
+            routing=routing,
+            progress=progress,
+            artifact_paths=result.artifact_paths,
+            stdout_summary=truncate_summary(
+                result.stdout, int(cfg.get("stdout_summary_cap", 2000))
+            ),
+            stderr_summary=truncate_summary(
+                result.stderr, int(cfg.get("stderr_summary_cap", 1000))
+            ),
+            exit_code=result.exit_code,
+            timeout_state=result.timeout_state,
+            cancel_state=result.cancel_state,
+            git_evidence=git_evidence,
+            artifact_verification=artifact_verification,
+            telegram_result=telegram_result,
+            runtime_identity=runtime_identity,
+            error=result.error,
+        )
+
+    # selected == "hermes" — delegate to the existing Hermes adapter
+    # (registered in ``adapter_registry``). Tests stub the adapter; in
+    # production this submits to Hermes 8642. Hermes is async, so the
+    # envelope returns a queued state with the upstream run_id; the
+    # per-run evidence fields are null/skipped (Hermes does not produce
+    # local artifacts / git evidence / a per-run Telegram on submit).
+    from aee.adapters.base import RuntimeError as AdapterRuntimeError  # noqa: F811
+    from aee.core.job_models import Job as AEEJob
+    from aee.core.registry import adapter_registry
+
+    job = AEEJob(
+        title="executor-run",
+        type="ops",
+        mode="normal",
+        input=body.prompt,
+        client_source=source,
+        adapter_name="hermes",
+        runtime_type="hermes",
+        expected_artifacts=body.expected_artifacts or [],
+    )
+    try:
+        adapter = adapter_registry.get("hermes")
+        submit_result = await adapter.submit(job)
+    except AdapterRuntimeError as exc:
+        runtime_identity = collect_runtime_identity(
+            selected_executor=selected, cfg=cfg
+        )
+        return build_executor_response(
+            requested_executor=requested,
+            selected_executor=selected,
+            run_id="hermes-submit-failed",
+            status="failed",
+            routing=routing,
+            error=f"hermes submit error: {exc}",
+            telegram_result={
+                "success": False,
+                "skipped": "hermes submit failed; no notification sent",
+            },
+            runtime_identity=runtime_identity,
+        )
+    runtime_identity = collect_runtime_identity(
+        selected_executor=selected, cfg=cfg
+    )
+    return build_executor_response(
+        requested_executor=requested,
+        selected_executor=selected,
+        run_id=submit_result.external_run_id,
+        status=submit_result.status or "queued",
+        routing=routing,
+        progress=0.0,
+        artifact_paths=[],
+        git_evidence=None,
+        telegram_result={
+            "success": False,
+            "skipped": "hermes is async; per-run telegram not sent on submit",
+        },
+        runtime_identity=runtime_identity,
+    )
+
+
 @app.get("/runs/{run_id}")
 async def get_run(
     run_id: str,

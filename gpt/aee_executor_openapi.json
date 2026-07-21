@@ -1,0 +1,353 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AEE Executor Run",
+    "version": "1.1.0",
+    "description": "AEE Runtime Bridge executor dispatch tool. Exposes read-only capability discovery via GET /executors, and dispatches an explicit executor (claude-code-cli or hermes) via POST /runs/executor, running the worker prompt verbatim and returning a full evidence envelope: selected_executor, routing decision, run_id, task_id, status, progress, artifact_paths, stdout_summary, stderr_summary, exit_code, timeout_state, cancel_state, git_evidence, artifact_verification, telegram_result, and runtime_identity. When executor=claude-code-cli the real Claude Code CLI is invoked and its selection is honored (no silent MiniMax-M3 override)."
+  },
+  "servers": [
+    {
+      "url": "https://hermes-runtime.biaobecue.com",
+      "description": "Public HTTPS root origin of the AEE Runtime Bridge (cloudflared tunnel -> 127.0.0.1:8787). Root origin only; no endpoint path."
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Bearer token from AEE_BRIDGE_TOKEN (or BRIDGE_API_KEY / GPT_BRIDGE_API_KEY) configured on the bridge host. Never embed the token value in the GPT; set it in the Action's Authorization header."
+      }
+    },
+    "schemas": {
+      "ExecutorRunRequest": {
+        "type": "object",
+        "required": ["prompt"],
+        "additionalProperties": false,
+        "properties": {
+          "executor": {
+            "type": "string",
+            "description": "Executor to dispatch to. Accepted aliases canonicalise to 'claude-code-cli': 'claude-code-cli', 'claude_code', 'claude-code'. Use 'hermes' for the legacy Hermes provider. If omitted, the configured default executor (claude-code-cli) is used.",
+            "example": "claude-code-cli"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64000,
+            "description": "The worker prompt, forwarded verbatim (never rewritten by the bridge).",
+            "example": "Use the write tool to create /tmp/aee_executor_smoke.md with content: hello from claude-code-cli"
+          },
+          "expected_artifacts": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Absolute paths the run is expected to produce; each is stat()'d and returned in artifact_verification.",
+            "example": ["/tmp/aee_executor_smoke.md"]
+          },
+          "timeout_sec": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1,
+            "description": "Run deadline in seconds. Falls back to the configured default (120), capped at max_timeout_sec (7200).",
+            "example": 120
+          },
+          "repo_path": {
+            "type": "string",
+            "description": "Working directory for the executor / repo for read-only git evidence. Must lie inside the configured repo allow-list (any path under /home/ubuntu, and /tmp). If omitted, defaults to /home/ubuntu/Abacus.",
+            "example": "/home/ubuntu/Abacus"
+          },
+          "max_turns": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1,
+            "description": "Override the configured Claude Code CLI --max-turns (default 50).",
+            "example": 10
+          }
+        }
+      },
+      "RoutingDecision": {
+        "type": "object",
+        "description": "Truthful executor routing decision. was_forced is always false on this endpoint (the GPT->MiniMax-M3 routing layer is never consulted).",
+        "properties": {
+          "requested_executor": { "type": ["string", "null"] },
+          "selected_executor": { "type": "string" },
+          "effective_executor": { "type": "string" },
+          "selection_source": { "type": "string", "description": "explicit | default" },
+          "was_forced": { "type": "boolean" },
+          "reason": { "type": "string" },
+          "effective_model": { "type": ["string", "null"] }
+        }
+      },
+      "ArtifactVerification": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "exists": { "type": "boolean" },
+          "size": { "type": ["integer", "null"] },
+          "mtime": { "type": ["integer", "null"] },
+          "sha256": { "type": ["string", "null"] }
+        }
+      },
+      "GitEvidence": {
+        "type": "object",
+        "properties": {
+          "head_sha": { "type": ["string", "null"] },
+          "branch": { "type": ["string", "null"] },
+          "dirty": { "type": ["boolean", "null"] },
+          "staged_file_count": { "type": "integer" },
+          "repo_path": { "type": ["string", "null"] }
+        }
+      },
+      "TelegramResult": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message_id": { "type": ["integer", "null"] },
+          "recipient": { "type": ["string", "null"] },
+          "skipped": { "type": ["string", "null"], "description": "Present when success is false; the concrete skip/failure reason." }
+        }
+      },
+      "RuntimeIdentity": {
+        "type": "object",
+        "description": "Factual runtime identity metadata for the run. Every field is a real, discovered value or null / 'unknown' when its source is unavailable — never fabricated.",
+        "properties": {
+          "provider": { "type": ["string", "null"], "description": "Display name of the selected executor's provider, e.g. 'Claude Code' or 'Hermes'. 'unknown' when the executor is not recognised.", "example": "Claude Code" },
+          "provider_version": { "type": ["string", "null"], "description": "Provider version string when discoverable; null otherwise.", "example": "2.1.216 (Claude Code)" },
+          "executor_binary": { "type": ["string", "null"], "description": "Absolute path of the executor binary (claude-code-cli only); null for executors without a local binary.", "example": "/home/ubuntu/.local/bin/claude" },
+          "executor_version": { "type": ["string", "null"], "description": "Version reported by the executor binary (`<binary> --version`); null when unavailable.", "example": "2.1.216 (Claude Code)" },
+          "runtime_bridge_version": { "type": "string", "description": "Bridge software version; 'unknown' until a version stamp is shipped.", "example": "unknown" },
+          "bridge_commit": { "type": ["string", "null"], "description": "HEAD sha of the bridge git worktree; null when not a git worktree.", "example": "07aefcb91fa11bd8dc6c8f4814ca3bc1fdb715d7" },
+          "bridge_branch": { "type": ["string", "null"], "description": "Current branch of the bridge worktree; null when unavailable.", "example": "master" },
+          "bridge_repository": { "type": ["string", "null"], "description": "Remote origin URL if configured, else the local bridge repo path.", "example": "/home/ubuntu/hermes-runtime-bridge" },
+          "generated_at_utc": { "type": "string", "description": "ISO-8601 UTC timestamp of identity collection.", "example": "2026-07-21T06:40:37Z" }
+        }
+      },
+      "ExecutorsResponse": {
+        "type": "object",
+        "description": "Read-only capability discovery (GET /executors). Lists supported executors, the configured default, and the alias map that canonicalises a requested name to its wire value. No side effects.",
+        "required": ["supported_executors", "default_executor", "aliases"],
+        "properties": {
+          "supported_executors": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Executors this bridge currently supports.",
+            "example": ["claude-code-cli", "hermes"]
+          },
+          "default_executor": {
+            "type": ["string", "null"],
+            "description": "The configured default executor used when POST /runs/executor omits `executor`.",
+            "example": "claude-code-cli"
+          },
+          "aliases": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "Map of accepted alias -> canonical wire value. Identity self-maps are excluded.",
+            "example": {
+              "claude_code": "claude-code-cli",
+              "claude-code": "claude-code-cli",
+              "claudecode": "claude-code-cli"
+            }
+          }
+        }
+      },
+      "ExecutorRunResponse": {
+        "type": "object",
+        "required": [
+          "selected_executor", "requested_executor", "run_id", "task_id",
+          "status", "progress", "routing", "artifact_paths",
+          "stdout_summary", "stderr_summary", "exit_code",
+          "timeout_state", "cancel_state", "git_evidence",
+          "artifact_verification", "telegram_result", "runtime_identity"
+        ],
+        "properties": {
+          "selected_executor": { "type": "string", "example": "claude-code-cli" },
+          "requested_executor": { "type": ["string", "null"], "example": "claude-code-cli" },
+          "run_id": { "type": "string" },
+          "task_id": { "type": ["string", "null"] },
+          "status": { "type": "string", "enum": ["queued", "running", "completed", "failed", "timeout", "cancelled"] },
+          "progress": { "type": "number", "format": "float", "minimum": 0, "maximum": 1 },
+          "routing": { "$ref": "#/components/schemas/RoutingDecision" },
+          "artifact_paths": { "type": "array", "items": { "type": "string" } },
+          "stdout_summary": { "type": "string" },
+          "stderr_summary": { "type": "string" },
+          "exit_code": { "type": ["integer", "null"] },
+          "timeout_state": { "type": ["string", "null"], "description": "exceeded | null" },
+          "cancel_state": { "type": ["string", "null"], "description": "requested | null" },
+          "git_evidence": { "anyOf": [ { "$ref": "#/components/schemas/GitEvidence" }, { "type": "null" } ] },
+          "artifact_verification": { "type": "array", "items": { "$ref": "#/components/schemas/ArtifactVerification" } },
+          "telegram_result": { "$ref": "#/components/schemas/TelegramResult" },
+          "runtime_identity": { "anyOf": [ { "$ref": "#/components/schemas/RuntimeIdentity" }, { "type": "null" } ] },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "UnsupportedExecutorError": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string", "example": "unsupported_executor" },
+          "message": { "type": "string" },
+          "supported_executors": { "type": "array", "items": { "type": "string" }, "example": ["claude-code-cli", "hermes"] }
+        }
+      }
+    }
+  },
+  "security": [
+    { "bearerAuth": [] }
+  ],
+  "paths": {
+    "/executors": {
+      "get": {
+        "summary": "Read-only executor capability discovery.",
+        "description": "Read-only capability discovery. Lists supported executors, the configured default, and the alias map. No dispatch, no side effects. Call before POST /runs/executor.",
+        "operationId": "aee_list_executors",
+        "x-openai-is-consequential": false,
+        "security": [ { "bearerAuth": [] } ],
+        "responses": {
+          "200": {
+            "description": "Supported executors, the default executor, and the alias map.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExecutorsResponse" },
+                "examples": {
+                  "default_capabilities": {
+                    "summary": "Default capability set",
+                    "value": {
+                      "supported_executors": ["claude-code-cli", "hermes"],
+                      "default_executor": "claude-code-cli",
+                      "aliases": {
+                        "claude_code": "claude-code-cli",
+                        "claude-code": "claude-code-cli",
+                        "claudecode": "claude-code-cli"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Missing or invalid bearer token." }
+        }
+      }
+    },
+    "/runs/executor": {
+      "post": {
+        "summary": "Dispatch a run to an explicit executor and return the full evidence envelope.",
+        "operationId": "aee_executor_run",
+        "x-openai-is-consequential": true,
+        "security": [ { "bearerAuth": [] } ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ExecutorRunRequest" },
+              "examples": {
+                "claude_code_cli": {
+                  "summary": "Run the real Claude Code CLI",
+                  "value": {
+                    "executor": "claude-code-cli",
+                    "prompt": "Use the write tool to create /tmp/aee_executor_smoke.md with content: hello from claude-code-cli",
+                    "expected_artifacts": ["/tmp/aee_executor_smoke.md"],
+                    "timeout_sec": 120
+                  }
+                },
+                "hermes_legacy": {
+                  "summary": "Route to the legacy Hermes provider",
+                  "value": {
+                    "executor": "hermes",
+                    "prompt": "Summarize the current AEE runtime status.",
+                    "timeout_sec": 120
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Run dispatched; full evidence envelope returned. status=completed for claude-code-cli (sync); status=queued for hermes (async).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExecutorRunResponse" },
+                "examples": {
+                  "claude_code_cli_completed": {
+                    "summary": "Real Claude Code CLI run completed",
+                    "value": {
+                      "selected_executor": "claude-code-cli",
+                      "requested_executor": "claude-code-cli",
+                      "run_id": "claude-cli-2322a3f2af5e",
+                      "task_id": null,
+                      "status": "completed",
+                      "progress": 1.0,
+                      "routing": {
+                        "requested_executor": "claude-code-cli",
+                        "selected_executor": "claude-code-cli",
+                        "effective_executor": "claude-code-cli",
+                        "selection_source": "explicit",
+                        "was_forced": false,
+                        "reason": "explicit_executor_opt_in",
+                        "effective_model": null
+                      },
+                      "artifact_paths": ["/tmp/aee_executor_smoke.md"],
+                      "stdout_summary": "Created `/tmp/aee_executor_smoke.md` with the content `hello from claude-code-cli`.\n",
+                      "stderr_summary": "",
+                      "exit_code": 0,
+                      "timeout_state": null,
+                      "cancel_state": null,
+                      "git_evidence": {
+                        "head_sha": "869a77f1b019dd23b6732dffdbd11676d2bc6583",
+                        "branch": "master",
+                        "dirty": true,
+                        "staged_file_count": 1,
+                        "repo_path": "/home/ubuntu/Abacus"
+                      },
+                      "artifact_verification": [
+                        {
+                          "path": "/tmp/aee_executor_smoke.md",
+                          "exists": true,
+                          "size": 26,
+                          "mtime": 1784613935,
+                          "sha256": "9b3a23cbaa104b4f1dc3ccf35d714bface1d32cdc110de7162a939e08c91651f"
+                        }
+                      ],
+                      "telegram_result": { "success": false, "skipped": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not configured in bridge env" },
+                      "runtime_identity": {
+                        "provider": "Claude Code",
+                        "provider_version": "2.1.216 (Claude Code)",
+                        "executor_binary": "/home/ubuntu/.local/bin/claude",
+                        "executor_version": "2.1.216 (Claude Code)",
+                        "runtime_bridge_version": "unknown",
+                        "bridge_commit": "07aefcb91fa11bd8dc6c8f4814ca3bc1fdb715d7",
+                        "bridge_branch": "master",
+                        "bridge_repository": "/home/ubuntu/hermes-runtime-bridge",
+                        "generated_at_utc": "2026-07-21T06:40:37Z"
+                      },
+                      "error": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unsupported executor (or disallowed repo_path). Deterministic validation error with a stable code.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UnsupportedExecutorError" },
+                "examples": {
+                  "unsupported_executor": {
+                    "summary": "Unsupported executor value",
+                    "value": {
+                      "code": "unsupported_executor",
+                      "message": "executor 'gemini' is not supported; accepted aliases canonicalise to 'claude-code-cli' or 'hermes'",
+                      "supported_executors": ["claude-code-cli", "hermes"]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Missing or invalid bearer token." },
+          "422": { "description": "Malformed request body (pydantic validation)." }
+        }
+      }
+    }
+  }
+}
