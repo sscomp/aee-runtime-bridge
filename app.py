@@ -1056,6 +1056,49 @@ async def list_executors(
     }
 
 
+def _persist_executor_run(envelope: Dict[str, Any]) -> None:
+    """Persist a POST /runs/executor response envelope to executor_runs.
+
+    Best-effort: a persistence failure MUST NOT break the dispatch
+    response. The work-order requires the run to be pollable later,
+    but if the DB is unavailable the response still carries the full
+    evidence envelope; the caller can re-dispatch if needed. Errors
+    are logged to stderr and swallowed.
+    """
+    try:
+        from dispatcher.db import get_conn
+        from dispatcher.executor_runs import upsert_run
+        conn = get_conn()
+        upsert_run(
+            conn,
+            run_id=envelope["run_id"],
+            requested_executor=envelope.get("requested_executor"),
+            selected_executor=envelope["selected_executor"],
+            task_id=envelope.get("task_id"),
+            status=envelope["status"],
+            progress=envelope.get("progress", 0.0),
+            exit_code=envelope.get("exit_code"),
+            timeout_state=envelope.get("timeout_state"),
+            cancel_state=envelope.get("cancel_state"),
+            stdout_summary=envelope.get("stdout_summary", ""),
+            stderr_summary=envelope.get("stderr_summary", ""),
+            artifact_paths=envelope.get("artifact_paths"),
+            artifact_verification=envelope.get("artifact_verification"),
+            git_evidence=envelope.get("git_evidence"),
+            telegram_result=envelope.get("telegram_result"),
+            runtime_identity=envelope.get("runtime_identity"),
+            routing=envelope.get("routing"),
+            error=envelope.get("error"),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        import sys
+        print(
+            f"[executor_runs] persistence failed for run_id="
+            f"{envelope.get('run_id')!r}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+
 @app.post("/runs/executor")
 async def create_executor_run(
     body: ExecutorRunRequest,
@@ -1173,7 +1216,7 @@ async def create_executor_run(
         runtime_identity = collect_runtime_identity(
             selected_executor=selected, cfg=cfg
         )
-        return build_executor_response(
+        envelope = build_executor_response(
             requested_executor=requested,
             selected_executor=selected,
             run_id=result.run_id,
@@ -1196,6 +1239,8 @@ async def create_executor_run(
             runtime_identity=runtime_identity,
             error=result.error,
         )
+        _persist_executor_run(envelope)
+        return envelope
 
     # selected == "hermes" — delegate to the existing Hermes adapter
     # (registered in ``adapter_registry``). Tests stub the adapter; in
@@ -1224,7 +1269,7 @@ async def create_executor_run(
         runtime_identity = collect_runtime_identity(
             selected_executor=selected, cfg=cfg
         )
-        return build_executor_response(
+        envelope = build_executor_response(
             requested_executor=requested,
             selected_executor=selected,
             run_id="hermes-submit-failed",
@@ -1237,10 +1282,12 @@ async def create_executor_run(
             },
             runtime_identity=runtime_identity,
         )
+        _persist_executor_run(envelope)
+        return envelope
     runtime_identity = collect_runtime_identity(
         selected_executor=selected, cfg=cfg
     )
-    return build_executor_response(
+    envelope = build_executor_response(
         requested_executor=requested,
         selected_executor=selected,
         run_id=submit_result.external_run_id,
@@ -1255,6 +1302,37 @@ async def create_executor_run(
         },
         runtime_identity=runtime_identity,
     )
+    _persist_executor_run(envelope)
+    return envelope
+
+
+import re
+
+# Run-id validation: work-order §3.1 supports Hermes async run IDs
+# such as ``run_5f346ad4dd7c4f27beaefccec65c5175`` and Claude Code
+# run IDs such as ``claude-cli-2322a3f2af5e``. The bridge also still
+# accepts the legacy dispatcher task ids (e.g. ``TASK-20260722-0001``).
+# The validation is intentionally permissive but rejects obviously
+# malformed inputs: empty, whitespace, control chars, path
+# separators, > 200 chars, or any char outside the union of
+# ``[A-Za-z0-9_-]`` plus the literal ``run_`` prefix and the
+# ``TASK-`` / ``claude-cli-`` shapes. We do NOT enforce a specific
+# prefix — that would break Hermes' opaque run_ids — only that the
+# id is a non-empty token of printable, non-slash chars.
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,199}\Z")
+
+
+def _malformed_run_id(run_id: str) -> bool:
+    """Return True if ``run_id`` cannot be a valid run identifier."""
+    if not isinstance(run_id, str):
+        return True
+    if not run_id or len(run_id) > 200:
+        return True
+    if "/" in run_id or "\\" in run_id or " " in run_id:
+        return True
+    if any(ord(c) < 32 for c in run_id):
+        return True
+    return not _RUN_ID_RE.match(run_id) is not None
 
 
 @app.get("/runs/{run_id}")
@@ -1262,14 +1340,66 @@ async def get_run(
     run_id: str,
     authorization: Optional[str] = Header(None),
 ) -> Dict[str, Any]:
-    """Poll a run's current state + final output (if completed).
+    """Read-only poll of a run's current and final state.
 
-    If a dispatcher task is bound to this run_id, return the merged view
-    (dispatcher progress + upstream raw). Otherwise pass through to Hermes.
+    Work-order TASK-AEE-RUN-TRACKING-RESTORE: this endpoint returns a
+    canonical JSON envelope for any run dispatched via
+    ``POST /runs/executor`` (the executor_runs store) OR any
+    dispatcher-tracked Hermes run (the ``tasks`` table). It does NOT
+    launch a new executor, mutate run state, or scan the repo.
+
+    Lookup order:
+      1. ``executor_runs`` table (populated by POST /runs/executor
+         for both claude-code-cli and hermes executors).
+      2. ``tasks`` table via ``find_by_hermes_run_id`` (legacy
+         dispatcher-backed runs that pre-date the executor store).
+      3. Deterministic JSON 404 envelope when neither source has
+         the run_id.
+
+    Malformed run_id (empty, contains slashes, control chars,
+    exceeds 200 chars) returns a deterministic JSON 400.
     """
     require_auth(authorization)
 
-    # Try the dispatcher first.
+    # Malformed run_id — deterministic 400. We still go through
+    # FastAPI's HTTPException so the response shape matches the
+    # rest of the API (``{"detail": ...}``).
+    if _malformed_run_id(run_id):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "malformed_run_id",
+                "message": (
+                    f"run_id {run_id!r} is not a valid run identifier; "
+                    f"expected a non-empty token of printable, non-slash chars"
+                ),
+            },
+        )
+
+    from dispatcher.db import get_conn
+    from dispatcher.executor_runs import get_run as _get_executor_run
+
+    # 1) executor_runs table — the canonical source for any
+    # POST /runs/executor dispatch (claude-code-cli or hermes).
+    try:
+        conn = get_conn()
+        persisted = _get_executor_run(conn, run_id)
+    except Exception:  # pragma: no cover - defensive
+        persisted = None
+    if persisted is not None:
+        # The persisted envelope already matches the canonical
+        # shape; add the source tag so callers can tell which
+        # store served the response.
+        envelope = dict(persisted)
+        envelope["source"] = "executor_runs"
+        envelope["is_terminal"] = envelope.get("status") in {
+            "completed", "failed", "timeout", "cancelled",
+        }
+        return envelope
+
+    # 2) Dispatcher task table (legacy POST /runs runs that did not
+    # go through POST /runs/executor). Preserve the pre-rewrite
+    # behaviour for these: return the merged dispatcher view.
     manager = TaskManager()
     task = manager.find_by_hermes_run_id(run_id)
     if task is not None:
@@ -1287,31 +1417,27 @@ async def get_run(
             "warning_count": task.warning_count,
             "output": out.get("output_text"),
             "usage": out.get("usage"),
+            "source": "dispatcher_tasks",
+            "is_terminal": task.status in {
+                "completed", "failed", "cancelled",
+            },
         }
 
-    # No dispatcher record — fall back to adapter-driven pass-through.
-    # AEE-2: use the adapter registry instead of hardcoded
-    # `httpx.AsyncClient.get(... /v1/runs/{id} ...)`. The legacy
-    # HermesAdapter implements the same endpoint; the response
-    # shape is whatever Hermes itself returns.
-    from aee.core.registry import adapter_registry
-    from aee.adapters.base import RuntimeError as AdapterRuntimeError
-    try:
-        adapter = adapter_registry.get("hermes")
-        poll_result = await adapter.poll(run_id)
-    except AdapterRuntimeError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Upstream Hermes error: {type(exc).__name__}: {exc}",
-        ) from exc
-    return {
-        "run_id": poll_result.external_run_id,
-        "status": poll_result.status,
-        "is_terminal": poll_result.is_terminal,
-        "output": poll_result.output,
-        "error": poll_result.error,
-        "raw": dict(poll_result.raw) if poll_result.raw is not None else None,
-    }
+    # 3) No persisted record. Deterministic 404 — do NOT call the
+    # upstream Hermes adapter (that would launch a network call
+    # and could 502 on a stale run_id, which the work-order
+    # explicitly forbids: "Must not launch a new executor, mutate
+    # run state, or require repo scanning").
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "code": "unknown_run_id",
+            "message": (
+                f"run_id {run_id!r} not found in executor_runs or tasks"
+            ),
+            "run_id": run_id,
+        },
+    )
 
 
 @app.get("/runs/{run_id}/summary")

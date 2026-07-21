@@ -186,6 +186,51 @@
           "message": { "type": "string" },
           "supported_executors": { "type": "array", "items": { "type": "string" }, "example": ["claude-code-cli", "hermes"] }
         }
+      },
+      "RunStatusResponse": {
+        "type": "object",
+        "description": "Read-only run status envelope returned by GET /runs/{run_id}. Tracks both Hermes async runs and Claude Code runs without launching a new executor. Populated by POST /runs/executor (the executor_runs store) or by the dispatcher tasks table (legacy POST /runs).",
+        "required": ["run_id", "selected_executor", "status", "progress"],
+        "properties": {
+          "run_id": { "type": "string", "description": "The run identifier echoed back." },
+          "requested_executor": { "type": ["string", "null"], "description": "Executor the caller requested (null when dispatched via legacy POST /runs)." },
+          "selected_executor": { "type": "string", "description": "Executor that handled the run (claude-code-cli or hermes); 'hermes' for legacy dispatcher runs." },
+          "task_id": { "type": ["string", "null"], "description": "Dispatcher task id when the run went through the dispatcher tasks table; null for executor_runs-only runs." },
+          "status": { "type": "string", "enum": ["queued", "started", "running", "completed", "failed", "cancelled", "timeout", "unknown"], "description": "Current run state. 'unknown' is reserved for legacy dispatcher rows with an unrecognised status string." },
+          "progress": { "type": "number", "format": "float", "minimum": 0, "maximum": 1, "description": "0.0 to 1.0; 1.0 for terminal states." },
+          "exit_code": { "type": ["integer", "null"], "description": "Process exit code when available (claude-code-cli); null for hermes async runs." },
+          "timeout_state": { "type": ["string", "null"], "description": "'exceeded' when the run hit its deadline; null otherwise." },
+          "cancel_state": { "type": ["string", "null"], "description": "'requested' when the run was cancelled; null otherwise." },
+          "stdout_summary": { "type": "string", "description": "Truncated stdout from the run (claude-code-cli); empty for hermes async runs." },
+          "stderr_summary": { "type": "string", "description": "Truncated stderr from the run (claude-code-cli); empty for hermes async runs." },
+          "artifact_paths": { "type": "array", "items": { "type": "string" }, "description": "Absolute paths of artifacts the run produced (claude-code-cli); empty for hermes async runs." },
+          "artifact_verification": { "type": "array", "items": { "$ref": "#/components/schemas/ArtifactVerification" }, "description": "Per-path exists/size/mtime/sha256 stat for declared expected_artifacts." },
+          "git_evidence": { "anyOf": [ { "$ref": "#/components/schemas/GitEvidence" }, { "type": "null" } ] },
+          "telegram_result": { "$ref": "#/components/schemas/TelegramResult" },
+          "runtime_identity": { "anyOf": [ { "$ref": "#/components/schemas/RuntimeIdentity" }, { "type": "null" } ] },
+          "routing": { "type": "object", "description": "Routing decision recorded at dispatch time; empty object for legacy dispatcher runs." },
+          "error": { "type": ["string", "null"], "description": "Error message for failed runs; null otherwise." },
+          "created_at": { "type": ["string", "null"], "description": "ISO-8601 UTC timestamp when the run was first persisted." },
+          "updated_at": { "type": ["string", "null"], "description": "ISO-8601 UTC timestamp of the last status update." },
+          "completed_at": { "type": ["string", "null"], "description": "ISO-8601 UTC timestamp when the run reached a terminal state; null while running." },
+          "source": { "type": "string", "enum": ["executor_runs", "dispatcher_tasks"], "description": "Which store served the response: 'executor_runs' (POST /runs/executor) or 'dispatcher_tasks' (legacy POST /runs)." },
+          "is_terminal": { "type": "boolean", "description": "True when status is completed/failed/cancelled/timeout." }
+        }
+      },
+      "MalformedRunIdError": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string", "example": "malformed_run_id" },
+          "message": { "type": "string" }
+        }
+      },
+      "UnknownRunIdError": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string", "example": "unknown_run_id" },
+          "message": { "type": "string" },
+          "run_id": { "type": "string" }
+        }
       }
     }
   },
@@ -346,6 +391,133 @@
           },
           "401": { "description": "Missing or invalid bearer token." },
           "422": { "description": "Malformed request body (pydantic validation)." }
+        }
+      }
+    },
+    "/runs/{run_id}": {
+      "get": {
+        "summary": "Read-only poll of a run's current and final state.",
+        "description": "Read-only run status poll. Returns the canonical envelope for any run dispatched via POST /runs/executor (the executor_runs store) or any legacy dispatcher-tracked Hermes run (the tasks table). Does NOT launch a new executor, mutate run state, or scan the repo. Use this to poll a run_id returned by POST /runs/executor until is_terminal is true. Unknown run_id returns a deterministic JSON 404; malformed run_id returns a deterministic JSON 400.",
+        "operationId": "aee_get_run_status",
+        "x-openai-is-consequential": false,
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*$" },
+            "description": "The run identifier returned by POST /runs/executor (e.g. 'claude-cli-2322a3f2af5e' or 'run_5f346ad4dd7c4f27beaefccec65c5175')."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run found; canonical envelope returned.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RunStatusResponse" },
+                "examples": {
+                  "claude_code_cli_completed": {
+                    "summary": "Completed claude-code-cli run",
+                    "value": {
+                      "run_id": "claude-cli-2322a3f2af5e",
+                      "requested_executor": "claude-code-cli",
+                      "selected_executor": "claude-code-cli",
+                      "task_id": null,
+                      "status": "completed",
+                      "progress": 1.0,
+                      "exit_code": 0,
+                      "timeout_state": null,
+                      "cancel_state": null,
+                      "stdout_summary": "Created /tmp/aee_executor_smoke.md",
+                      "stderr_summary": "",
+                      "artifact_paths": ["/tmp/aee_executor_smoke.md"],
+                      "artifact_verification": [
+                        { "path": "/tmp/aee_executor_smoke.md", "exists": true, "size": 26, "mtime": 1784613935, "sha256": "9b3a23cbaa104b4f1dc3ccf35d714bface1d32cdc110de7162a939e08c91651f" }
+                      ],
+                      "git_evidence": { "head_sha": "869a77f1b019dd23b6732dffdbd11676d2bc6583", "branch": "master", "dirty": false, "staged_file_count": 0, "repo_path": "/home/ubuntu/Abacus" },
+                      "telegram_result": { "success": false, "skipped": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not configured in bridge env" },
+                      "runtime_identity": {
+                        "provider": "Claude Code",
+                        "provider_version": "2.1.216 (Claude Code)",
+                        "executor_binary": "/home/ubuntu/.local/bin/claude",
+                        "executor_version": "2.1.216 (Claude Code)",
+                        "runtime_bridge_version": "unknown",
+                        "bridge_commit": "07aefcb91fa11bd8dc6c8f4814ca3bc1fdb715d7",
+                        "bridge_branch": "master",
+                        "bridge_repository": "/home/ubuntu/hermes-runtime-bridge",
+                        "generated_at_utc": "2026-07-21T06:40:37Z"
+                      },
+                      "routing": { "requested_executor": "claude-code-cli", "selected_executor": "claude-code-cli", "effective_executor": "claude-code-cli", "selection_source": "explicit", "was_forced": false, "reason": "explicit_executor_opt_in", "effective_model": null },
+                      "error": null,
+                      "created_at": "2026-07-22T10:00:00Z",
+                      "updated_at": "2026-07-22T10:00:05Z",
+                      "completed_at": "2026-07-22T10:00:05Z",
+                      "source": "executor_runs",
+                      "is_terminal": true
+                    }
+                  },
+                  "hermes_queued": {
+                    "summary": "Queued hermes async run",
+                    "value": {
+                      "run_id": "run_5f346ad4dd7c4f27beaefccec65c5175",
+                      "requested_executor": "hermes",
+                      "selected_executor": "hermes",
+                      "task_id": null,
+                      "status": "queued",
+                      "progress": 0.0,
+                      "exit_code": null,
+                      "timeout_state": null,
+                      "cancel_state": null,
+                      "stdout_summary": "",
+                      "stderr_summary": "",
+                      "artifact_paths": [],
+                      "artifact_verification": [],
+                      "git_evidence": null,
+                      "telegram_result": { "success": false, "skipped": "hermes is async; per-run telegram not sent on submit" },
+                      "runtime_identity": null,
+                      "routing": { "requested_executor": "hermes", "selected_executor": "hermes", "effective_executor": "hermes", "selection_source": "explicit", "was_forced": false, "reason": "explicit_executor_opt_in", "effective_model": null },
+                      "error": null,
+                      "created_at": "2026-07-22T10:00:00Z",
+                      "updated_at": "2026-07-22T10:00:00Z",
+                      "completed_at": null,
+                      "source": "executor_runs",
+                      "is_terminal": false
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed run_id (deterministic JSON 400).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MalformedRunIdError" },
+                "examples": {
+                  "malformed_run_id": {
+                    "summary": "Malformed run_id",
+                    "value": { "code": "malformed_run_id", "message": "run_id 'run with spaces' is not a valid run identifier; expected a non-empty token of printable, non-slash chars" }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Missing or invalid bearer token." },
+          "404": {
+            "description": "Unknown run_id (deterministic JSON 404).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UnknownRunIdError" },
+                "examples": {
+                  "unknown_run_id": {
+                    "summary": "Unknown run_id",
+                    "value": { "code": "unknown_run_id", "message": "run_id 'run_does_not_exist_abc123' not found in executor_runs or tasks", "run_id": "run_does_not_exist_abc123" }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }

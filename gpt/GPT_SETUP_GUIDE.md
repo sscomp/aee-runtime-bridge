@@ -194,7 +194,108 @@ queued/running Hermes submission (Hermes is async; the per-run artifact
 
 ---
 
-## 7. Rollback (disable the action without deleting the GPT)
+## 7. Poll a run's status (`GET /runs/{run_id}`)
+
+`POST /runs/executor` returns a `run_id` immediately. For both the
+`claude-code-cli` executor (synchronous, completes within the request)
+and the `hermes` executor (asynchronous, returns `status: "queued"` on
+submit), the canonical way to read back the current or final state of a
+run — without launching a new executor — is `GET /runs/{run_id}`.
+
+The endpoint is **read-only**: it does not launch any executor, mutate
+run state, scan the repo, or call upstream Hermes. It reads from the
+durable `executor_runs` SQLite table (populated best-effort by
+`POST /runs/executor`) and falls back to the legacy `tasks` table for
+any Hermes run tracked by the dispatcher. Unknown `run_id` returns a
+deterministic JSON 404; malformed `run_id` returns a deterministic JSON
+400.
+
+### Polling workflow
+
+```
+1. GPT calls  POST /runs/executor        -> { "run_id": "<id>", ... }
+2. GPT calls  GET  /runs/<id>            -> canonical envelope
+3. If envelope.is_terminal == false      -> sleep 3-10s, goto 2
+4. If envelope.is_terminal == true       -> report status / exit_code / artifacts
+```
+
+### Example poll (claude-code-cli, completed run)
+
+```bash
+curl -sS -H "Authorization: Bearer ${AEE_...EN}" \
+  "${AEE_RUNTIME_BRIDGE_BASE_URL}/runs/claude-cli-2322a3f2af5e" | jq
+```
+
+Response shape (abbreviated):
+
+```json
+{
+  "run_id": "claude-cli-2322a3f2af5e",
+  "requested_executor": "claude-code-cli",
+  "selected_executor": "claude-code-cli",
+  "status": "completed",
+  "is_terminal": true,
+  "exit_code": 0,
+  "artifact_paths": ["/tmp/aee_executor_smoke.md"],
+  "artifact_verification": [
+    { "path": "/tmp/aee_executor_smoke.md", "exists": true, "size": 26, "sha256": "9b3a..." }
+  ],
+  "created_at": "2026-07-22T10:00:00Z",
+  "completed_at": "2026-07-22T10:00:05Z",
+  "source": "executor_runs"
+}
+```
+
+### Example poll (hermes async, queued run)
+
+```bash
+curl -sS -H "Authorization: Bearer ${AEE_...EN}" \
+  "${AEE_RUNTIME_BRIDGE_BASE_URL}/runs/run_5f346ad4dd7c4f27beaefccec65c5175" | jq
+```
+
+```json
+{
+  "run_id": "run_5f346ad4dd7c4f27beaefccec65c5175",
+  "requested_executor": "hermes",
+  "selected_executor": "hermes",
+  "status": "queued",
+  "is_terminal": false,
+  "created_at": "2026-07-22T10:00:00Z",
+  "completed_at": null,
+  "source": "executor_runs"
+}
+```
+
+### Deterministic error envelopes
+
+| Case | HTTP | `code` | Shape |
+|------|-----|--------|-------|
+| Malformed `run_id` (e.g. spaces, slashes, empty) | 400 | `malformed_run_id` | `{ "code", "message" }` |
+| Unknown `run_id` (not in `executor_runs` or `tasks`) | 404 | `unknown_run_id` | `{ "code", "message", "run_id" }` |
+| Missing / invalid bearer token | 401 | — | upstream auth error |
+
+The GPT should treat `400` as a permanent client error (do not retry
+the same `run_id`); treat `404` as "run never existed in this bridge"
+(do not retry with backoff — there is nothing to wait for); treat
+`200` with `is_terminal: false` as the only case that warrants polling.
+
+### Notes for the GPT instruction text
+
+Add this to the action's *Instructions* (after the existing
+`aee_executor_run` guidance):
+
+> After `aee_executor_run` returns a `run_id`, poll
+> `aee_get_run_status` with that `run_id` until
+> `is_terminal == true`. Report `status`, `exit_code`,
+> `artifact_paths`, and any `artifact_verification` entry where
+> `exists == false`. Do NOT call `aee_executor_run` again to "check
+> on" a run — that launches a new executor. Treat HTTP 400 as
+> permanent (malformed id) and HTTP 404 as permanent (unknown id);
+> only HTTP 200 with `is_terminal: false` is a reason to keep polling.
+
+---
+
+## 8. Rollback (disable the action without deleting the GPT)
 
 1. In the GPT builder, open the action.
 2. Toggle the action **off** (or delete just the action). The GPT itself
@@ -207,7 +308,7 @@ turned off.
 
 ---
 
-## 8. Natural-language action description for the GPT
+## 9. Natural-language action description for the GPT
 
 Paste this into the action's *Instructions* (or the GPT's main
 instructions):
@@ -226,7 +327,7 @@ instructions):
 
 ---
 
-## 9. Files in this guide
+## 10. Files in this guide
 
 | File | Purpose |
 |------|---------|

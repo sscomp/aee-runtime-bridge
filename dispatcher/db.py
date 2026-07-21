@@ -243,6 +243,27 @@ _AEE7_WRITE_SIDE_MIGRATIONS: list[tuple[str, str]] = [
     if m.column is not None
 ]
 
+# AEE v3 Telegram Completion Enforcement Gate — the dispatcher's
+# ``complete()`` now records the notification gate's result into a
+# new ``task_outputs.notification_json`` column. The blob is the
+# JSON-serialized result dict from
+# ``dispatcher.notifier.notify_completed_with_fallback`` (keys:
+# ``sent`` / ``method`` / ``recipient`` / ``message_id`` / ``ts_utc``
+# / ``ts_taipei`` / ``attempts`` / ``last_error``). NULLable — legacy
+# rows and rows completed before the v3 gate was wired keep NULL,
+# which ``compute_completion_state`` reads as "notification pending"
+# (the EVIDENCE_COMPLETED stage). Same idempotent ``PRAGMA
+# table_info`` pattern as AEE-7.2 / AEE-8.2; the CREATE TABLE
+# statement is intentionally NOT changed (ALTER TABLE is the
+# established idempotent path — see the comment block on
+# ``_PHASE4_MIGRATIONS`` above).
+_AEE_V3_NOTIFICATION_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "notification_json",
+        "ALTER TABLE task_outputs ADD COLUMN notification_json TEXT",
+    ),
+]
+
 # AEE-4: Worker metadata + status. Adds 11 columns to `workers` so any
 # registered worker can self-describe its runtime, environment, and
 # current state. The columns are NULLable except `status`, which
@@ -482,6 +503,26 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     # external_run_id). See _AEE713_FIXUP_MIGRATIONS comment block.
     for _label, stmt in _AEE713_FIXUP_MIGRATIONS:
         conn.execute(stmt)
+    # AEE v3 Telegram Completion Enforcement Gate: add the
+    # ``task_outputs.notification_json`` column. Same idempotent
+    # ``PRAGMA table_info`` pattern as AEE-7.2 / AEE-8.2 above;
+    # the CREATE TABLE statement is intentionally NOT changed
+    # (ALTER TABLE is the established idempotent path). Legacy
+    # rows and rows completed before the v3 gate was wired keep
+    # NULL, which ``compute_completion_state`` reads as
+    # "notification pending" (the EVIDENCE_COMPLETED stage).
+    import sys as _sys_v3_notif
+    for col, stmt in _AEE_V3_NOTIFICATION_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('task_outputs') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(
+                f"[db] AEE v3 notification migration: added task_outputs.{col}",
+                file=_sys_v3_notif.stderr,
+            )
     # AEE-1: index for the new lookup path. Idempotent via IF NOT EXISTS.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_run_id ON tasks(external_run_id)"
@@ -508,6 +549,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     # transparently on next dispatcher restart.
     from aee.artifacts.repository import ensure_aee6_schema
     ensure_aee6_schema(conn)
+    # Run tracking: the executor_runs table persisted by
+    # ``POST /runs/executor`` so ``GET /runs/{run_id}`` can poll a
+    # run's current and final state without launching a new
+    # executor. Idempotent (CREATE TABLE IF NOT EXISTS + IF NOT
+    # EXISTS indexes). The migration lives in
+    # ``dispatcher.executor_runs`` so this module stays runtime-neutral.
+    from dispatcher.executor_runs import ensure_schema as _ensure_executor_runs
+    _ensure_executor_runs(conn)
     conn.commit()
 
 
@@ -655,6 +704,22 @@ def run_migrations() -> list[str]:
     # when the data is already NULL.
     for _label, stmt in _AEE713_FIXUP_MIGRATIONS:
         conn.execute(stmt)
+    # AEE v3 Telegram Completion Enforcement Gate: add the
+    # ``task_outputs.notification_json`` column. Same idempotent
+    # ``PRAGMA table_info`` pattern as AEE-7.2 / AEE-8.2 above;
+    # legacy rows keep NULL.
+    for col, stmt in _AEE_V3_NOTIFICATION_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('task_outputs') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(
+                f"[db] AEE v3 notification migration: added task_outputs.{col}",
+                file=sys.stderr,
+            )
+            added.append(col)
     # Indexes (idempotent).
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_run_id ON tasks(external_run_id)"
