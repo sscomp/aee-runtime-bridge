@@ -559,6 +559,10 @@ class TaskManager:
         self._emit_event(task_id, EventKind.COMPLETED, {
             "duration_sec": duration, "result_path": result_path,
         })
+        # Task-Mapping work-order (Fix D): mirror the terminal
+        # ``completed`` status into ``executor_runs`` so GET /runs
+        # list/summary reflect the true lifecycle. Best-effort.
+        self._sync_executor_runs_status(task_id, status="completed", exit_code=0)
         return self.get_or_raise(task_id)
 
     def _verify_expected_delivery(self, task_id: str, input_text: str) -> Dict[str, Any]:
@@ -772,6 +776,85 @@ class TaskManager:
             "recommended_action": "retry_with_explicit_write_instruction",
         }
 
+    # ------------------------------------------------------------------
+    # Task-Mapping work-order: sync ``executor_runs`` row on
+    # terminal lifecycle transitions (complete/fail/timeout/cancel).
+    # Root cause C1 of the investigation report: ``manager.complete()``
+    # and ``manager.fail()`` only updated the ``tasks`` table, leaving
+    # the ``executor_runs`` row stuck at its last non-terminal status
+    # (e.g. ``running`` forever). This helper mirrors the terminal
+    # status into ``executor_runs`` so that ``GET /runs`` list /
+    # summary / full-get reflect the true lifecycle state.
+    #
+    # The sync is keyed on ``run_id`` (the canonical key in
+    # ``executor_runs``). For Hermes-dispatched runs the run_id is
+    # the task's ``external_run_id`` / ``hermes_run_id``; for
+    # executor runs it was passed into ``upsert_run`` at dispatch
+    # time. We look up the run_id by ``task_id`` (the
+    # ``executor_runs.task_id`` column is non-NULL for newly created
+    # runs per Fix B; for pre-fix runs it may be NULL and the sync
+    # is a no-op).
+    #
+    # Best-effort: a sync failure MUST NOT block the lifecycle
+    # transition. The ``tasks`` table is already updated; this helper
+    # runs after the transition has committed and only logs on error.
+    # Idempotent: ``upsert_run`` is INSERT OR REPLACE on ``run_id``,
+    # so repeated syncs with the same status are safe.
+    def _sync_executor_runs_status(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        exit_code: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        try:
+            from dispatcher.executor_runs import upsert_run
+            conn = get_conn()
+            trow = conn.execute(
+                "SELECT hermes_run_id, external_run_id, adapter_name "
+                "FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if trow is None:
+                return
+            run_id = trow["hermes_run_id"] or trow["external_run_id"]
+            if not run_id:
+                # No upstream run id — this task was never dispatched
+                # to a runtime that produces a run_id (e.g. a
+                # rejected/synthetic task). Nothing to sync.
+                return
+            _terminal = status in {"completed", "failed", "timeout", "cancelled"}
+            _phase = "terminal" if _terminal else (
+                "queued" if status in {"queued", "pending"} else "running"
+            )
+            _step = status if _terminal else (
+                "queued" if status in {"queued", "pending"} else "running"
+            )
+            upsert_run(
+                conn,
+                run_id=run_id,
+                requested_executor=None,
+                selected_executor=trow["adapter_name"] or "hermes",
+                task_id=task_id,
+                status=status,
+                progress=1.0 if _terminal else 0.0,
+                exit_code=exit_code,
+                error=error,
+                routing={
+                    "selected_executor": trow["adapter_name"] or "hermes",
+                    "selection_source": "lifecycle_sync",
+                },
+                current_step=_step,
+                phase=_phase,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning(
+                "manager._sync_executor_runs_status: sync failed "
+                "task_id=%s status=%s err=%s",
+                task_id, status, exc,
+            )
+
     def fail(self, task_id: str, error_message: str) -> Task:
         ts = ids.now_iso()
         conn = get_conn()
@@ -801,6 +884,12 @@ class TaskManager:
         )
         _append_log(task_id, "ERROR", f"failed: {error_message}")
         self._emit_event(task_id, EventKind.FAILED, {"error": error_message[:500]})
+        # Task-Mapping work-order (Fix D): mirror the terminal
+        # ``failed`` status into ``executor_runs`` so GET /runs
+        # list/summary reflect the true lifecycle. Best-effort.
+        self._sync_executor_runs_status(
+            task_id, status="failed", exit_code=1, error=error_message[:500],
+        )
         return self.get_or_raise(task_id)
 
     def timeout(self, task_id: str, reason: str) -> Task:
@@ -826,6 +915,11 @@ class TaskManager:
             )
         _append_log(task_id, "WARN", f"timeout: {reason}")
         self._emit_event(task_id, EventKind.TIMEOUT, {"reason": reason[:500]})
+        # Task-Mapping work-order (Fix D): mirror terminal timeout into
+        # executor_runs so GET /runs reflects the true lifecycle.
+        self._sync_executor_runs_status(
+            task_id, status="timeout", error=reason[:500],
+        )
         return self.get_or_raise(task_id)
 
     def cancel(self, task_id: str) -> Task:
@@ -846,6 +940,9 @@ class TaskManager:
             )
         _append_log(task_id, "INFO", f"cancelled duration={duration:.2f}s")
         self._emit_event(task_id, EventKind.CANCELLED, {"duration_sec": duration})
+        # Task-Mapping work-order (Fix D): mirror terminal cancelled
+        # into executor_runs so GET /runs reflects the true lifecycle.
+        self._sync_executor_runs_status(task_id, status="cancelled")
         return self.get_or_raise(task_id)
 
     def retry(self, task_id: str) -> Task:

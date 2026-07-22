@@ -756,7 +756,104 @@ async def list_runs_endpoint(
             since=since_normalized,
         )
     except Exception:  # pragma: no cover - defensive
+        conn = None
         rows = []
+
+    # ------------------------------------------------------------------
+    # Task-Mapping work-order: union ``tasks`` rows that have a
+    # ``hermes_run_id`` (i.e. were dispatched via ``POST /runs``) into
+    # the list so hermes-adapter runs are visible alongside
+    # executor_runs rows. Root cause C3 of the investigation report:
+    # before this fix, ``POST /runs`` only wrote ``tasks`` and
+    # ``GET /runs`` only read ``executor_runs``, so hermes runs were
+    # invisible to the list endpoint.
+    #
+    # The ``_persist_hermes_run_mapping`` helper (Fix A) now writes
+    # an ``executor_runs`` row at dispatch time, so for NEW hermes
+    # runs the union is a no-op (the row is already in ``rows``).
+    # The union is retained for backwards compatibility with
+    # pre-fix hermes runs that only have a ``tasks`` row and were
+    # never mirrored into ``executor_runs`` — without the union they
+    # would remain invisible forever. The union is keyed on
+    # ``run_id`` so a hermes run that exists in both stores is
+    # returned exactly once (the ``executor_runs`` row wins because
+    # it carries the richer observability fields).
+    #
+    # ``tasks.status`` uses a slightly different vocabulary
+    # (``pending`` / ``waiting`` are task-only); we map them onto the
+    # canonical run status vocabulary: ``pending`` → ``queued``,
+    # ``waiting`` → ``running``. ``started`` (executor_runs-only) is
+    # not produced by the tasks path. The ``selected_executor`` for
+    # unioned tasks rows is ``"hermes"`` unless the task's
+    # ``adapter_name`` column says otherwise (the canonical source
+    # for adapter identity is the ``tasks`` row).
+    try:
+        if conn is None:
+            raise RuntimeError("db connection unavailable")
+        seen_run_ids = {r.get("run_id") for r in rows if r.get("run_id")}
+        cursor = conn.execute(
+            "SELECT task_id, hermes_run_id, external_run_id, "
+            "adapter_name, status, created_at, title "
+            "FROM tasks WHERE hermes_run_id IS NOT NULL "
+            "AND hermes_run_id != '' "
+            "ORDER BY created_at DESC, hermes_run_id DESC LIMIT ?",
+            (max(limit * 2, 100),),
+        )
+        for trow in cursor.fetchall():
+            run_id = trow["hermes_run_id"] or trow["external_run_id"]
+            if not run_id or run_id in seen_run_ids:
+                continue
+            t_status = trow["status"]
+            if t_status == "pending":
+                t_status = "queued"
+            elif t_status == "waiting":
+                t_status = "running"
+            if status is not None and t_status != status:
+                continue
+            if executor is not None and executor != (trow["adapter_name"] or "hermes"):
+                continue
+            if since_normalized is not None and (trow["created_at"] or "") < since_normalized:
+                continue
+            rows.append({
+                "run_id": run_id,
+                "requested_executor": None,
+                "selected_executor": trow["adapter_name"] or "hermes",
+                "task_id": trow["task_id"],
+                "status": t_status,
+                "progress": 1.0 if t_status in {"completed", "failed", "timeout", "cancelled"} else 0.0,
+                "exit_code": None,
+                "timeout_state": None,
+                "cancel_state": None,
+                "stdout_summary": "",
+                "stderr_summary": "",
+                "artifact_paths": [],
+                "artifact_verification": [],
+                "git_evidence": None,
+                "telegram_result": {},
+                "runtime_identity": None,
+                "routing": {
+                    "selected_executor": trow["adapter_name"] or "hermes",
+                    "selection_source": "tasks_union",
+                },
+                "error": None,
+                "created_at": trow["created_at"],
+                "updated_at": trow["created_at"],
+                "completed_at": None,
+                "last_heartbeat_at": None,
+                "current_step": None,
+                "phase": None,
+                "title": trow["title"],
+            })
+            seen_run_ids.add(run_id)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    # Re-sort the unioned list newest-first by created_at with the
+    # run_id DESC tie-breaker (matching ``list_runs`` ordering) and
+    # re-apply the caller's limit.
+    rows.sort(key=lambda r: (r.get("created_at") or "", r.get("run_id") or ""), reverse=True)
+    rows = rows[:limit]
+
 
     # Augment each item with the convenience tags that
     # GET /runs/{run_id} also adds so list consumers do not have to
@@ -1127,7 +1224,33 @@ async def create_run(
             (run_id, job.runtime_type, job.adapter_name, task_id),
         )
     manager.log(task_id, f"upstream run started, hermes_run_id={run_id}, adapter={adapter.name}")
-
+    # ------------------------------------------------------------------
+    # Task-Mapping work-order: persist a durable ``executor_runs``
+    # mapping row for this Hermes-dispatched run so that the read
+    # paths (GET /runs list, GET /runs/{id}, GET /runs/{id}/summary)
+    # can find it in the same canonical store used by
+    # POST /runs/executor. Without this row, the hermes run is
+    # invisible to ``GET /runs`` (list) which only reads
+    # ``executor_runs`` (root cause C1/C3 of the investigation
+    # report at /home/ubuntu/Abacus/AEE_RUNTIME_PERSISTENCE_TELEGRAM_INVESTIGATION.md).
+    # Best-effort: a persistence failure MUST NOT break the dispatch
+    # response. ``task_id`` and ``selected_executor='hermes'`` are
+    # stamped so the mapping is canonical + queryable.
+    _persist_hermes_run_mapping(
+        run_id=run_id,
+        task_id=task_id,
+        status="running",
+        routing={
+            "client_source": source,
+            "model_name": effective_model_name,
+            "selected_executor": "hermes",
+            "requested_executor": None,
+            "selection_source": "default",
+            "was_forced": resolved.was_forced,
+            "reason": resolved.reason,
+            "profile": resolved_profile,
+        },
+    )
     return CreateRunResponse(
         run_id=run_id,
         status=submit_result.status or "started",
@@ -1488,6 +1611,68 @@ def _persist_terminal_reconciliation(
         return out
 
 
+def _persist_hermes_run_mapping(
+    *,
+    run_id: str,
+    task_id: str,
+    status: str = "running",
+    routing: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist a ``executor_runs`` mapping row for a Hermes-dispatched run.
+
+    This closes the two-table split root cause (C1/C3) for ``POST /runs``:
+    Hermes-adapter runs were only written to the ``tasks`` table, leaving
+    ``GET /runs`` (list) and the summary endpoint unable to find them in
+    the canonical ``executor_runs`` store. This helper writes a minimal
+    mapping row with ``selected_executor='hermes'`` and the dispatcher's
+    ``task_id`` so list/get/summary all resolve via the same store.
+
+    Best-effort: a persistence failure MUST NOT break the dispatch
+    response. Errors are logged to stderr and swallowed (mirroring
+    ``_persist_executor_run``). ``upsert_run`` is idempotent on
+    ``run_id``, so subsequent lifecycle updates (complete/fail) can
+    re-call this with the same ``run_id`` to advance the row.
+    """
+    try:
+        from dispatcher.db import get_conn
+        from dispatcher.executor_runs import upsert_run
+
+        _status = status
+        _terminal = _status in {"completed", "failed", "timeout", "cancelled"}
+        _phase = "terminal" if _terminal else (
+            "queued" if _status in {"queued", "pending"} else "running"
+        )
+        _step = _status if _terminal else (
+            "queued" if _status in {"queued", "pending"} else "running"
+        )
+        conn = get_conn()
+        upsert_run(
+            conn,
+            run_id=run_id,
+            requested_executor=None,
+            selected_executor="hermes",
+            task_id=task_id,
+            status=_status,
+            progress=1.0 if _terminal else 0.0,
+            routing=routing or {
+                "selected_executor": "hermes",
+                "selection_source": "default",
+            },
+            last_heartbeat_at=_utc_now_iso(),
+            current_step=_step,
+            phase=_phase,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        import sys
+        print(
+            f"[hermes_run_mapping] persistence failed for run_id="
+            f"{run_id!r}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+
+
+
 def _persist_executor_run(envelope: Dict[str, Any]) -> None:
     """Persist a POST /runs/executor response envelope to executor_runs.
 
@@ -1648,6 +1833,47 @@ async def create_executor_run(
         was_forced=False,
         reason=("default" if defaulted else "explicit_executor_opt_in"),
     )
+    # ------------------------------------------------------------------
+    # Task-Mapping work-order: create a dispatcher ``tasks`` row for
+    # every executor run so that ``executor_runs.task_id`` is non-NULL
+    # for newly created runs (root cause C5 of the investigation
+    # report at /home/ubuntu/Abacus/AEE_RUNTIME_PERSISTENCE_TELEGRAM_INVESTIGATION.md).
+    # The row is created in ``queued`` state; the executor path does
+    # not call ``manager.start()`` (no upstream Hermes run to track),
+    # and the watcher's completion gate is responsible for advancing
+    # the row to a terminal status when the executor finishes. The
+    # ``executor_session_id`` field records the caller's session id so
+    # the read-side identity validator can attribute the run back to
+    # the orchestrator that issued it. Best-effort: a create failure
+    # is logged and swallowed so the dispatch still returns the
+    # executor's evidence envelope with ``task_id=None`` (matching the
+    # pre-fix contract for failure paths) rather than 500'ing.
+    executor_task_id: Optional[str] = None
+    try:
+        from dispatcher.manager import TaskManager as _TaskManager
+        _etask = _TaskManager().create(
+            title=f"executor-run:{selected}",
+            type="ops",
+            input_text=body.prompt,
+            session_id=None,
+            mode="normal",
+            owner="m2",
+            model_name=None,
+            workdir=None,
+            initial_status="queued",
+            required_capabilities=None,
+            repo_root=repo_path,
+            executor_session_id=source,
+            profile=None,
+        )
+        executor_task_id = _etask.task_id
+    except Exception as exc:  # pragma: no cover - defensive
+        import sys as _sys
+        print(
+            f"[executor_run_mapping] tasks.create failed for "
+            f"selected={selected!r}: {type(exc).__name__}: {exc}",
+            file=_sys.stderr,
+        )
 
     if selected == "claude-code-cli":
         from aee.runtimes.executor_cli import ClaudeCodeCliRunner
@@ -1703,6 +1929,7 @@ async def create_executor_run(
             telegram_result=telegram_result,
             runtime_identity=runtime_identity,
             error=result.error,
+            task_id=executor_task_id,
         )
         _persist_executor_run(envelope)
         return envelope
@@ -1746,6 +1973,7 @@ async def create_executor_run(
                 "skipped": "hermes submit failed; no notification sent",
             },
             runtime_identity=runtime_identity,
+            task_id=executor_task_id,
         )
         _persist_executor_run(envelope)
         return envelope
@@ -1766,6 +1994,7 @@ async def create_executor_run(
             "skipped": "hermes is async; per-run telegram not sent on submit",
         },
         runtime_identity=runtime_identity,
+        task_id=executor_task_id,
     )
     _persist_executor_run(envelope)
     return envelope
