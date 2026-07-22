@@ -668,4 +668,53 @@ __all__ = [
     "get_heartbeat_interval_seconds",
     "LIFECYCLE_STEPS",
     "update_heartbeat",
+    # P2.1 background completion sync (TASK-AEE-P2-BRIDGE-HERMES-COMPLETION-SYNC).
+    "list_non_terminal_runs",
 ]
+
+
+# ---------------------------------------------------------------------------
+# P2.1 background completion sync (TASK-AEE-P2-BRIDGE-HERMES-COMPLETION-SYNC).
+# ---------------------------------------------------------------------------
+# Read-only listing of non-terminal executor_runs rows, used by the
+# background ExecutorRunWatcher to find Hermes-dispatched runs that are
+# still in-flight so the watcher can poll the upstream adapter once per
+# tick. The query is bounded (limit) and read-only (single SELECT).
+
+_NON_TERMINAL_STATUSES = frozenset({
+    "queued", "started", "running",
+})
+
+
+def list_non_terminal_runs(
+    conn: sqlite3.Connection,
+    *,
+    selected_executor: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """Return non-terminal executor_runs rows (queued/started/running).
+
+    Read-only SELECT ordered newest-first by ``created_at``. The
+    ``selected_executor`` filter narrows the scan to a specific
+    executor (e.g. ``"hermes"``) so the watcher only polls the
+    adapter that owns the run. Returns canonical envelopes (same
+    shape as :func:`get_run`).
+    """
+    clauses: List[str] = []
+    params: List[Any] = []
+    placeholders = ",".join("?" * len(_NON_TERMINAL_STATUSES))
+    clauses.append(f"status IN ({placeholders})")
+    params.extend(sorted(_NON_TERMINAL_STATUSES))
+    if selected_executor:
+        clauses.append("selected_executor = ?")
+        params.append(selected_executor)
+    sql = "SELECT run_id FROM executor_runs WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        got = get_run(conn, r["run_id"])
+        if got is not None:
+            out.append(got)
+    return out

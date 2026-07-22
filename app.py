@@ -180,9 +180,21 @@ async def _lifespan(app: FastAPI):
     watcher = Watcher(tick_sec=WATCHER_TICK_SEC)
     await watcher.start()
     app.state.watcher = watcher
+    # P2.1 (TASK-AEE-P2-BRIDGE-HERMES-COMPLETION-SYNC): start the
+    # background executor-run watcher that polls the upstream
+    # adapter for non-terminal Hermes-dispatched runs and
+    # reconciles the durable executor_runs row when Hermes reports
+    # a terminal state. The existing dispatcher.Watcher only polls
+    # the ``tasks`` table; this watcher owns the ``executor_runs``
+    # namespace.
+    from dispatcher.executor_watcher import ExecutorRunWatcher
+    exec_watcher = ExecutorRunWatcher()
+    await exec_watcher.start()
+    app.state.executor_watcher = exec_watcher
     try:
         yield
     finally:
+        await exec_watcher.stop()
         await watcher.stop()
 
 
@@ -1246,31 +1258,34 @@ async def list_executors(
     }
 
 
-async def _maybe_reconcile_hermes_run(
+async def _reconcile_hermes_run_once(
     run_id: str,
     persisted: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Bounded reconciliation: poll upstream Hermes once for a non-terminal run.
 
-    Work-order TASK-AEE-HERMES-COMPLETION-SYNC.  Only Hermes-dispatched
-    runs (``selected_executor == "hermes"``) that are still in a
-    non-terminal state (``queued``/``running``/``started``) are
-    reconciled.  The function awaits ``adapter.poll(external_run_id)``
-    exactly once and, if the upstream reports a terminal state,
-    updates the durable ``executor_runs`` row in-place with the final
-    fields.  Any error (adapter unavailable, upstream 404, transient
-    HTTP error, non-terminal upstream report) is swallowed — the
-    stale in-flight envelope is returned unchanged so callers can
-    keep polling.  Idempotent: a row that is already terminal is
-    returned as-is without any upstream call.
+    Shared core used by BOTH the GET-triggered reconciliation path
+    (``_maybe_reconcile_hermes_run``) and the background
+    ``ExecutorRunWatcher`` (TASK-AEE-P2-BRIDGE-HERMES-COMPLETION-SYNC).
+    Only Hermes-dispatched runs (``selected_executor == "hermes"``)
+    that are still in a non-terminal state
+    (``queued``/``running``/``started``) are reconciled.  The
+    function awaits ``adapter.poll(external_run_id)`` exactly once
+    and, if the upstream reports a terminal state, updates the
+    durable ``executor_runs`` row in-place with the final fields.
+    Any error (adapter unavailable, upstream 404, transient HTTP
+    error, non-terminal upstream report) is swallowed — the stale
+    in-flight envelope is returned unchanged so callers can keep
+    polling.  Idempotent: a row that is already terminal is returned
+    as-is without any upstream call.
 
     Returns the (possibly updated) envelope dict.  Never raises.
 
     Safety:
       * No executor launch — only a read-only GET on Hermes 8642.
       * No mutation of unrelated rows.
-      * Bounded — exactly one upstream call per GET, and only when
-        the row is non-terminal + Hermes-dispatched.
+      * Bounded — exactly one upstream call per invocation, and only
+        when the row is non-terminal + Hermes-dispatched.
     """
     _TERMINAL = {"completed", "failed", "timeout", "cancelled"}
     try:
@@ -1343,6 +1358,22 @@ async def _maybe_reconcile_hermes_run(
         stdout_summary=_truncate_for_envelope(out_text),
         error=str(err_text)[:2000] if err_text else None,
     )
+
+
+async def _maybe_reconcile_hermes_run(
+    run_id: str,
+    persisted: Dict[str, Any],
+) -> Dict[str, Any]:
+    """GET-triggered bounded reconciliation wrapper.
+
+    Thin wrapper around :func:`_reconcile_hermes_run_once` preserving
+    the exact GET /runs/{run_id} contract established by commit
+    ``5eb83f6``. The background ``ExecutorRunWatcher`` (P2.1) calls
+    the shared core directly; this wrapper exists so the GET path's
+    call site and the existing ``tests/test_completion_sync.py``
+    suite continue to work byte-for-byte unchanged.
+    """
+    return await _reconcile_hermes_run_once(run_id, persisted)
 
 
 def _truncate_for_envelope(text: Any, cap: int = 2000) -> str:
