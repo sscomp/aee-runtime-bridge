@@ -1959,9 +1959,104 @@ async def get_run_summary(
     run_id: str,
     authorization: Optional[str] = Header(None),
 ) -> Dict[str, Any]:
-    """Bridge-curated summary, friendly to ChatGPT."""
+    """Bridge-curated summary, friendly to ChatGPT.
+
+    Work-order TASK-AEE-P2-RUN-RETRIEVAL-API-RESTORE: this endpoint
+    is a STRICT PURE READ. It MUST NOT launch a new executor run,
+    MUST NOT call the upstream Hermes adapter merely to inspect an
+    existing persisted run, and MUST NOT mutate any state.
+
+    Lookup order (mirrors ``GET /runs/{run_id}`` so the two
+    endpoints agree on what "an existing run" means):
+      1. ``executor_runs`` table (populated by POST /runs/executor
+         for both claude-code-cli and hermes executors) — the
+         canonical store for any run dispatched via the executor
+         surface. The persisted envelope already carries
+         routing/runtime/artifact/git/telegram evidence.
+      2. ``tasks`` table via ``find_by_hermes_run_id`` (legacy
+         dispatcher-backed runs that pre-date the executor store).
+      3. Deterministic JSON 404 envelope when neither source has
+         the run_id. The previous implementation fell through to
+         ``adapter.poll(run_id)`` here, which launched an upstream
+         Hermes call on every unknown id — that was the
+         regression this restore fixes (commit f85804e left the
+         summary endpoint on the pre-rewrite fall-through path
+         while the full ``GET /runs/{run_id}`` was rewritten to
+         be pure-read).
+    """
     require_auth(authorization)
 
+    # Malformed run_id — deterministic 400 (same gate as the full
+    # GET /runs/{run_id} route so both endpoints agree).
+    if _malformed_run_id(run_id):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "malformed_run_id",
+                "message": (
+                    f"run_id {run_id!r} is not a valid run identifier; "
+                    f"expected a non-empty token of printable, non-slash chars"
+                ),
+            },
+        )
+
+    from dispatcher.db import get_conn
+    from dispatcher.executor_runs import get_run as _get_executor_run
+
+    # 1) executor_runs table — the canonical source for any
+    # POST /runs/executor dispatch (claude-code-cli or hermes).
+    try:
+        conn = get_conn()
+        persisted = _get_executor_run(conn, run_id)
+    except Exception:  # pragma: no cover - defensive
+        persisted = None
+    if persisted is not None:
+        status = persisted.get("status") or "unknown"
+        # The persisted stdout_summary is the bounded executor
+        # transcript; the tasks-table output_text is the
+        # dispatcher's record of the agent's final message. Both
+        # are persisted evidence — never re-derived by polling.
+        output = persisted.get("stdout_summary") or ""
+        if status in {"completed", "failed", "timeout", "cancelled"}:
+            hint = "Task ended. Read `output` and decide next step."
+        elif status == "running":
+            hint = "Task is still running. Poll again in a few seconds."
+        else:
+            hint = f"Task is in state: {status}. Re-check shortly."
+        preview = output
+        if isinstance(output, str) and len(output) > 2000:
+            preview = output[:2000] + f"... [truncated, full length={len(output)}]"
+        return {
+            "run_id": run_id,
+            "task_id": persisted.get("task_id"),
+            "requested_executor": persisted.get("requested_executor"),
+            "selected_executor": persisted.get("selected_executor"),
+            "status": status,
+            "progress": persisted.get("progress"),
+            "exit_code": persisted.get("exit_code"),
+            "timeout_state": persisted.get("timeout_state"),
+            "cancel_state": persisted.get("cancel_state"),
+            "phase": persisted.get("phase"),
+            "current_step": persisted.get("current_step"),
+            "last_heartbeat_at": persisted.get("last_heartbeat_at"),
+            "created_at": persisted.get("created_at"),
+            "updated_at": persisted.get("updated_at"),
+            "completed_at": persisted.get("completed_at"),
+            "last_event": None,
+            "output_preview": preview,
+            "artifact_paths": persisted.get("artifact_paths") or [],
+            "artifact_count": len(persisted.get("artifact_paths") or []),
+            "error": persisted.get("error"),
+            "is_terminal": status in {
+                "completed", "failed", "timeout", "cancelled",
+            },
+            "source": "executor_runs",
+            "current_hint": hint,
+        }
+
+    # 2) Dispatcher task table (legacy POST /runs runs that did not
+    # go through POST /runs/executor). Preserve the pre-rewrite
+    # behaviour for these: return the dispatcher's curated view.
     manager = TaskManager()
     task = manager.find_by_hermes_run_id(run_id)
     if task is not None:
@@ -1988,39 +2083,32 @@ async def get_run_summary(
             "last_event": None,
             "output_preview": preview,
             "error": task.error_message,
+            "is_terminal": task.status in {
+                "completed", "failed", "cancelled",
+            },
+            "source": "dispatcher_tasks",
             "current_hint": hint,
         }
 
-    # Fall through to upstream via the runtime adapter.
-    from aee.core.registry import adapter_registry
-    from aee.adapters.base import RuntimeError as AdapterRuntimeError
-    try:
-        adapter = adapter_registry.get("hermes")
-        poll_result = await adapter.poll(run_id)
-    except AdapterRuntimeError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Upstream Hermes error: {type(exc).__name__}: {exc}",
-        ) from exc
-    status = poll_result.status or "unknown"
-    output = poll_result.output
-    last_event = (poll_result.raw or {}).get("last_event") if isinstance(poll_result.raw, dict) else None
-    if status in {"completed", "failed", "cancelled"}:
-        hint = "Task ended. Read `output` and decide next step."
-    elif status == "running":
-        hint = "Task is still running. Poll again in a few seconds."
-    else:
-        hint = f"Task is in state: {status}. Re-check shortly."
-    preview = output
-    if isinstance(output, str) and len(output) > 2000:
-        preview = output[:2000] + f"... [truncated, full length={len(output)}]"
-    return {
-        "run_id": run_id,
-        "status": status,
-        "last_event": last_event,
-        "output_preview": preview,
-        "current_hint": hint,
-    }
+    # 3) No persisted record. Deterministic 404 — do NOT call the
+    # upstream Hermes adapter (that would launch a network call
+    # and could 502 on a stale run_id, which the work-order
+    # explicitly forbids: "No new run creation, no agent
+    # execution, no Telegram, no service-side mutation"). The
+    # previous implementation fell through to ``adapter.poll``
+    # here; this restore removes that fall-through so the summary
+    # endpoint is pure-read for unknown ids, matching the full
+    # GET /runs/{run_id} contract.
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "code": "unknown_run_id",
+            "message": (
+                f"run_id {run_id!r} not found in executor_runs or tasks"
+            ),
+            "run_id": run_id,
+        },
+    )
 
 
 @app.post("/runs/{run_id}/stop")
