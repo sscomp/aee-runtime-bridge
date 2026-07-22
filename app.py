@@ -750,11 +750,21 @@ async def list_runs_endpoint(
     # GET /runs/{run_id} also adds so list consumers do not have to
     # re-derive them.
     terminal_statuses = {"completed", "failed", "timeout", "cancelled"}
+    # P1 observability: derive the canonical observability envelope
+    # for each row from persisted evidence only. ``derive_observability``
+    # is a pure function over the row dict — it does not poll
+    # executors, launch work, or mutate state. GET /runs remains a
+    # pure read (work-order §3).
+    from dispatcher.observability import derive_observability
     items: List[Dict[str, Any]] = []
     for row in rows:
         env = dict(row)
         env.setdefault("source", "executor_runs")
         env["is_terminal"] = env.get("status") in terminal_statuses
+        # Merge the observability fields into the envelope. The
+        # canonical run fields (run_id, status, progress, etc.) are
+        # preserved; observability fields are added alongside.
+        env.update(derive_observability(env))
         items.append(env)
 
     return {
@@ -1771,6 +1781,15 @@ async def get_run(
         envelope["is_terminal"] = envelope.get("status") in {
             "completed", "failed", "timeout", "cancelled",
         }
+        # P1 observability: derive the canonical observability
+        # envelope from the **persisted post-reconciliation** row
+        # (work-order §4). The reconciliation above may have updated
+        # the row in-place with the final state; observability fields
+        # are computed from whatever the persisted row now says, so
+        # they reflect the post-reconciliation truth — never a
+        # pre-reconciliation guess.
+        from dispatcher.observability import derive_observability
+        envelope.update(derive_observability(envelope))
         return envelope
 
     # 2) Dispatcher task table (legacy POST /runs runs that did not
@@ -1780,7 +1799,7 @@ async def get_run(
     task = manager.find_by_hermes_run_id(run_id)
     if task is not None:
         out = manager.get_output(task.task_id) or {}
-        return {
+        envelope = {
             "run_id": run_id,
             "task_id": task.task_id,
             "status": task.status,
@@ -1798,6 +1817,31 @@ async def get_run(
                 "completed", "failed", "cancelled",
             },
         }
+        # P1 observability for the dispatcher-tasks fallback. The
+        # ``tasks`` table does not carry an explicit ``updated_at``
+        # column; we fall back to the most recent timestamp we have
+        # on the row — ``finished_at`` for terminal runs,
+        # ``started_at`` for non-terminal runs — so the stall policy
+        # can produce a deterministic, non-fabricated outcome. When
+        # neither is present the policy returns ``missing_timestamp``
+        # (stalled=False). ``heartbeat_at`` (AEE-1 column) maps to
+        # ``last_heartbeat_at``. ``current_step`` maps to
+        # ``progress_step``. ``stdout_tail`` is derived from the
+        # persisted ``output_text`` (the dispatcher's record of the
+        # agent's final message) — never by scanning the repo.
+        from dispatcher.observability import derive_observability
+        obs_source = {
+            "status": task.status,
+            "updated_at": task.finished_at or task.started_at,
+            "started_at": task.started_at,
+            "finished_at": task.finished_at,
+            "duration_sec": task.duration_sec,
+            "last_heartbeat_at": task.heartbeat_at,
+            "current_step": task.progress_step,
+            "output_text": out.get("output_text"),
+        }
+        envelope.update(derive_observability(obs_source))
+        return envelope
 
     # 3) No persisted record. Deterministic 404 — do NOT call the
     # upstream Hermes adapter (that would launch a network call

@@ -296,6 +296,11 @@ components:
         ``GET /runs``. Mirrors the canonical envelope returned by
         ``GET /runs/{run_id}`` with the ``source`` and ``is_terminal``
         convenience tags included for list consumers.
+
+        P1 observability fields (TASK-AEE-RUN-OBSERVABILITY-P1) are
+        derived from persisted evidence only — never from a live
+        executor poll, never by scanning the repo. See
+        ``dispatcher/observability.py`` for the canonical contract.
       properties:
         run_id: { type: string }
         requested_executor: { type: string, nullable: true }
@@ -303,12 +308,98 @@ components:
         status: { type: string, enum: [queued, started, running, completed, failed, cancelled, timeout, unknown] }
         progress: { type: number, format: float, minimum: 0, maximum: 1 }
         created_at: { type: string, nullable: true, description: 'ISO-8601 UTC timestamp.' }
-        updated_at: { type: string, nullable: true, description: 'ISO-8601 UTC timestamp.' }
+        updated_at: { type: string, nullable: true, description: 'ISO-8601 UTC last-mutation timestamp; null on legacy rows.' }
         completed_at: { type: string, nullable: true, description: 'ISO-8601 UTC timestamp; null while running.' }
         is_terminal: { type: boolean, description: 'True when status is completed/failed/cancelled/timeout.' }
         source: { type: string, enum: [executor_runs, dispatcher_tasks], description: 'Which store served the row.' }
         artifact_paths: { type: array, items: { type: string } }
         error: { type: string, nullable: true }
+        # ---- P1 observability fields (TASK-AEE-RUN-OBSERVABILITY-P1) ----
+        # All fields below are derived from persisted row evidence
+        # only. They are present on every response (legacy rows
+        # degrade to null/None with a deterministic reason — see
+        # the per-field description).
+        last_heartbeat_at:
+          type: string
+          nullable: true
+          description: |
+            ISO-8601 UTC timestamp of the most recent executor
+            heartbeat. Null on legacy rows / pre-P1 dispatches.
+        current_step:
+          type: string
+          nullable: true
+          description: |
+            Short human-readable step label captured at the most
+            recent progress update (e.g. "running tests",
+            "committing"). Null on legacy rows.
+        phase:
+          type: string
+          enum: [queued, running, terminal, unknown]
+          description: |
+            Coarse phase derived from ``status`` so GPT callers can
+            bucket runs without re-implementing the terminal-status
+            check. ``unknown`` is the only non-fabricated answer
+            when ``status`` is missing or not in the vocabulary.
+        duration_seconds:
+          type: number
+          format: float
+          nullable: true
+          description: |
+            Wall-clock seconds from ``started_at`` to
+            ``finished_at`` when both are present. Null while the
+            run is in progress or when timestamps are missing —
+            this contract never fabricates a duration.
+        seconds_since_update:
+          type: integer
+          nullable: true
+          description: |
+            Integer seconds between now and ``updated_at``,
+            quantised to a non-negative int so two reads in the
+            same second return byte-for-byte identical values.
+            Null when ``updated_at`` is missing or unparseable
+            (the stall policy returns ``missing_timestamp`` in
+            that case, never a fabricated age).
+        stdout_tail:
+          type: string
+          nullable: true
+          description: |
+            Bounded tail slice (≤4096 UTF-8 bytes) of the persisted
+            ``stdout_summary`` (executor_runs) or ``output_text``
+            (dispatcher tasks fallback). Null when no output was
+            captured; empty string when output was empty (so
+            callers can distinguish "no output" from "empty
+            output"). Never derived by scanning repo files.
+        stderr_tail:
+          type: string
+          nullable: true
+          description: |
+            Bounded tail slice (≤4096 UTF-8 bytes) of the persisted
+            ``stderr_summary``. Same null/empty contract as
+            ``stdout_tail``.
+        stalled:
+          type: boolean
+          description: |
+            Deterministic stall flag. Terminal runs are NEVER
+            stalled. Non-terminal runs are stalled when
+            ``updated_at`` is older than the configured stall
+            threshold (default 600s; override via
+            ``RUN_STALL_THRESHOLD_SECONDS`` env var). Missing
+            timestamps produce ``stalled=false`` with reason
+            ``missing_timestamp`` — the contract never fabricates
+            an age.
+        stalled_reason:
+          type: string
+          nullable: true
+          enum: [terminal, recent_update, no_update, missing_timestamp]
+          description: |
+            Why ``stalled`` has its value. ``terminal`` for
+            terminal runs (never stalled). ``recent_update`` for
+            non-terminal runs with a fresh ``updated_at``.
+            ``no_update`` for non-terminal runs whose
+            ``updated_at`` is older than the threshold.
+            ``missing_timestamp`` for non-terminal runs with no
+            parseable ``updated_at`` (the policy does not
+            fabricate an age).
 
     RunListResponse:
       type: object

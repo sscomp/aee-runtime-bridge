@@ -79,6 +79,43 @@ CREATE INDEX IF NOT EXISTS idx_executor_runs_created_at ON executor_runs(created
 CREATE INDEX IF NOT EXISTS idx_executor_runs_selected ON executor_runs(selected_executor);
 """
 
+# ---------------------------------------------------------------------------
+# P1 run observability migration (TASK-AEE-RUN-OBSERVABILITY-P1).
+# ---------------------------------------------------------------------------
+# Three additive, NULLable columns on ``executor_runs`` so the
+# canonical observability envelope (``dispatcher.observability``) can
+# be derived from persisted evidence rather than fabricated:
+#
+#   * ``last_heartbeat_at`` — ISO-8601 timestamp of the most recent
+#     executor heartbeat. NULL on legacy rows / pre-P1 dispatches.
+#   * ``current_step``     — short human-readable step label captured
+#     at the most recent progress update (e.g. "running tests",
+#     "committing"). NULL on legacy rows.
+#   * ``phase``            — coarse phase marker captured at write
+#     time (queued|running|terminal). NULL on legacy rows; the read
+#     path falls back to ``derive_phase(status)`` when NULL.
+#
+# All three are NULLable and have NO DEFAULT — legacy rows keep NULL
+# and the observability read path treats NULL as "no evidence" (the
+# stall policy returns ``missing_timestamp`` rather than fabricating).
+# The migration uses the same idempotent ``pragma_table_info`` pattern
+# as AEE-1 / AEE-7.2 so re-running on a migrated DB is a no-op.
+_P1_OBSERVABILITY_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "last_heartbeat_at",
+        "ALTER TABLE executor_runs ADD COLUMN last_heartbeat_at TEXT",
+    ),
+    (
+        "current_step",
+        "ALTER TABLE executor_runs ADD COLUMN current_step TEXT",
+    ),
+    (
+        "phase",
+        "ALTER TABLE executor_runs ADD COLUMN phase TEXT",
+    ),
+]
+
+
 _init_lock = threading.Lock()
 _initialized = False
 
@@ -91,6 +128,21 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     modified.
     """
     conn.executescript(_SCHEMA)
+    # P1 observability columns (additive, idempotent, NULLable).
+    # Same pragma_table_info pattern as AEE-1 / AEE-7.2 in
+    # ``dispatcher.db``: re-running on a migrated DB is a no-op.
+    import sys
+    for col, stmt in _P1_OBSERVABILITY_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('executor_runs') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(
+                f"[executor_runs] P1 observability migration: added {col}",
+                file=sys.stderr,
+            )
     conn.commit()
 
 
@@ -138,11 +190,17 @@ def upsert_run(
     routing: Optional[Dict[str, Any]] = None,
     error: Optional[str] = None,
     completed_at: Optional[str] = None,
+    # P1 observability (TASK-AEE-RUN-OBSERVABILITY-P1). All optional,
+    # NULL on legacy rows. The read path derives the canonical
+    # observability envelope from these persisted values.
+    last_heartbeat_at: Optional[str] = None,
+    current_step: Optional[str] = None,
+    phase: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Idempotently insert or replace a run row.
 
     Returns the canonical envelope dict (the same shape
-    ``GET /runs/{run_id}`` returns) so the caller can persist +
+    ``GET /runs/{run_id}`` returns) so the caller can persist + 
     respond with one call site.
     """
     now = _now_iso()
@@ -168,6 +226,14 @@ def upsert_run(
         "created_at": now,
         "updated_at": now,
         "completed_at": completed_at,
+        # P1 observability — persisted on every upsert so the read
+        # path can derive the envelope from row data alone. NULL on
+        # legacy rows that pre-date the migration; the read path
+        # treats NULL as "no evidence" (the stall policy returns
+        # ``missing_timestamp`` rather than fabricating).
+        "last_heartbeat_at": last_heartbeat_at,
+        "current_step": current_step,
+        "phase": phase,
     }
 
     # Preserve created_at / completed_at on update so repeated
@@ -196,9 +262,10 @@ def upsert_run(
           artifact_paths_json, artifact_verification_json,
           git_evidence_json, telegram_result_json,
           runtime_identity_json, routing_json, error,
-          created_at, updated_at, completed_at
+          created_at, updated_at, completed_at,
+          last_heartbeat_at, current_step, phase
         ) VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         (
@@ -223,6 +290,9 @@ def upsert_run(
             envelope["created_at"],
             envelope["updated_at"],
             envelope["completed_at"],
+            envelope["last_heartbeat_at"],
+            envelope["current_step"],
+            envelope["phase"],
         ),
     )
     conn.commit()
@@ -269,6 +339,12 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> Optional[Dict[str, Any]]:
         "created_at": d["created_at"],
         "updated_at": d["updated_at"],
         "completed_at": d["completed_at"],
+        # P1 observability columns. Use ``.get()`` because legacy
+        # rows / pre-migration schemas do not have these columns;
+        # the read path treats NULL as "no evidence".
+        "last_heartbeat_at": d.get("last_heartbeat_at"),
+        "current_step": d.get("current_step"),
+        "phase": d.get("phase"),
     }
 
 

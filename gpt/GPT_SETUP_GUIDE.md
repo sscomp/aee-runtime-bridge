@@ -222,7 +222,7 @@ deterministic JSON 404; malformed `run_id` returns a deterministic JSON
 ### Example poll (claude-code-cli, completed run)
 
 ```bash
-curl -sS -H "Authorization: Bearer ${AEE_...EN}" \
+curl -sS -H "Authorization: Bearer ${AEE_BRIDGE_TOKEN}" \
   "${AEE_RUNTIME_BRIDGE_BASE_URL}/runs/claude-cli-2322a3f2af5e" | jq
 ```
 
@@ -242,14 +242,24 @@ Response shape (abbreviated):
   ],
   "created_at": "2026-07-22T10:00:00Z",
   "completed_at": "2026-07-22T10:00:05Z",
-  "source": "executor_runs"
+  "source": "executor_runs",
+  "updated_at": "2026-07-22T10:00:05Z",
+  "last_heartbeat_at": null,
+  "current_step": null,
+  "phase": "terminal",
+  "duration_seconds": 5.0,
+  "seconds_since_update": 7200,
+  "stdout_tail": "fake claude stdout ok",
+  "stderr_tail": null,
+  "stalled": false,
+  "stalled_reason": "terminal"
 }
 ```
 
 ### Example poll (hermes async, queued run)
 
 ```bash
-curl -sS -H "Authorization: Bearer ${AEE_...EN}" \
+curl -sS -H "Authorization: Bearer ${AEE_BRIDGE_TOKEN}" \
   "${AEE_RUNTIME_BRIDGE_BASE_URL}/runs/run_5f346ad4dd7c4f27beaefccec65c5175" | jq
 ```
 
@@ -262,9 +272,66 @@ curl -sS -H "Authorization: Bearer ${AEE_...EN}" \
   "is_terminal": false,
   "created_at": "2026-07-22T10:00:00Z",
   "completed_at": null,
-  "source": "executor_runs"
+  "source": "executor_runs",
+  "updated_at": "2026-07-22T10:00:00Z",
+  "last_heartbeat_at": null,
+  "current_step": null,
+  "phase": "queued",
+  "duration_seconds": null,
+  "seconds_since_update": 30,
+  "stdout_tail": null,
+  "stderr_tail": null,
+  "stalled": false,
+  "stalled_reason": "recent_update"
 }
 ```
+
+### P1 observability fields (TASK-AEE-RUN-OBSERVABILITY-P1)
+
+Every `GET /runs` and `GET /runs/{run_id}` response now carries the
+following persisted-evidence observability fields, derived from the
+durable row only — never from a live executor poll, never by
+scanning the repo:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `updated_at` | string\|null | ISO-8601 UTC last row-mutation timestamp; null on legacy rows. |
+| `last_heartbeat_at` | string\|null | ISO-8601 UTC timestamp of the most recent executor heartbeat; null on legacy rows. |
+| `current_step` | string\|null | Short human-readable step label (e.g. "running tests"); null on legacy rows. |
+| `phase` | string | Coarse phase derived from `status`: `queued`, `running`, `terminal`, or `unknown`. |
+| `duration_seconds` | number\|null | Wall-clock seconds from `started_at` to `finished_at` when both present; null while in progress. **Never fabricated.** |
+| `seconds_since_update` | integer\|null | Integer seconds since `updated_at` (quantised to a non-negative int so two reads in the same second are byte-identical). Null when `updated_at` is missing or unparseable. |
+| `stdout_tail` | string\|null | Bounded tail (≤4096 UTF-8 bytes) of the persisted stdout summary. Null when no output was captured; empty string when output was empty. |
+| `stderr_tail` | string\|null | Bounded tail (≤4096 UTF-8 bytes) of the persisted stderr summary. Same null/empty contract as `stdout_tail`. |
+| `stalled` | boolean | Deterministic stall flag. Terminal runs are NEVER stalled. Non-terminal runs are stalled when `updated_at` is older than the configured threshold. |
+| `stalled_reason` | string\|null | Why `stalled` has its value. One of: `terminal`, `recent_update`, `no_update`, `missing_timestamp`. |
+
+**Stall policy (deterministic, configurable):**
+
+  * Terminal runs (status in `completed`, `failed`, `timeout`, `cancelled`): `stalled=false`, reason `terminal`.
+  * Non-terminal + `updated_at` older than threshold (default 600s): `stalled=true`, reason `no_update`.
+  * Non-terminal + `updated_at` newer than threshold: `stalled=false`, reason `recent_update`.
+  * Non-terminal + missing/unparseable `updated_at`: `stalled=false`, reason `missing_timestamp` (the contract never fabricates an age).
+  * Threshold override: `RUN_STALL_THRESHOLD_SECONDS` env var (integer seconds; malformed or non-positive values fall back to the default).
+
+**No ETA.** There is no `eta_seconds` or `estimated_completion`
+field. A future P2 work order may add an evidence-backed rolling
+estimator; until then ETA is omitted rather than fabricated.
+
+**Updated GPT instruction text:**
+
+> After `aee_executor_run` returns a `run_id`, poll
+> `aee_get_run_status` with that `run_id` until
+> `is_terminal == true`. Report `status`, `exit_code`,
+> `artifact_paths`, and any `artifact_verification` entry where
+> `exists == false`. If `stalled == true` on a non-terminal run,
+> the run has had no progress update for longer than the stall
+> threshold — escalate to the operator instead of continuing to
+> poll. Do NOT call `aee_executor_run` again to "check on" a run
+> — that launches a new executor. Treat HTTP 400 as permanent
+> (malformed id) and HTTP 404 as permanent (unknown id); only
+> HTTP 200 with `is_terminal: false` AND `stalled: false` is a
+> reason to keep polling.
 
 ### Deterministic error envelopes
 
