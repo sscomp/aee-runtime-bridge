@@ -375,8 +375,21 @@ def test_full_retrieval_preserves_evidence_envelope(monkeypatch, tmp_path):
 # L. Legacy dispatcher-task rows remain readable via summary
 # ---------------------------------------------------------------------------
 def test_summary_legacy_dispatcher_task(monkeypatch, tmp_path):
-    """A run_id backed only by the tasks table (no executor_runs
-    row) is still readable via the summary endpoint."""
+    """A dispatcher task created via the legacy ``TaskManager`` lifecycle
+    (``create`` / ``start`` / ``complete`` — no ``POST /runs``) is still
+    readable via the summary endpoint.
+
+    Post the run/task mapping unification (commit 99d8d1c, Fix A+D), the
+    lifecycle ``complete`` writes a unified ``executor_runs`` row via
+    ``_sync_executor_runs_status`` (Fix D) so list/get/summary all resolve
+    via the same store. The summary endpoint therefore returns
+    ``source == "executor_runs"`` (the canonical store) — the task is
+    still readable; only the source label changed. The legacy
+    ``dispatcher_tasks``-only path is now reserved for runs that
+    pre-date both Fix A (POST /runs mapping) and Fix D (lifecycle sync),
+    i.e. rows that exist in ``tasks`` but were never mirrored into
+    ``executor_runs`` (covered by other union-fallback tests).
+    """
     from dispatcher import db as ddb
     from dispatcher import manager as dmgr
 
@@ -406,7 +419,10 @@ def test_summary_legacy_dispatcher_task(monkeypatch, tmp_path):
     assert body["run_id"] == "run_legacy_summary_001"
     assert body["status"] == "completed"
     assert body["is_terminal"] is True
-    assert body["source"] == "dispatcher_tasks"
+    # Fix D (commit 99d8d1c) writes a unified executor_runs row at
+    # ``complete`` time, so the summary endpoint resolves via the
+    # canonical executor_runs store and reports ``source == executor_runs``.
+    assert body["source"] == "executor_runs"
     assert body["task_id"] == t.task_id
 
 

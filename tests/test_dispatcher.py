@@ -246,12 +246,13 @@ class TestTaskLifecycle(unittest.TestCase):
     def test_log_file_written(self):
         # Per the module-level fixture above and the
         # ``TestTaskLifecycle.setUp`` reset, ``mgr.LOGS_DIR`` is
-        # guaranteed to point at ``bridge_root/logs`` for this
-        # test — even if a previous test module mutated it at
-        # import time. The contract: a freshly-created task has a
-        # non-empty per-task log file under ``logs/{task_id}.log``.
+        # guaranteed to point at ``_DEFAULT_LOGS_DIR`` (the tempdir
+        # ``logs``) for this test — even if a previous test module
+        # mutated it at import time. The contract: a freshly-created
+        # task has a non-empty per-task log file under
+        # ``_DEFAULT_LOGS_DIR / {task_id}.log``.
         t = self.m.create(title="t", type="normal", input_text="x")
-        log_path = _ROOT / "logs" / f"{t.task_id}.log"
+        log_path = _DEFAULT_LOGS_DIR / f"{t.task_id}.log"
         self.assertTrue(log_path.exists(), f"log not written: {log_path}")
         self.assertGreater(log_path.stat().st_size, 0)
 
@@ -259,7 +260,7 @@ class TestTaskLifecycle(unittest.TestCase):
         t = self.m.create(title="t", type="research", input_text="x")
         self.m.start(t.task_id, "hr")
         self.m.complete(t.task_id, output_text="result", raw={"k": "v"})
-        report_dir = _ROOT / "reports" / t.task_id
+        report_dir = _DEFAULT_REPORTS_DIR / t.task_id
         self.assertTrue(report_dir.exists())
         self.assertTrue((report_dir / "task.json").exists())
 
@@ -296,15 +297,15 @@ class TestManagerPathsOrderIndependence(unittest.TestCase):
     def test_log_file_lands_in_canonical_logs_dir_after_external_mutation(self):
         # Simulate the leak: another test module mutated the
         # module attribute at import time.
-        bogus = _ROOT / "logs" / "should_not_be_used_by_this_test"
+        bogus = _DEFAULT_LOGS_DIR / "should_not_be_used_by_this_test"
         _mgr.LOGS_DIR = bogus
-        _mgr.REPORTS_DIR = _ROOT / "reports_should_not_be_used_by_this_test"
+        _mgr.REPORTS_DIR = _DEFAULT_REPORTS_DIR / "should_not_be_used_by_this_test"
         try:
             # Mimic the setUp reset.
             _reset_manager_paths()
             mgr = TaskManager()
             t = mgr.create(title="t", type="normal", input_text="x")
-            log_path = _ROOT / "logs" / f"{t.task_id}.log"
+            log_path = _DEFAULT_LOGS_DIR / f"{t.task_id}.log"
             self.assertTrue(
                 log_path.exists(),
                 f"log not written to canonical path: {log_path}",
