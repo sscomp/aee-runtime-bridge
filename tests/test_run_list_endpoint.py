@@ -9,7 +9,8 @@ Covers the work-order's 10 required scenarios:
   5. executor filter
   6. since filter
   7. empty result
-  8. malformed inputs (invalid status, invalid since, out-of-range limit)
+  8. malformed inputs (invalid status, invalid since, out-of-range limit,
+     non-integer limit)
   9. auth required
  10. no executor/upstream side effects
 
@@ -205,17 +206,29 @@ def test_limit_bounds_default(monkeypatch, tmp_path):
 
 
 def test_limit_clamped_to_max(monkeypatch, tmp_path):
-    """limit=200 (above max=100) is rejected by FastAPI validation (422)."""
+    """limit=200 (above max=100) returns a structured HTTP 400."""
     client, _app, key = make_client(monkeypatch, tmp_path)
     resp = _list_runs(client, key, limit=200)
-    assert resp.status_code == 422
+    assert resp.status_code == 400
+    detail = resp.json().get("detail", {})
+    assert isinstance(detail, dict)
+    assert detail.get("code") == "invalid_limit"
+    assert "valid_range" in detail
+    assert detail["valid_range"] == {"min": 1, "max": 100}
+    assert "200" in detail.get("message", "")
 
 
 def test_limit_zero_rejected(monkeypatch, tmp_path):
-    """limit=0 (below min=1) is rejected by FastAPI validation (422)."""
+    """limit=0 (below min=1) returns a structured HTTP 400."""
     client, _app, key = make_client(monkeypatch, tmp_path)
     resp = _list_runs(client, key, limit=0)
-    assert resp.status_code == 422
+    assert resp.status_code == 400
+    detail = resp.json().get("detail", {})
+    assert isinstance(detail, dict)
+    assert detail.get("code") == "invalid_limit"
+    assert "valid_range" in detail
+    assert detail["valid_range"] == {"min": 1, "max": 100}
+    assert "0" in detail.get("message", "")
 
 
 def test_limit_one(monkeypatch, tmp_path):
@@ -382,10 +395,15 @@ def test_invalid_since_garbage_iso(monkeypatch, tmp_path):
 
 
 def test_limit_above_max_rejected(monkeypatch, tmp_path):
-    """limit=101 (above max=100) is rejected by FastAPI (422)."""
+    """limit=101 (above max=100) returns a structured HTTP 400."""
     client, _app, key = make_client(monkeypatch, tmp_path)
     resp = _list_runs(client, key, limit=101)
-    assert resp.status_code == 422
+    assert resp.status_code == 400
+    detail = resp.json().get("detail", {})
+    assert isinstance(detail, dict)
+    assert detail.get("code") == "invalid_limit"
+    assert detail["valid_range"] == {"min": 1, "max": 100}
+    assert "101" in detail.get("message", "")
 
 
 def test_limit_at_max_accepted(monkeypatch, tmp_path):
@@ -401,6 +419,48 @@ def test_limit_at_max_accepted(monkeypatch, tmp_path):
     body = resp.json()
     assert body["count"] == 100
     assert body["limit"] == 100
+
+
+def test_limit_negative_rejected(monkeypatch, tmp_path):
+    """limit=-5 (below min=1) returns a structured HTTP 400."""
+    client, _app, key = make_client(monkeypatch, tmp_path)
+    resp = _list_runs(client, key, limit=-5)
+    assert resp.status_code == 400
+    detail = resp.json().get("detail", {})
+    assert isinstance(detail, dict)
+    assert detail.get("code") == "invalid_limit"
+    assert detail["valid_range"] == {"min": 1, "max": 100}
+    assert "-5" in detail.get("message", "")
+
+
+def test_limit_non_integer_rejected_as_422(monkeypatch, tmp_path):
+    """Non-integer limit (e.g. 'abc') is rejected by FastAPI's request
+    parser as a 422 — a separate framework-level case, documented for
+    completeness. The bridge intentionally does not override this
+    because 'abc' cannot be coerced to int at the type layer; only
+    integer values reach the handler's range check (which returns 400).
+    """
+    client, _app, key = make_client(monkeypatch, tmp_path)
+    resp = client.get(
+        "/runs",
+        params={"limit": "abc"},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert resp.status_code == 422
+
+
+def test_limit_float_rejected_as_422(monkeypatch, tmp_path):
+    """Non-integer float limit (e.g. '2.5') is rejected by FastAPI's
+    request parser as a 422 — same framework-level parsing case as
+    'abc'. The contract reserves 400 for *integer* out-of-range values.
+    """
+    client, _app, key = make_client(monkeypatch, tmp_path)
+    resp = client.get(
+        "/runs",
+        params={"limit": "2.5"},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------

@@ -589,10 +589,24 @@ async def health() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+RUN_LIST_LIMIT_MIN = 1
+RUN_LIST_LIMIT_MAX = 100
+RUN_LIST_LIMIT_DEFAULT = 20
+
+
 @app.get("/runs")
 async def list_runs_endpoint(
     authorization: Optional[str] = Header(None),
-    limit: int = Query(20, ge=1, le=100, description="Maximum number of runs to return (1..100)."),
+    limit: int = Query(
+        RUN_LIST_LIMIT_DEFAULT,
+        description=(
+            "Maximum number of runs to return. Must be an integer in "
+            f"[{RUN_LIST_LIMIT_MIN}..{RUN_LIST_LIMIT_MAX}]. Out-of-range "
+            "values return a structured HTTP 400 with code "
+            "'invalid_limit'. Non-integer values are rejected by the "
+            "framework's JSON parser as a 422 (a separate case, see docs)."
+        ),
+    ),
     status: Optional[str] = Query(
         None,
         description="Filter by canonical run status. One of: queued, started, running, completed, failed, timeout, cancelled.",
@@ -619,7 +633,11 @@ async def list_runs_endpoint(
     have a stable order across calls.
 
     Query parameters:
-      * ``limit``    — integer, default 20, min 1, max 100.
+      * ``limit``    — integer, default 20, min 1, max 100. Out-of-range
+        values return a structured HTTP 400 with code ``invalid_limit``.
+        Non-integer values (e.g. ``?limit=abc``) are rejected by
+        FastAPI's JSON parser as a 422 — a separate case documented here
+        for completeness.
       * ``status``   — optional canonical status filter.
       * ``executor`` — optional selected_executor filter.
       * ``since``    — optional ISO-8601 timestamp filter on created_at.
@@ -634,11 +652,35 @@ async def list_runs_endpoint(
     ``GET /runs/{run_id}`` (without the ``source`` / ``is_terminal``
     convenience tags — those are added here for list consumers).
 
-    Invalid ``limit`` is rejected by FastAPI's ``Query(ge=1, le=100)``
-    with a 422. Invalid ``status`` or malformed ``since`` return a
+    Invalid ``limit`` (below 1 or above 100) returns a deterministic
+    HTTP 400 with a structured ``{code, message, valid_range}`` body.
+    Non-integer ``limit`` values are rejected by FastAPI's request
+    parser as a 422 (a separate framework-level case, documented
+    above). Invalid ``status`` or malformed ``since`` return a
     deterministic 400 with a structured ``{code, message}`` body.
     """
     require_auth(authorization)
+
+    # Validate ``limit`` against the contract range [1..100]. The
+    # ``Query`` declaration above intentionally omits ``ge``/``le`` so
+    # that an out-of-range integer reaches this handler and receives
+    # a deterministic 400 (with the structured envelope callers depend
+    # on) rather than FastAPI's generic 422 validation response.
+    if limit < RUN_LIST_LIMIT_MIN or limit > RUN_LIST_LIMIT_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_limit",
+                "message": (
+                    f"limit {limit} is out of range; expected an integer "
+                    f"in [{RUN_LIST_LIMIT_MIN}..{RUN_LIST_LIMIT_MAX}]"
+                ),
+                "valid_range": {
+                    "min": RUN_LIST_LIMIT_MIN,
+                    "max": RUN_LIST_LIMIT_MAX,
+                },
+            },
+        )
 
     # Validate ``status`` against the canonical vocabulary. An
     # unknown value is a deterministic 400 (not a silent empty list)
