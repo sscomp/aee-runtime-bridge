@@ -1354,6 +1354,16 @@ def _truncate_for_envelope(text: Any, cap: int = 2000) -> str:
     return s[:cap] + "...[truncated]"
 
 
+def _utc_now_iso() -> str:
+    """ISO-8601 UTC timestamp — shared helper for the P1.1 write path.
+
+    Centralised so the terminal reconciliation + the initial dispatch
+    use byte-identical timestamp formats.
+    """
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _persist_terminal_reconciliation(
     run_id: str,
     persisted: Dict[str, Any],
@@ -1369,6 +1379,13 @@ def _persist_terminal_reconciliation(
     new ``completed_at`` is stamped only if the row was not already
     terminal.  The envelope returned by ``upsert_run`` is the same
     shape as ``get_run``, so callers can return it directly.
+
+    P1.1 write-side activation (TASK-AEE-RUN-OBSERVABILITY-WRITE-ACTIVATION):
+    terminal reconciliation stamps the terminal phase + the truthful
+    final heartbeat + the lifecycle step matching the new status. The
+    step is validated by ``upsert_run``'s call site against
+    ``LIFECYCLE_STEPS``. The persisted row is now the single source
+    of truth for the observability read path.
     """
     try:
         from dispatcher.db import get_conn
@@ -1384,6 +1401,12 @@ def _persist_terminal_reconciliation(
         # by passing them through verbatim — upsert_run will re-encode
         # them.  ``completed_at`` is stamped by upsert_run when the
         # status is terminal.
+        # P1.1: terminal transition persists phase=terminal, the
+        # truthful final heartbeat (now), and the lifecycle step
+        # matching the new status (work-order §5). The step is in
+        # ``LIFECYCLE_STEPS`` (the terminal subset) by construction
+        # because ``status`` is one of {completed, failed, timeout,
+        # cancelled} which maps 1:1 to the terminal-step vocabulary.
         conn = get_conn()
         return upsert_run(
             conn,
@@ -1405,6 +1428,13 @@ def _persist_terminal_reconciliation(
             runtime_identity=envelope.get("runtime_identity"),
             routing=envelope.get("routing") or {},
             error=error if error is not None else envelope.get("error"),
+            # P1.1: terminal heartbeat + phase + step. The status
+            # itself is the truthful step (one of the canonical
+            # terminal steps); ``last_heartbeat_at`` is now because
+            # this is the terminal write; ``phase`` is ``"terminal"``.
+            last_heartbeat_at=_utc_now_iso(),
+            current_step=status,
+            phase="terminal",
         )
     except Exception as exc:  # pragma: no cover - defensive
         import sys
@@ -1435,10 +1465,34 @@ def _persist_executor_run(envelope: Dict[str, Any]) -> None:
     but if the DB is unavailable the response still carries the full
     evidence envelope; the caller can re-dispatch if needed. Errors
     are logged to stderr and swallowed.
+
+    P1.1 write-side activation (TASK-AEE-RUN-OBSERVABILITY-WRITE-ACTIVATION):
+    derives the truthful ``phase`` and ``current_step`` from the
+    envelope's ``status`` so the persisted row carries the canonical
+    observability fields from the very first write. Terminal
+    statuses stamp ``phase="terminal"`` + ``current_step=<status>``;
+    non-terminal statuses stamp ``phase="queued"`` / ``"running"``
+    (mirroring ``dispatcher.observability.derive_phase``) +
+    ``current_step="queued"`` / ``"running"``. The Claude CLI executor's
+    live poll loop (``ClaudeCodeCliRunner.run``) writes subsequent
+    heartbeats via ``update_heartbeat``; this initial persist is the
+    row-creation write.
     """
     try:
         from dispatcher.db import get_conn
         from dispatcher.executor_runs import upsert_run
+        # P1.1: derive the truthful phase + step from the envelope's
+        # status so the persisted row is a complete observability
+        # source from the first write. The terminal step matches the
+        # status 1:1 (work-order §6).
+        _status = envelope["status"]
+        _terminal = _status in {"completed", "failed", "timeout", "cancelled"}
+        _phase = "terminal" if _terminal else (
+            "queued" if _status in {"queued", "pending"} else "running"
+        )
+        _step = _status if _terminal else (
+            "queued" if _status in {"queued", "pending"} else "running"
+        )
         conn = get_conn()
         upsert_run(
             conn,
@@ -1460,6 +1514,15 @@ def _persist_executor_run(envelope: Dict[str, Any]) -> None:
             runtime_identity=envelope.get("runtime_identity"),
             routing=envelope.get("routing"),
             error=envelope.get("error"),
+            # P1.1: persist the canonical observability fields from
+            # the very first write so a GET immediately after the
+            # dispatch returns a complete envelope. The terminal
+            # heartbeat stamp is truthful: for terminal dispatches
+            # it is now; for non-terminal it is now (the live poll
+            # loop will advance it on subsequent iterations).
+            last_heartbeat_at=_utc_now_iso(),
+            current_step=_step,
+            phase=_phase,
         )
     except Exception as exc:  # pragma: no cover - defensive
         import sys

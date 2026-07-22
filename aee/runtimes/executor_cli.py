@@ -215,8 +215,71 @@ class ClaudeCodeCliRunner:
         grace = float(self._provider._cancel_grace_seconds) + 5.0
         hard_deadline = (time.time() + timeout_sec + grace) if timeout_sec else None
 
+        # P1.1 write-side activation: persist a heartbeat on every poll
+        # iteration whose wall-clock gap exceeds the configured cadence.
+        # The heartbeat writer is best-effort: a DB error is swallowed so
+        # it never breaks the dispatch. The writer skips terminal / missing
+        # rows (work-order §5). Heartbeats are emitted HERE — in the
+        # executor lifecycle loop — NEVER by GET /runs (work-order §4).
+        from dispatcher.db import get_conn as _get_heartbeat_conn
+        from dispatcher.executor_runs import (
+            LIFECYCLE_STEPS as _LIFECYCLE_STEPS,
+            get_heartbeat_interval_seconds as _get_hb_interval,
+            update_heartbeat as _update_hb,
+            upsert_run as _seed_run,
+        )
+        _hb_interval = _get_hb_interval()
+        _last_hb_ts = 0.0
+        _hb_phase = "running"
+
+        # P1.1: seed the executor_runs row BEFORE the poll loop so the
+        # live heartbeats below find an existing non-terminal row to
+        # update (work-order §1 — "wire executor lifecycle persistence
+        # so live runs update persisted observability fields"). The
+        # terminal write in ``_persist_executor_run`` (app.py) is the
+        # canonical completion path; this seed is the row-creation write
+        # for the live-run observation window. Best-effort: a DB error
+        # is swallowed so it never breaks the dispatch.
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            _seed_ts = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            _seed_conn = _get_heartbeat_conn()
+            _seed_run(
+                _seed_conn,
+                run_id=rid,
+                requested_executor=None,
+                selected_executor="claude-code-cli",
+                status=submit_res.status or "running",
+                progress=0.0,
+                last_heartbeat_at=_seed_ts,
+                current_step="starting",
+                phase=(
+                    "queued" if (submit_res.status or "") in {"queued", "pending"}
+                    else "running"
+                ),
+            )
+        except Exception:  # pragma: no cover - best-effort seed
+            pass
+
+        def _emit_heartbeat(step: str) -> None:
+            nonlocal _last_hb_ts
+            if step not in _LIFECYCLE_STEPS:
+                return  # defensive — caller should only pass canonical steps
+            now_ts = time.time()
+            if (now_ts - _last_hb_ts) < _hb_interval:
+                return  # cadence gate
+            _last_hb_ts = now_ts
+            try:
+                conn = _get_heartbeat_conn()
+                _update_hb(conn, run_id=rid, current_step=step, phase=_hb_phase)
+            except Exception:  # pragma: no cover - best-effort, never break run
+                pass
+
         last_status = submit_res.status
         cancel_state: Optional[str] = None
+        # Initial heartbeat: the run is now running (or queued if the
+        # provider reports PENDING on submit).
+        _emit_heartbeat("starting")
         while True:
             poll_res = await self._provider.poll(rid)
             last_status = poll_res.status
@@ -235,6 +298,10 @@ class ClaudeCodeCliRunner:
                 poll_res = await self._provider.poll(rid)
                 last_status = poll_res.status
                 break
+            # P1.1: emit a running heartbeat on every poll iteration,
+            # cadence-gated by ``_hb_interval``. The step is "running"
+            # (the executor is in the poll loop, no specific sub-phase).
+            _emit_heartbeat("running")
             await asyncio.sleep(0.1)
 
         # Read captured streams (read_stdout/read_stderr return BytesIO).

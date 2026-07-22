@@ -43,7 +43,9 @@ at module load time (avoids a circular import); it receives a
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -470,6 +472,189 @@ def init_executor_runs(conn: sqlite3.Connection) -> None:
             _initialized = True
 
 
+# ---------------------------------------------------------------------------
+# P1.1 write-side activation (TASK-AEE-RUN-OBSERVABILITY-WRITE-ACTIVATION).
+# ---------------------------------------------------------------------------
+# Heartbeat writer: persists live executor progress into the
+# ``executor_runs`` row WITHOUT going through GET /runs or
+# GET /runs/{run_id}. The write path is the executor lifecycle loop
+# (the poll loop in ``ClaudeCodeCliRunner.run`` and the Hermes async
+# reconciliation path); the read path remains pure.
+#
+# Design rules (work-order §3–§8):
+# 1. Heartbeats are emitted by the execution lifecycle / background
+#    supervisor, NEVER by GET /runs or GET /runs/{run_id}.
+# 2. A terminal row is never re-heartbeated. The writer checks the
+#    persisted status first and skips the UPDATE when the row is
+#    already terminal.
+# 3. The cadence is deterministic: a named constant
+#    (``DEFAULT_HEARTBEAT_INTERVAL_SECONDS``) overridable via the
+#    ``RUN_HEARTBEAT_INTERVAL_SECONDS`` environment variable. Read
+#    once per call (not cached at import time) so a runtime env change
+#    is honoured without a restart, mirroring the stall-threshold
+#    contract in ``dispatcher.observability``.
+# 4. ``current_step`` values are restricted to the canonical
+#    lifecycle vocabulary (``LIFECYCLE_STEPS``) — no model-internal
+#    / fabricated step labels.
+# 5. The writer is idempotent: calling it twice with the same
+#    arguments is safe; the second call simply re-stamps
+#    ``updated_at`` and ``last_heartbeat_at`` to the new now().
+
+# Deterministic heartbeat cadence. The default (5s) is small enough
+# that a 30s test run produces >= 2 heartbeat samples while the run
+# is non-terminal, and large enough to keep the DB write cost
+# negligible on long runs. Override via the env var for operators
+# who need a different cadence.
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5
+
+
+def get_heartbeat_interval_seconds() -> float:
+    """Return the configured heartbeat interval in seconds.
+
+    Reads ``RUN_HEARTBEAT_INTERVAL_SECONDS`` from the environment on
+    every call. A missing or malformed value falls back to
+    ``DEFAULT_HEARTBEAT_INTERVAL_SECONDS``. A malformed / non-positive
+    value also prints a warning to stderr — same contract as
+    ``dispatcher.observability.get_stall_threshold_seconds`` so
+    operators see their env var was ignored, but the write path
+    never raises.
+    """
+    raw = os.environ.get("RUN_HEARTBEAT_INTERVAL_SECONDS")
+    if raw is None:
+        return float(DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
+    try:
+        val = float(raw)
+    except (ValueError, TypeError):
+        print(
+            f"[executor_runs] RUN_HEARTBEAT_INTERVAL_SECONDS={raw!r} is "
+            f"not a number; falling back to "
+            f"{DEFAULT_HEARTBEAT_INTERVAL_SECONDS}s",
+            file=sys.stderr,
+        )
+        return float(DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
+    if val <= 0:
+        print(
+            f"[executor_runs] RUN_HEARTBEAT_INTERVAL_SECONDS={val} is "
+            f"non-positive; falling back to "
+            f"{DEFAULT_HEARTBEAT_INTERVAL_SECONDS}s",
+            file=sys.stderr,
+        )
+        return float(DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
+    return val
+
+
+# Canonical lifecycle step vocabulary (work-order §6). These are the
+# ONLY values ``update_heartbeat`` accepts for ``current_step``; any
+# other value is rejected so a caller cannot fabricate a
+# model-internal step. The terminal steps map 1:1 to the canonical
+# run statuses (``{completed, failed, timeout, cancelled}``).
+LIFECYCLE_STEPS = frozenset({
+    "queued",               # run accepted, executor not yet spawned
+    "starting",             # executor subprocess spawn in flight
+    "running",              # executor running, no specific sub-phase
+    "collecting_output",    # draining stdout / stderr post-exit
+    "verifying_artifacts",  # artifact verification in flight
+    "completed",            # terminal: success
+    "failed",               # terminal: non-zero exit / error
+    "timeout",              # terminal: deadline exceeded
+    "cancelled",            # terminal: cancel requested
+})
+
+# Terminal-step subset (mirrors _TERMINAL_STATUSES in observability).
+_TERMINAL_STEPS = frozenset({"completed", "failed", "timeout", "cancelled"})
+
+
+def update_heartbeat(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    current_step: str,
+    phase: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Persist a single heartbeat for a non-terminal executor run.
+
+    Updates the ``executor_runs`` row in-place:
+
+      * ``last_heartbeat_at`` = now (ISO-8601 UTC)
+      * ``current_step``       = ``current_step`` (validated against
+                                  ``LIFECYCLE_STEPS``)
+      * ``phase``              = ``phase`` (if given) — callers should
+                                  pass ``"queued"`` / ``"running"`` /
+                                  ``"terminal"`` from the canonical
+                                  phase vocabulary in
+                                  ``dispatcher.observability``
+      * ``updated_at``         = now
+
+    Safety contract (work-order §3–§8):
+
+      * **Terminal rows are never re-heartbeated.** If the persisted
+        status is in ``{completed, failed, timeout, cancelled}`` the
+        function returns ``None`` without writing — a terminal run
+        never receives further heartbeat updates. This is the
+        work-order §5 requirement.
+      * **GET /runs is a pure read.** This function is called ONLY by
+        the executor lifecycle / background supervisor, never by
+        the GET endpoints.
+      * **Step validation.** ``current_step`` MUST be in
+        ``LIFECYCLE_STEPS``; a fabricated / model-internal step is
+        rejected with ``ValueError`` so the caller cannot persist a
+        non-canonical label (work-order §6).
+      * **Missing row.** If the run_id is not in ``executor_runs``
+        the function returns ``None`` without writing — heartbeats
+        only apply to rows the dispatch path already created.
+
+    Returns the updated envelope (the same shape returned by
+    :func:`get_run`) when the row was updated, or ``None`` when the
+    row was skipped (terminal / missing / no-op). Never raises
+    except for the ``current_step`` validation contract.
+    """
+    if current_step not in LIFECYCLE_STEPS:
+        raise ValueError(
+            f"current_step={current_step!r} is not in the canonical "
+            f"LIFECYCLE_STEPS vocabulary; refusing to persist a "
+            f"fabricated / model-internal step label"
+        )
+
+    # Read the existing row first — never heartbeaten terminal rows.
+    existing = conn.execute(
+        "SELECT status FROM executor_runs WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if existing is None:
+        return None  # missing row — only the dispatch path creates rows
+    persisted_status = existing["status"]
+    if persisted_status in _TERMINAL_STEPS:
+        return None  # terminal — never re-heartbeat (work-order §5)
+
+    now = _now_iso()
+    conn.execute(
+        """
+        UPDATE executor_runs
+           SET last_heartbeat_at = ?,
+               current_step      = ?,
+               phase             = COALESCE(?, phase),
+               updated_at        = ?
+         WHERE run_id = ?
+        """,
+        (now, current_step, phase, now, run_id),
+    )
+    conn.commit()
+    return get_run(conn, run_id)
+
+
+def init_executor_runs(conn: sqlite3.Connection) -> None:
+    """Module-level init guard for ``ensure_schema``.
+
+    Kept for symmetry with ``dispatcher.db._init_schema``; callers
+    that already hold a connection can call ``ensure_schema`` directly.
+    """
+    global _initialized
+    with _init_lock:
+        if not _initialized:
+            ensure_schema(conn)
+            _initialized = True
+
+
 __all__ = [
     "ensure_schema",
     "upsert_run",
@@ -478,4 +663,9 @@ __all__ = [
     "list_runs",
     "init_executor_runs",
     "CANONICAL_RUN_STATUSES",
+    # P1.1 write-side activation (TASK-AEE-RUN-OBSERVABILITY-WRITE-ACTIVATION).
+    "DEFAULT_HEARTBEAT_INTERVAL_SECONDS",
+    "get_heartbeat_interval_seconds",
+    "LIFECYCLE_STEPS",
+    "update_heartbeat",
 ]
