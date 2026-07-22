@@ -25,20 +25,62 @@ Design notes
   :class:`ProviderError`; the caller surfaces it as a real
   ``status=failed`` envelope with the error text — never a Hermes
   substitute.
+
+Auth-bridge (TASK-AEE-CLAUDE-CODE-EXECUTOR-RECOVERY, 2026-07-22)
+----------------------------------------------------------------
+The AEE-7.1 ``claude_code_provider_shim.py`` proved that mirroring
+``ANTHROPIC_AUTH_TOKEN`` -> ``ANTHROPIC_API_KEY`` in the worker env
+is the minimal, correct fix for "Not logged in" exits on hosts where
+the only available credential is the auth-token env var (the
+Ollama-Cloud bearer). The shim applies the mirror for the
+orchestrator path; the executor path (``POST /runs/executor``) did
+NOT, because ``ClaudeCodeCliRunner.run()`` called
+``ClaudeCodeProvider.submit()`` without ``env=``, so
+``_filter_env(None)`` only forwarded ``_ALLOWED_ENV_VARS ∩ os.environ``
+— and when the parent env lacked ``ANTHROPIC_API_KEY`` the worker
+subprocess silently exited with ``Not logged in · Please run /login``
+and exit_code 1.
+
+The mirror is reproduced here (rather than imported from the shim)
+to keep the executor path dependency-light and to preserve the
+existing response envelope. The mirror is pure and never mutates
+``os.environ``; the resulting dict is re-filtered by
+``ClaudeCodeProvider._filter_env`` so unrelated keys are dropped.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from aee.adapters.claude_code_provider import ClaudeCodeProvider
 from aee.adapters.exec_provider import (
     ExecStatus,
     ProviderError,
 )
+
+
+def _build_claude_env_mirror(parent_env: "Mapping[str, str]") -> "Dict[str, str]":
+    """Return a copy of ``parent_env`` with the ANTHROPIC_API_KEY mirror applied.
+
+    Mirrors ``ANTHROPIC_AUTH_TOKEN`` -> ``ANTHROPIC_API_KEY`` only when
+    the latter is unset, so Claude CLI 2.1.216's env-based auth code
+    path can read a credential even on hosts that only expose the
+    Ollama-Cloud bearer token under ``ANTHROPIC_AUTH_TOKEN``. Pure:
+    never mutates the input mapping. See the AEE-7.1 case study in
+    ``aee/orchestrator/claude_code_provider_shim.py`` for the canonical
+    implementation this reproduces.
+    """
+    out: Dict[str, str] = dict(parent_env)
+    if "ANTHROPIC_API_KEY" in out:
+        return out
+    token = out.get("ANTHROPIC_AUTH_TOKEN")
+    if token:
+        out["ANTHROPIC_API_KEY"] = token
+    return out
 
 
 # Map ExecStatus -> (envelope status, timeout_state, cancel_state).
@@ -137,10 +179,17 @@ class ClaudeCodeCliRunner:
     ) -> CliRunResult:
         """Submit the prompt and poll until terminal / cancelled / deadline."""
         rid = run_id or f"claude-cli-{uuid.uuid4().hex[:12]}"
+        # Auth-bridge: mirror ANTHROPIC_AUTH_TOKEN -> ANTHROPIC_API_KEY so
+        # the worker subprocess can authenticate even when the parent env
+        # only carries the Ollama-Cloud bearer token. ``_filter_env`` then
+        # re-applies the allow-list, dropping unrelated keys. (Recovery
+        # TASK-AEE-CLAUDE-CODE-EXECUTOR-RECOVERY, 2026-07-22.)
+        mirrored_env = _build_claude_env_mirror(os.environ)
         try:
             submit_res = await self._provider.submit(
                 prompt=prompt,
                 cwd=cwd,
+                env=mirrored_env,
                 timeout_seconds=timeout_sec,
                 run_id=rid,
             )
