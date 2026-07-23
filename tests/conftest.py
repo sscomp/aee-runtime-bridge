@@ -34,12 +34,37 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 # Make the bridge root importable so the live_db_guard module
 # can be loaded by the hook below.
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+
+@pytest.fixture
+def tmp_db_dir(tmp_path: Path) -> Path:
+    """Per-test temp directory for a fresh ``dispatcher.db``.
+
+    Used by ``tests/test_migration_aee1.py::test_run_migrations_public_api_idempotent``
+    (added in commit fa98cbf) which rebinds ``dispatcher.db.DB_DIR`` /
+    ``DB_PATH`` to this directory and restores the production paths in a
+    ``finally`` block. The fixture only provides an empty directory; the
+    test is responsible for creating the DB file via
+    ``db.run_migrations()``.
+
+    Why this lives in conftest.py: the test was added in fa98cbf with a
+    parameter named ``tmp_db_dir`` but no corresponding fixture was
+    defined in the repo (verified via ``git grep "def tmp_db_dir"
+    $(git rev-list --all)`` -> empty). The error
+    "fixture 'tmp_db_dir' not found" has been present since the test's
+    introduction. This fixture closes the gap with the smallest possible
+    repository change: one fixture in the existing conftest, delegating
+    to pytest's built-in ``tmp_path`` for proper lifecycle/cleanup.
+    """
+    return tmp_path
 
 
 def _load_guard():
