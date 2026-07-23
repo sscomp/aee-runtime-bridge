@@ -2243,16 +2243,22 @@ def _merge_task_evidence_into_envelope(
     if evidence is None:
         return envelope
 
-    # The merge only fires when the task side carries real *artifacts*
-    # (not just output_text). A lifecycle-sync stub whose task has only
-    # ``output_text`` (e.g. ``manager.complete(output_text="legacy done")``
-    # in ``test_summary_legacy_dispatcher_task``) is the legitimate
-    # lifecycle-sync contract (Fix D, commit 99d8d1c) and must keep
-    # ``source == "executor_runs"``. The historical runs that motivated
-    # this work-order all carry 2 artifacts each in ``delivery_json`` /
-    # ``artifacts``; requiring artifacts here distinguishes the two
-    # cases without modifying the out-of-allowlist regression test.
-    if not evidence.get("artifact_paths"):
+    # The merge fires when the task side carries ANY real evidence —
+    # either a non-empty ``output_text`` OR at least one artifact
+    # (work-order WO-FIX-OUTPUT-ONLY-HERMES-EVIDENCE-003 §6 "REQUIRED
+    # BEHAVIOR": merge when ``task_outputs.output_text`` is non-empty
+    # OR artifacts exist). A lifecycle-sync stub whose task has NEITHER
+    # output_text NOR artifacts is the legitimate empty-task contract
+    # (``_collect_task_evidence`` returns ``None`` for it, so the
+    # ``evidence is None`` guard above already returns the envelope
+    # unchanged); this second gate only rules out the residual case
+    # where ``_collect_task_evidence`` returned non-None on the
+    # strength of a ``telegram_result`` alone (no output, no
+    # artifacts) — a notification row is not task evidence and must
+    # not flip ``source`` to the merge marker.
+    has_output = bool((evidence.get("output_text") or "").strip())
+    has_artifacts = bool(evidence.get("artifact_paths"))
+    if not (has_output or has_artifacts):
         return envelope
 
     merged = dict(envelope)

@@ -377,18 +377,24 @@ def test_full_retrieval_preserves_evidence_envelope(monkeypatch, tmp_path):
 def test_summary_legacy_dispatcher_task(monkeypatch, tmp_path):
     """A dispatcher task created via the legacy ``TaskManager`` lifecycle
     (``create`` / ``start`` / ``complete`` — no ``POST /runs``) is still
-    readable via the summary endpoint.
+    readable via the summary endpoint, and — because ``complete()`` was
+    called with non-empty ``output_text`` — its output is surfaced via
+    the evidence merge.
 
     Post the run/task mapping unification (commit 99d8d1c, Fix A+D), the
     lifecycle ``complete`` writes a unified ``executor_runs`` row via
-    ``_sync_executor_runs_status`` (Fix D) so list/get/summary all resolve
-    via the same store. The summary endpoint therefore returns
-    ``source == "executor_runs"`` (the canonical store) — the task is
-    still readable; only the source label changed. The legacy
-    ``dispatcher_tasks``-only path is now reserved for runs that
-    pre-date both Fix A (POST /runs mapping) and Fix D (lifecycle sync),
-    i.e. rows that exist in ``tasks`` but were never mirrored into
-    ``executor_runs`` (covered by other union-fallback tests).
+    ``_sync_executor_runs_status`` (Fix D) with empty evidence fields
+    and a linked ``task_id``. The task's ``output_text`` ("legacy done")
+    lives in ``task_outputs``. Under the corrected API contract
+    (WO-FIX-OUTPUT-ONLY-HERMES-EVIDENCE-003 §6) that is an output-only
+    task: ``output_text`` is non-empty, artifacts are empty, so the
+    merge fires and the summary reports
+    ``source == "executor_runs+tasks_merge"`` with ``output_preview``
+    carrying the task output. The legacy ``dispatcher_tasks``-only path
+    is reserved for runs that pre-date both Fix A (POST /runs mapping)
+    and Fix D (lifecycle sync), i.e. rows that exist in ``tasks`` but
+    were never mirrored into ``executor_runs`` (covered by other
+    union-fallback tests).
     """
     from dispatcher import db as ddb
     from dispatcher import manager as dmgr
@@ -420,10 +426,18 @@ def test_summary_legacy_dispatcher_task(monkeypatch, tmp_path):
     assert body["status"] == "completed"
     assert body["is_terminal"] is True
     # Fix D (commit 99d8d1c) writes a unified executor_runs row at
-    # ``complete`` time, so the summary endpoint resolves via the
-    # canonical executor_runs store and reports ``source == executor_runs``.
-    assert body["source"] == "executor_runs"
+    # ``complete`` time with empty evidence + linked task_id; the
+    # task's output_text ("legacy done") triggers the §6 output-only
+    # merge, so the summary resolves via the canonical executor_runs
+    # store AND surfaces the merged task output.
+    assert body["source"] == "executor_runs+tasks_merge", (
+        f"legacy output-only task not merged (source={body['source']!r})"
+    )
     assert body["task_id"] == t.task_id
+    assert "legacy done" in body["output_preview"], (
+        f"output_preview missing task output: {body['output_preview']!r}"
+    )
+    assert body["artifact_count"] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -991,12 +991,15 @@ class TestHermesStubEvidenceMerge:
         assert data["source"] == "executor_runs"
         assert data["artifact_paths"] == []
 
-    def test_lifecycle_sync_output_only_not_merged(self, monkeypatch, tmp_path):
-        """A lifecycle-sync stub whose task has output_text but NO
-        artifacts is the legitimate Fix D contract — source stays
-        ``executor_runs`` (regression guard for
-        ``test_summary_legacy_dispatcher_task`` which lives in a
-        non-allowlisted file)."""
+    def test_lifecycle_sync_output_only_is_merged(self, monkeypatch, tmp_path):
+        """Case A (WO-FIX-OUTPUT-ONLY-HERMES-EVIDENCE-003 §9): a
+        lifecycle-sync stub whose task carries ``output_text`` but NO
+        artifacts is MERGED — ``source`` becomes
+        ``executor_runs+tasks_merge`` and ``stdout_summary`` carries
+        the task output. This is the corrected API contract (§6): a
+        legitimate empty task — no ``output_text`` AND no artifacts —
+        is the ONLY case that stays unmerged (covered by
+        ``test_empty_stub_with_no_task_evidence_not_merged``)."""
         client, app_module, key = make_client(monkeypatch, tmp_path)
         run_id = "run_merge_output_only_009"
         task_id = "TASK-MERGE-OUTPUT-ONLY-009"
@@ -1015,11 +1018,31 @@ class TestHermesStubEvidenceMerge:
         resp = client.get(f"/runs/{run_id}", headers=_auth_headers(key))
         assert resp.status_code == 200
         data = resp.json()
-        # No artifacts on task side → merge does NOT fire → source
-        # stays executor_runs (preserves the Fix D contract).
-        assert data["source"] == "executor_runs", (
-            f"output-only lifecycle-sync stub was merged (source="
-            f"{data['source']!r}); merge must require artifacts"
+        # Output-only → merge fires → source flipped, output surfaced,
+        # artifact_count stays 0 (no artifacts fabricated).
+        assert data["source"] == "executor_runs+tasks_merge", (
+            f"output-only stub was NOT merged (source="
+            f"{data['source']!r}); §6 requires merge when output_text "
+            f"is non-empty even with zero artifacts"
+        )
+        assert data["artifact_paths"] == []
+        assert "legacy done" in data["stdout_summary"], (
+            f"stdout_summary not populated from output_text: "
+            f"{data['stdout_summary']!r}"
+        )
+
+        # Summary endpoint must agree (Case A on /runs/{id}/summary).
+        resp2 = client.get(f"/runs/{run_id}/summary", headers=_auth_headers(key))
+        assert resp2.status_code == 200, f"{resp2.status_code}: {resp2.text}"
+        sdata = resp2.json()
+        assert sdata["status"] == "completed"
+        assert sdata["source"] == "executor_runs+tasks_merge"
+        assert sdata["artifact_count"] == 0, (
+            f"artifact_count={sdata['artifact_count']}, expected 0 "
+            f"(output-only must not fabricate artifacts)"
+        )
+        assert "legacy done" in sdata["output_preview"], (
+            f"output_preview not populated: {sdata['output_preview']!r}"
         )
 
     def test_canary_tasks_fallback_unchanged(self, monkeypatch, tmp_path):
