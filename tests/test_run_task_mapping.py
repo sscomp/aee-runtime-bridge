@@ -710,3 +710,382 @@ class TestRegression:
             )
         finally:
             _restore_adapters(saved)
+
+
+# ---------------------------------------------------------------------------
+# WO-FIX-API-SERIALIZATION-MERGE-HERMES-EVIDENCE
+# ---------------------------------------------------------------------------
+
+class TestHermesStubEvidenceMerge:
+    """A Hermes lifecycle-sync executor_runs stub with empty evidence
+    must be merged with task-side evidence so GET /runs/{id} and
+    /summary surface the real artifacts/output the run produced.
+
+    Regression safety (work-order §"REGRESSION SAFETY"):
+      * Fully populated claude-code-cli rows are NOT merged (detection
+        short-circuits on the first non-empty executor evidence field).
+      * Unknown run IDs still 404.
+      * Existing canary/tasks fallback behaviour unchanged.
+    """
+
+    def _seed_hermes_lifecycle_stub(self, db_path, *, run_id, task_id,
+                                    status="completed",
+                                    stdout_summary="",
+                                    artifact_paths=None,
+                                    git_evidence=None):
+        """Write a Hermes lifecycle-sync stub directly into executor_runs."""
+        from dispatcher import db as ddb
+        from dispatcher.executor_runs import upsert_run
+        # Ensure schema is initialised before we open a raw connection.
+        ddb.get_conn()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            upsert_run(
+                conn,
+                run_id=run_id,
+                requested_executor=None,
+                selected_executor="hermes",
+                task_id=task_id,
+                status=status,
+                stdout_summary=stdout_summary,
+                artifact_paths=artifact_paths or [],
+                git_evidence=git_evidence,
+            )
+        finally:
+            conn.close()
+
+    def _seed_task_evidence(self, db_path, *, task_id, output_text,
+                            delivery_paths=None, artifact_rows=None,
+                            notification=None):
+        """Seed dispatcher task + task_outputs + artifacts rows."""
+        from dispatcher import db as ddb
+        # Ensure schema is initialised before we open a raw connection.
+        ddb.get_conn()
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO tasks ("
+                "  task_id, title, type, status, progress_pct, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, "stub-evidence-merge", "ops", "completed",
+                 100, "2026-07-23T09:00:00Z"),
+            )
+            delivery_json = json.dumps(delivery_paths or [])
+            notification_json = json.dumps(notification) if notification else None
+            conn.execute(
+                "INSERT OR REPLACE INTO task_outputs ("
+                "  task_id, output_text, usage_json, raw_json,"
+                "  delivery_json, notification_json"
+                ") VALUES (?, ?, NULL, NULL, ?, ?)",
+                (task_id, output_text, delivery_json, notification_json),
+            )
+            for a in artifact_rows or []:
+                conn.execute(
+                    "INSERT OR REPLACE INTO artifacts ("
+                    "  artifact_id, task_id, path, kind, sha256,"
+                    "  size, mtime, file_exists, content_type,"
+                    "  classification_source, collected_at, version"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (a.get("artifact_id", f"art-{a['path'][-8:]}"),
+                     task_id, a["path"], a.get("kind", "artifact"),
+                     a.get("sha256"), a.get("size"), a.get("mtime"),
+                     1 if a.get("file_exists", True) else 0,
+                     a.get("content_type", "text/markdown"),
+                     a.get("classification_source", "auto"),
+                     a.get("collected_at", "2026-07-23T09:00:00Z"),
+                     a.get("version", 1)),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_get_run_merges_artifacts_from_tasks(self, monkeypatch, tmp_path):
+        """GET /runs/{id} merges artifact_paths/verification from tasks table."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        run_id = "run_merge_001"
+        task_id = "TASK-MERGE-001"
+        db = _db_path(monkeypatch)
+
+        self._seed_hermes_lifecycle_stub(
+            db, run_id=run_id, task_id=task_id, status="completed",
+            stdout_summary="", artifact_paths=[], git_evidence=None,
+        )
+        self._seed_task_evidence(
+            db, task_id=task_id, output_text="WO-1 完成。提交 SHA abc123",
+            delivery_paths=[
+                "/home/ubuntu/Abacus/AEE_WO1_REPORT.md",
+                "/home/ubuntu/Abacus/AEE_WO1_REPORT.md.sha256",
+            ],
+            artifact_rows=[
+                {"path": "/home/ubuntu/Abacus/AEE_WO1_REPORT.md",
+                 "sha256": "a" * 64, "size": 100, "mtime": "2026-07-23T09:00:00Z"},
+                {"path": "/home/ubuntu/Abacus/AEE_WO1_REPORT.md.sha256",
+                 "sha256": "b" * 64, "size": 65, "mtime": "2026-07-23T09:00:00Z"},
+            ],
+        )
+
+        resp = client.get(f"/runs/{run_id}", headers=_auth_headers(key))
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+        data = resp.json()
+        # Lifecycle fields preserved from executor_runs
+        assert data["status"] == "completed"
+        assert data["selected_executor"] == "hermes"
+        assert data["task_id"] == task_id
+        # Evidence merged from tasks side
+        assert data["source"] == "executor_runs+tasks_merge"
+        assert data["artifact_paths"] == [
+            "/home/ubuntu/Abacus/AEE_WO1_REPORT.md",
+            "/home/ubuntu/Abacus/AEE_WO1_REPORT.md.sha256",
+        ], f"artifact_paths not merged: {data['artifact_paths']}"
+        assert len(data["artifact_verification"]) == 2
+        assert data["stdout_summary"], (
+            f"stdout_summary empty after merge: {data['stdout_summary']!r}"
+        )
+        assert "WO-1 完成" in data["stdout_summary"]
+
+    def test_get_run_summary_merges_artifacts_from_tasks(self, monkeypatch, tmp_path):
+        """GET /runs/{id}/summary merges artifact_count/paths/output_preview."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        run_id = "run_merge_002"
+        task_id = "TASK-MERGE-002"
+        db = _db_path(monkeypatch)
+
+        self._seed_hermes_lifecycle_stub(
+            db, run_id=run_id, task_id=task_id, status="completed",
+            stdout_summary="", artifact_paths=[],
+        )
+        self._seed_task_evidence(
+            db, task_id=task_id,
+            output_text="Diagnostic complete. All artifacts verified.",
+            delivery_paths=[
+                "/home/ubuntu/Abacus/AEE_DIAG_REPORT.md",
+                "/home/ubuntu/Abacus/AEE_DIAG_REPORT.md.sha256",
+            ],
+            artifact_rows=[
+                {"path": "/home/ubuntu/Abacus/AEE_DIAG_REPORT.md",
+                 "sha256": "c" * 64, "size": 200},
+                {"path": "/home/ubuntu/Abacus/AEE_DIAG_REPORT.md.sha256",
+                 "sha256": "d" * 64, "size": 65},
+            ],
+        )
+
+        resp = client.get(f"/runs/{run_id}/summary", headers=_auth_headers(key))
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert data["status"] == "completed"
+        assert data["source"] == "executor_runs+tasks_merge"
+        assert data["artifact_count"] == 2, (
+            f"artifact_count={data['artifact_count']}, expected 2"
+        )
+        assert len(data["artifact_paths"]) == 2
+        assert data["output_preview"], (
+            f"output_preview empty after merge: {data['output_preview']!r}"
+        )
+        assert "Diagnostic complete" in data["output_preview"]
+
+    def test_fully_populated_claude_code_row_not_merged(self, monkeypatch, tmp_path):
+        """A claude-code-cli run with real artifact_paths is NOT merged."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        fake_bin = write_fake_claude(
+            tmp_path, stdout="cli ok output",
+            name="fake-claude-merge-noop",
+        )
+        set_fake_binary(monkeypatch, fake_bin)
+
+        resp = post_executor(client, key, {
+            "executor": "claude-code-cli",
+            "prompt": "merge noop test",
+            "timeout_sec": 30,
+            "repo_path": "/home/ubuntu/Abacus",
+        })
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+        run_id = resp.json()["run_id"]
+
+        resp2 = client.get(f"/runs/{run_id}", headers=_auth_headers(key))
+        assert resp2.status_code == 200
+        data = resp2.json()
+        # A fully populated claude-code-cli row must keep source=executor_runs
+        # (NOT executor_runs+tasks_merge) — detection short-circuits.
+        assert data["source"] == "executor_runs", (
+            f"fully populated claude-code-cli row was merged (source="
+            f"{data['source']!r}); merge must be a no-op when executor "
+            f"evidence is non-empty"
+        )
+
+    def test_unknown_run_id_still_404(self, monkeypatch, tmp_path):
+        """Unknown run_id still returns 404 (no merge, no upstream call)."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        resp = client.get(
+            "/runs/run_unknown_merge_test_xyz", headers=_auth_headers(key),
+        )
+        assert resp.status_code == 404
+
+    def test_empty_stub_with_no_task_evidence_not_merged(self, monkeypatch, tmp_path):
+        """An empty stub whose task has no evidence is returned as-is
+        (source stays executor_runs, no merge fires)."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        run_id = "run_merge_empty_005"
+        task_id = "TASK-MERGE-EMPTY-005"
+        db = _db_path(monkeypatch)
+
+        self._seed_hermes_lifecycle_stub(
+            db, run_id=run_id, task_id=task_id, status="completed",
+            stdout_summary="", artifact_paths=[],
+        )
+        # Seed the task row but with NO output_text, NO artifacts,
+        # NO delivery_json — _collect_task_evidence returns None.
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO tasks ("
+                "  task_id, title, type, status, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (task_id, "empty-evidence", "ops", "completed",
+                 "2026-07-23T09:00:00Z"),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO task_outputs ("
+                "  task_id, output_text, delivery_json, notification_json"
+                ") VALUES (?, ?, NULL, NULL)",
+                (task_id, "",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        resp = client.get(f"/runs/{run_id}", headers=_auth_headers(key))
+        assert resp.status_code == 200
+        data = resp.json()
+        # No evidence on either side → no merge, source stays executor_runs
+        assert data["source"] == "executor_runs"
+        assert data["artifact_paths"] == []
+
+    def test_stub_without_task_id_not_merged(self, monkeypatch, tmp_path):
+        """A stub with task_id=NULL cannot be merged (no linked task)."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        run_id = "run_merge_no_taskid_006"
+        db = _db_path(monkeypatch)
+
+        from dispatcher import db as ddb
+        from dispatcher.executor_runs import upsert_run
+        ddb.get_conn()  # ensure schema initialised
+        conn = sqlite3.connect(str(db))
+        try:
+            upsert_run(
+                conn,
+                run_id=run_id,
+                requested_executor=None,
+                selected_executor="hermes",
+                task_id=None,  # no linked task
+                status="completed",
+                stdout_summary="",
+                artifact_paths=[],
+            )
+        finally:
+            conn.close()
+
+        resp = client.get(f"/runs/{run_id}", headers=_auth_headers(key))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["source"] == "executor_runs"
+        assert data["artifact_paths"] == []
+
+    def test_lifecycle_sync_output_only_not_merged(self, monkeypatch, tmp_path):
+        """A lifecycle-sync stub whose task has output_text but NO
+        artifacts is the legitimate Fix D contract — source stays
+        ``executor_runs`` (regression guard for
+        ``test_summary_legacy_dispatcher_task`` which lives in a
+        non-allowlisted file)."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        run_id = "run_merge_output_only_009"
+        task_id = "TASK-MERGE-OUTPUT-ONLY-009"
+        db = _db_path(monkeypatch)
+
+        self._seed_hermes_lifecycle_stub(
+            db, run_id=run_id, task_id=task_id, status="completed",
+            stdout_summary="", artifact_paths=[],
+        )
+        # Task has output_text but NO artifacts, NO delivery_json paths.
+        self._seed_task_evidence(
+            db, task_id=task_id, output_text="legacy done",
+            delivery_paths=[], artifact_rows=[],
+        )
+
+        resp = client.get(f"/runs/{run_id}", headers=_auth_headers(key))
+        assert resp.status_code == 200
+        data = resp.json()
+        # No artifacts on task side → merge does NOT fire → source
+        # stays executor_runs (preserves the Fix D contract).
+        assert data["source"] == "executor_runs", (
+            f"output-only lifecycle-sync stub was merged (source="
+            f"{data['source']!r}); merge must require artifacts"
+        )
+
+    def test_canary_tasks_fallback_unchanged(self, monkeypatch, tmp_path):
+        """A run with NO executor_runs row still falls through to the
+        tasks-table fallback (source=dispatcher_tasks)."""
+        saved = _stub_hermes_adapter(run_id="run_merge_canary_007")
+        try:
+            client, app_module, key = make_client(monkeypatch, tmp_path)
+            resp = client.post(
+                "/runs",
+                json={
+                    "title": "canary-fallback",
+                    "input": "canary fallback test",
+                    "mode": "normal",
+                    "session_id": "test-merge-canary",
+                },
+                headers=_auth_headers(key),
+            )
+            run_id = resp.json()["run_id"]
+            # Delete the executor_runs row to force the tasks fallback
+            conn = sqlite3.connect(str(_db_path(monkeypatch)))
+            try:
+                conn.execute(
+                    "DELETE FROM executor_runs WHERE run_id = ?", (run_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            resp2 = client.get(f"/runs/{run_id}", headers=_auth_headers(key))
+            assert resp2.status_code == 200
+            data = resp2.json()
+            assert data["source"] == "dispatcher_tasks", (
+                f"canary fallback broken: source={data['source']!r}"
+            )
+        finally:
+            _restore_adapters(saved)
+
+    def test_merged_envelope_preserves_lifecycle_fields(self, monkeypatch, tmp_path):
+        """Merged envelope preserves status/exit_code/timestamps from
+        executor_runs; only evidence fields are merged in."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        run_id = "run_merge_lifecycle_008"
+        task_id = "TASK-MERGE-LIFECYCLE-008"
+        db = _db_path(monkeypatch)
+
+        self._seed_hermes_lifecycle_stub(
+            db, run_id=run_id, task_id=task_id, status="failed",
+            stdout_summary="", artifact_paths=[],
+        )
+        self._seed_task_evidence(
+            db, task_id=task_id, output_text="task failed but produced a report",
+            delivery_paths=["/home/ubuntu/Abacus/AEE_FAIL_REPORT.md"],
+            artifact_rows=[
+                {"path": "/home/ubuntu/Abacus/AEE_FAIL_REPORT.md",
+                 "sha256": "e" * 64, "size": 50},
+            ],
+        )
+
+        resp = client.get(f"/runs/{run_id}", headers=_auth_headers(key))
+        assert resp.status_code == 200
+        data = resp.json()
+        # Lifecycle fields preserved from executor_runs
+        assert data["status"] == "failed"
+        assert data["selected_executor"] == "hermes"
+        # Evidence merged from tasks
+        assert data["source"] == "executor_runs+tasks_merge"
+        assert data["artifact_paths"] == ["/home/ubuntu/Abacus/AEE_FAIL_REPORT.md"]
+        assert "task failed" in data["stdout_summary"]
