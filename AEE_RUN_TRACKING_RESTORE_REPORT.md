@@ -214,9 +214,10 @@ shape is unchanged (persistence is best-effort, post-response).
 ## Git Evidence
 
 - Pre-work HEAD: `bc75c94962a15aab2ea0e6038de53671f26b7b8c`
-- Commit SHA: (pending — will be filled after commit)
+- Commit SHA: `f85804e8d09b628ac04a7665b1efced1bc9d0a64`
 - Staging: explicit-path list (NOT `git add -A`)
 - Branch: `master`
+- Files in commit: 7 (4 modified + 3 new), +1505/-34 lines
 
 ## Artifact Verification
 
@@ -303,4 +304,19 @@ Commit message: `feat(runtime): restore run status tracking`
 
 ## Telegram
 
-Attempted. Result recorded below after the commit step.
+Attempted via `hermes send --to telegram:5132341473 --file AEE_RUN_TRACKING_RESTORE_REPORT.md`.
+
+Result:
+
+```json
+{
+  "success": true,
+  "platform": "telegram",
+  "chat_id": "5132341473",
+  "message_id": "7701",
+  "mirrored": true
+}
+```
+
+Telegram sent: message_id 7701, mirrored=true. Delivered to 鼎鼎
+(chat_id 5132341473).

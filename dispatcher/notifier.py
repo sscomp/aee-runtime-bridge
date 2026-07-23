@@ -15,22 +15,58 @@ fails or times out. Implementation notes:
 This is the second P2 item; the first (reaper) calls into this via
 `notify_timeout(task_id)`. We also expose `notify_failed(task_id)`
 and `notify_completed(task_id)` for completeness.
+
+AEE v3 Telegram Completion Enforcement Gate
+--------------------------------------------
+The v3 gate is the *working* path that ``TaskManager.complete()``
+calls to actually deliver a Telegram alert when a task finishes.
+The legacy ``notify_completed`` (above) is a silent fallback: it
+early-returns ``False`` when ``config/notify.json`` has
+``enabled=false`` or when ``completed`` is not in ``notify_on`` —
+both of which were the case before v3 (Gap A + Gap B).
+
+The v3 gate fixes both:
+
+* The primary path (``notify_completed_hermes_gateway``) shells out
+  to ``hermes send --to telegram:<chat_id> --subject ... --file ...
+  --json``. This is independent of the ``enabled`` flag because it
+  uses the Hermes CLI (a separate process with its own credentials
+  resolution), not the in-process urllib path.
+* ``config/notify.json`` is flipped to ``enabled=true`` and
+  ``notify_on`` now includes ``completed`` so the legacy fallback
+  (``notify_completed``) can fire too.
+
+The gate's result dict (``sent`` / ``method`` / ``recipient`` /
+``message_id`` / ``ts_utc`` / ``ts_taipei`` / ``attempts`` /
+``last_error``) is persisted into ``task_outputs.notification_json``
+by ``TaskManager.complete()`` and read back by
+``compute_completion_state`` to derive the 4-stage completion
+state. See ``dispatcher/notification_state.py`` for the stage model
+and ``dispatcher/manager.py:TaskManager.complete`` for the wire-up.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Deque, Dict, Optional
+from typing import Any, Deque, Dict, Optional
 
 log = logging.getLogger("dispatcher.notifier")
+
+# AEE v3 Telegram Completion Enforcement Gate — version pin. Bumped
+# when the gate's wire-up, return shape, or persistence contract
+# changes. Recorded in ``config/notify.json`` under
+# ``enforcement_gate.version`` for documentation / audit.
+ENFORCEMENT_GATE_VERSION = "v3.0.0"
 
 # ---------------------------------------------------------------------------
 # Rate limiting (sliding window, in-memory; reset on bridge restart)
@@ -58,6 +94,46 @@ def _append_local_log(line: str) -> None:
             f.write(line + "\n")
     except Exception:  # noqa: BLE001
         pass
+
+
+def _append_notification_audit(audit_record: Dict[str, Any]) -> None:
+    """AEE v3 Telegram auditability — append a JSONL audit record for
+    each notification attempt so the gate's outcome can be
+    independently verified after the fact.
+
+    The audit log is append-only JSONL at
+    ``<bridge_root>/logs/notification_audit.jsonl``. Each line is a
+    JSON object with at least:
+
+    * ``task_id``      — the dispatcher task id.
+    * ``sent``         — bool from the gate result.
+    * ``method``       — ``hermes_send`` / ``notifier.notify_completed`` / ``failed``.
+    * ``recipient``    — the chat id the alert was sent to.
+    * ``message_id``   — int|None — the Telegram message id (the
+                          canonical completion evidence under the v3
+                          contract).
+    * ``ts_utc``       — ISO-8601 UTC timestamp.
+    * ``ts_taipei``    — ISO-8601 Asia/Taipei timestamp.
+    * ``last_error``   — str|None — populated when ``sent`` is False.
+    * ``attempts``     — int — number of paths tried (1 or 2).
+
+    This function MUST NOT raise — it is on the gate's write path
+    and any exception would break the notification flow. Errors are
+    logged at WARNING level and swallowed.
+    """
+    try:
+        from dispatcher.manager import _BRIDGE_ROOT
+        log_dir = _BRIDGE_ROOT / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = log_dir / "notification_audit.jsonl"
+        line = json.dumps(audit_record, default=str, ensure_ascii=False)
+        with audit_path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as exc:  # noqa: BLE001 — never raise from the audit path
+        log.warning(
+            "notifier._append_notification_audit: failed to write audit record: %s: %s",
+            type(exc).__name__, exc,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -194,3 +270,381 @@ def notify_completed(task_id: str) -> bool:
 
 def notify_cancelled(task_id: str) -> bool:
     return _dispatch_status(task_id, "cancelled")
+
+
+# ---------------------------------------------------------------------------
+# AEE v3 Telegram Completion Enforcement Gate
+# ---------------------------------------------------------------------------
+#
+# The two functions below are the *working* notification path that
+# ``TaskManager.complete()`` calls. The legacy ``notify_completed``
+# (above) is the silent fallback — it early-returns ``False`` when
+# the config gate is closed. The v3 gate's primary path shells out
+# to the Hermes CLI (``hermes send``), which resolves its own
+# Telegram credentials independently of ``config/notify.json``.
+#
+# Both functions return a structured dict (NOT a bool) so the
+# dispatcher can persist the full outcome into
+# ``task_outputs.notification_json`` and so
+# ``compute_completion_state`` can derive the 4-stage completion
+# state from the persisted blob.
+
+
+def _now_iso_utc() -> str:
+    """ISO-8601 UTC timestamp with the trailing ``Z``."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _now_iso_taipei() -> str:
+    """ISO-8601 timestamp in Asia/Taipei (UTC+08:00)."""
+    return datetime.now(timezone(timedelta(hours=8))).isoformat()
+
+
+def notify_completed_hermes_gateway(
+    task_id: str,
+    *,
+    chat_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Send the completion alert via the Hermes Telegram Gateway.
+
+    Shells out to ``hermes send --to telegram:<chat_id> --subject
+    <subject> --file <tmpfile> --json`` with a 30s timeout. The
+    chat id defaults to the ``TELEGRAM_CHAT_ID`` env var when not
+    passed explicitly. The subject is
+    ``"AEE task completed: <task_id>"``; the body is the formatted
+    alert text from ``_format_alert(task_id, "completed")`` (or a
+    minimal ``"task <id> completed"`` string when the formatter
+    returns ``None`` — e.g. when the task row is missing).
+
+    Returns a dict with keys:
+
+    * ``sent``         — bool, True iff the gateway reported a
+                         confirmed send.
+    * ``method``       — ``"hermes_send"``.
+    * ``recipient``    — the chat id the alert was sent to.
+    * ``message_id``   — int|None — the Telegram message id
+                         returned by the gateway (None when the
+                         gateway did not return one, even on
+                         success).
+    * ``ts_utc``       — ISO-8601 UTC timestamp of the attempt.
+    * ``ts_taipei``    — ISO-8601 Asia/Taipei timestamp of the
+                         attempt.
+    * ``attempts``     — 1 (the v3 path tries once; the fallback
+                         is a separate call in
+                         ``notify_completed_with_fallback``).
+    * ``last_error``   — str|None — set when ``sent`` is False or
+                         when ``message_id`` is None.
+
+    Defensive: this function MUST NOT raise. Any
+    ``subprocess.CalledProcessError`` / ``TimeoutExpired`` /
+    ``JSONDecodeError`` / unexpected exception is caught and
+    returned as ``sent=False`` with ``last_error`` populated. The
+    temp file holding the body is always cleaned up (``finally``
+    block).
+    """
+    ts_utc = _now_iso_utc()
+    ts_taipei = _now_iso_taipei()
+    resolved_chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "").strip() or None
+    if not resolved_chat_id:
+        return {
+            "sent": False,
+            "method": "hermes_send",
+            "recipient": None,
+            "message_id": None,
+            "ts_utc": ts_utc,
+            "ts_taipei": ts_taipei,
+            "attempts": 1,
+            "last_error": "TELEGRAM_CHAT_ID not set and no chat_id passed",
+        }
+
+    subject = f"AEE task completed: {task_id}"
+    # Build the body. _format_alert returns None when the task
+    # row is missing (e.g. the task was deleted between complete()
+    # and the gate firing). Fall back to a minimal string so the
+    # gateway still has a body to send.
+    try:
+        body = _format_alert(task_id, "completed")
+    except Exception as exc:  # noqa: BLE001 — never raise from the formatter
+        body = None
+        log.warning(
+            "notifier.notify_completed_hermes_gateway: _format_alert raised task_id=%s err=%s",
+            task_id, exc,
+        )
+    if not body:
+        body = f"task {task_id} completed"
+
+    tmpfile = None
+    try:
+        # NamedTemporaryFile so the path is stable across the
+        # write + the subprocess call. delete=False so we can
+        # close it (Windows-safe) before the subprocess reads it;
+        # we clean up in the finally block.
+        fd, tmpfile = tempfile.mkstemp(
+            prefix=f"aee-v3-notif-{task_id}-",
+            suffix=".txt",
+            text=True,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+
+        proc = subprocess.run(
+            [
+                "hermes", "send",
+                "--to", f"telegram:{resolved_chat_id}",
+                "--subject", subject,
+                "--file", str(tmpfile),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            stderr_tail = (proc.stderr or "").strip()[:500]
+            return {
+                "sent": False,
+                "method": "hermes_send",
+                "recipient": resolved_chat_id,
+                "message_id": None,
+                "ts_utc": ts_utc,
+                "ts_taipei": ts_taipei,
+                "attempts": 1,
+                "last_error": (
+                    f"hermes send exit={proc.returncode}: {stderr_tail}"
+                ),
+            }
+        stdout = (proc.stdout or "").strip()
+        if not stdout:
+            return {
+                "sent": False,
+                "method": "hermes_send",
+                "recipient": resolved_chat_id,
+                "message_id": None,
+                "ts_utc": ts_utc,
+                "ts_taipei": ts_taipei,
+                "attempts": 1,
+                "last_error": "hermes send returned empty stdout",
+            }
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            return {
+                "sent": False,
+                "method": "hermes_send",
+                "recipient": resolved_chat_id,
+                "message_id": None,
+                "ts_utc": ts_utc,
+                "ts_taipei": ts_taipei,
+                "attempts": 1,
+                "last_error": f"hermes send stdout JSONDecodeError: {exc}",
+            }
+        # The Hermes CLI ``send --json`` contract returns a dict
+        # with at least ``ok`` (bool) and, on success, ``message_id``
+        # (int). Be defensive: accept either shape.
+        ok = bool(parsed.get("ok", parsed.get("sent", False)))
+        message_id = parsed.get("message_id")
+        if not ok:
+            return {
+                "sent": False,
+                "method": "hermes_send",
+                "recipient": resolved_chat_id,
+                "message_id": None,
+                "ts_utc": ts_utc,
+                "ts_taipei": ts_taipei,
+                "attempts": 1,
+                "last_error": (
+                    parsed.get("error")
+                    or parsed.get("last_error")
+                    or "hermes send returned ok=False"
+                ),
+            }
+        return {
+            "sent": True,
+            "method": "hermes_send",
+            "recipient": resolved_chat_id,
+            "message_id": message_id,
+            "ts_utc": ts_utc,
+            "ts_taipei": ts_taipei,
+            "attempts": 1,
+            "last_error": None,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "sent": False,
+            "method": "hermes_send",
+            "recipient": resolved_chat_id,
+            "message_id": None,
+            "ts_utc": ts_utc,
+            "ts_taipei": ts_taipei,
+            "attempts": 1,
+            "last_error": f"hermes send TimeoutExpired after 30s: {exc}",
+        }
+    except subprocess.CalledProcessError as exc:
+        return {
+            "sent": False,
+            "method": "hermes_send",
+            "recipient": resolved_chat_id,
+            "message_id": None,
+            "ts_utc": ts_utc,
+            "ts_taipei": ts_taipei,
+            "attempts": 1,
+            "last_error": f"hermes send CalledProcessError: {exc}",
+        }
+    except FileNotFoundError as exc:
+        # ``hermes`` binary not on PATH. Most common failure in
+        # environments without the Hermes CLI installed.
+        return {
+            "sent": False,
+            "method": "hermes_send",
+            "recipient": resolved_chat_id,
+            "message_id": None,
+            "ts_utc": ts_utc,
+            "ts_taipei": ts_taipei,
+            "attempts": 1,
+            "last_error": f"hermes binary not found: {exc}",
+        }
+    except Exception as exc:  # noqa: BLE001 — never raise from the gate
+        return {
+            "sent": False,
+            "method": "hermes_send",
+            "recipient": resolved_chat_id,
+            "message_id": None,
+            "ts_utc": ts_utc,
+            "ts_taipei": ts_taipei,
+            "attempts": 1,
+            "last_error": f"hermes_send unexpected {type(exc).__name__}: {exc}",
+        }
+    finally:
+        if tmpfile:
+            try:
+                os.unlink(tmpfile)
+            except OSError:
+                pass
+
+
+def notify_completed_with_fallback(
+    task_id: str,
+    *,
+    chat_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """AEE v3 gate — try the Hermes Telegram Gateway first, then
+    fall back to the legacy in-process notifier.
+
+    The primary path (``notify_completed_hermes_gateway``) is the
+    working path. If it returns ``sent=False``, the legacy
+    ``notify_completed`` (which uses the in-process urllib
+    Telegram client) is tried as a fallback so a missing Hermes
+    CLI binary or a gateway outage does not silently drop the
+    alert.
+
+    Returns a merged dict with the same key shape as
+    ``notify_completed_hermes_gateway``. ``method`` reflects
+    which path actually succeeded:
+
+    * ``"hermes_send"`` — the gateway path succeeded.
+    * ``"notifier.notify_completed"`` — the gateway failed and
+      the legacy fallback succeeded.
+    * ``"failed"`` — both paths failed; ``last_error`` is set to
+      a combined string.
+
+    The legacy ``notify_completed`` returns a bool (not a dict),
+    so this wrapper synthesises the dict shape for the fallback
+    branch: ``message_id`` is ``None`` (the legacy path does not
+    capture the Telegram message id), ``attempts`` is 2, and the
+    timestamps are stamped at the moment the fallback returned.
+    """
+    # Try the Hermes Telegram Gateway first.
+    result = notify_completed_hermes_gateway(task_id, chat_id=chat_id)
+    if result.get("sent") and result.get("message_id") is not None:
+        # AEE v3 auditability — record the confirmed-delivery outcome
+        # so the gate's evidence (message_id) can be independently
+        # verified from ``logs/notification_audit.jsonl`` without
+        # having to read the dispatcher DB.
+        _append_notification_audit({
+            "task_id": task_id,
+            "sent": True,
+            "method": result.get("method"),
+            "recipient": result.get("recipient"),
+            "message_id": result.get("message_id"),
+            "ts_utc": result.get("ts_utc"),
+            "ts_taipei": result.get("ts_taipei"),
+            "last_error": None,
+            "attempts": result.get("attempts", 1),
+        })
+        return result
+
+    # Gateway did not confirm a message_id — fall back to the
+    # legacy in-process notifier.
+    gateway_error = result.get("last_error")
+    try:
+        legacy_sent = notify_completed(task_id)
+    except Exception as exc:  # noqa: BLE001 — never raise from the gate
+        legacy_sent = False
+        legacy_error = f"notifier.notify_completed raised: {exc}"
+    else:
+        legacy_error = None if legacy_sent else "notifier.notify_completed returned False"
+
+    if legacy_sent:
+        # The legacy path does not capture message_id; stamp a
+        # fresh ts pair so the persisted blob reflects when the
+        # fallback actually fired.
+        legacy_result = {
+            "sent": True,
+            "method": "notifier.notify_completed",
+            "recipient": result.get("recipient"),
+            "message_id": None,
+            "ts_utc": _now_iso_utc(),
+            "ts_taipei": _now_iso_taipei(),
+            "attempts": 2,
+            "last_error": None,
+        }
+        # AEE v3 auditability — record the legacy-fallback outcome
+        # (message_id is None because the legacy path doesn't capture
+        # it; this is a known limitation, not a defect). The audit
+        # record lets the orchestrator distinguish "sent via legacy"
+        # from "sent via gateway" without parsing notification_json.
+        _append_notification_audit({
+            "task_id": task_id,
+            "sent": True,
+            "method": "notifier.notify_completed",
+            "recipient": legacy_result.get("recipient"),
+            "message_id": None,
+            "ts_utc": legacy_result.get("ts_utc"),
+            "ts_taipei": legacy_result.get("ts_taipei"),
+            "last_error": None,
+            "attempts": 2,
+        })
+        return legacy_result
+
+    # Both paths failed. Merge the errors so the operator can
+    # see why both were tried.
+    combined = []
+    if gateway_error:
+        combined.append(f"gateway: {gateway_error}")
+    if legacy_error:
+        combined.append(f"fallback: {legacy_error}")
+    failed_result = {
+        "sent": False,
+        "method": "failed",
+        "recipient": result.get("recipient"),
+        "message_id": None,
+        "ts_utc": result.get("ts_utc", _now_iso_utc()),
+        "ts_taipei": result.get("ts_taipei", _now_iso_taipei()),
+        "attempts": 2,
+        "last_error": "; ".join(combined) if combined else "both paths failed",
+    }
+    # AEE v3 auditability — record the both-paths-failed outcome so
+    # the orchestrator can grep the audit log for notification
+    # failures and correlate with NOTIFICATION_FAILED events.
+    _append_notification_audit({
+        "task_id": task_id,
+        "sent": False,
+        "method": "failed",
+        "recipient": failed_result.get("recipient"),
+        "message_id": None,
+        "ts_utc": failed_result.get("ts_utc"),
+        "ts_taipei": failed_result.get("ts_taipei"),
+        "last_error": failed_result.get("last_error"),
+        "attempts": 2,
+    })
+    return failed_result

@@ -46,7 +46,7 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from dotenv import load_dotenv
@@ -855,7 +855,6 @@ async def list_runs_endpoint(
     rows.sort(key=lambda r: (r.get("created_at") or "", r.get("run_id") or ""), reverse=True)
     rows = rows[:limit]
 
-
     # Augment each item with the convenience tags that
     # GET /runs/{run_id} also adds so list consumers do not have to
     # re-derive them.
@@ -1225,6 +1224,7 @@ async def create_run(
             (run_id, job.runtime_type, job.adapter_name, task_id),
         )
     manager.log(task_id, f"upstream run started, hermes_run_id={run_id}, adapter={adapter.name}")
+
     # ------------------------------------------------------------------
     # Task-Mapping work-order: persist a durable ``executor_runs``
     # mapping row for this Hermes-dispatched run so that the read
@@ -1252,6 +1252,7 @@ async def create_run(
             "profile": resolved_profile,
         },
     )
+
     return CreateRunResponse(
         run_id=run_id,
         status=submit_result.status or "started",
@@ -1672,8 +1673,6 @@ def _persist_hermes_run_mapping(
         )
 
 
-
-
 def _persist_executor_run(envelope: Dict[str, Any]) -> None:
     """Persist a POST /runs/executor response envelope to executor_runs.
 
@@ -1834,6 +1833,7 @@ async def create_executor_run(
         was_forced=False,
         reason=("default" if defaulted else "explicit_executor_opt_in"),
     )
+
     # ------------------------------------------------------------------
     # Task-Mapping work-order: create a dispatcher ``tasks`` row for
     # every executor run so that ``executor_runs.task_id`` is non-NULL
@@ -1914,6 +1914,7 @@ async def create_executor_run(
             run_id=result.run_id,
             status=result.status,
             routing=routing,
+            task_id=executor_task_id,
             progress=progress,
             artifact_paths=result.artifact_paths,
             stdout_summary=truncate_summary(
@@ -1930,7 +1931,6 @@ async def create_executor_run(
             telegram_result=telegram_result,
             runtime_identity=runtime_identity,
             error=result.error,
-            task_id=executor_task_id,
         )
         _persist_executor_run(envelope)
         return envelope
@@ -1968,13 +1968,13 @@ async def create_executor_run(
             run_id="hermes-submit-failed",
             status="failed",
             routing=routing,
+            task_id=executor_task_id,
             error=f"hermes submit error: {exc}",
             telegram_result={
                 "success": False,
                 "skipped": "hermes submit failed; no notification sent",
             },
             runtime_identity=runtime_identity,
-            task_id=executor_task_id,
         )
         _persist_executor_run(envelope)
         return envelope
@@ -1987,6 +1987,7 @@ async def create_executor_run(
         run_id=submit_result.external_run_id,
         status=submit_result.status or "queued",
         routing=routing,
+        task_id=executor_task_id,
         progress=0.0,
         artifact_paths=[],
         git_evidence=None,
@@ -1995,7 +1996,6 @@ async def create_executor_run(
             "skipped": "hermes is async; per-run telegram not sent on submit",
         },
         runtime_identity=runtime_identity,
-        task_id=executor_task_id,
     )
     _persist_executor_run(envelope)
     return envelope
@@ -2605,13 +2605,194 @@ async def get_run_summary(
     )
 
 
-@app.post("/runs/{run_id}/stop")
-async def stop_run(
+def _resolve_stop_adapter(
     run_id: str,
-    authorization: Optional[str] = Header(None),
+) -> Tuple[Optional[Any], Optional[Dict[str, Any]], Optional[str], bool]:
+    """Resolve the cancel target for a run without branching on caller.
+
+    The orchestrator must not need to know which executor is behind a
+    run after creation. This helper reads the persisted
+    ``executor_runs`` row (or the ``tasks`` table fallback for
+    legacy dispatcher-tracked runs) and returns the adapter to
+    delegate ``cancel`` to. The decision is purely read-side.
+
+    Returns ``(adapter, persisted_envelope, selected_executor, already_terminal)``:
+
+    * ``adapter`` — the registry adapter to call ``adapter.cancel(run_id)`` on.
+    * ``persisted_envelope`` — the ``executor_runs`` row dict, or ``None``
+      when the run is unknown or only present in the dispatcher tasks
+      table (legacy fallback). Used by the caller to surface the
+      canonical envelope fields (``status``/``routing``/etc.) in the
+      404 vs already-terminal vs cancel-ok branches.
+    * ``selected_executor`` — the persisted executor name
+      (``"claude-code-cli"`` / ``"hermes"``) or ``None`` when unknown.
+    * ``already_terminal`` — ``True`` if the persisted row is in a
+      terminal state (caller should short-circuit cancel and return a
+      deterministic envelope instead of issuing an upstream cancel
+      that would no-op anyway).
+
+    Never raises; returns ``(None, None, None, False)`` when no
+    persisted record can be found — the caller is responsible for
+    the 404.
+    """
+    from dispatcher.db import get_conn
+    from dispatcher.executor_runs import get_run as _get_executor_run
+
+    # 1) executor_runs — the canonical source for any
+    # POST /runs/executor dispatch (claude-code-cli or hermes).
+    try:
+        conn = get_conn()
+        persisted = _get_executor_run(conn, run_id)
+    except Exception:  # pragma: no cover - defensive
+        persisted = None
+    if persisted is not None:
+        selected = persisted.get("selected_executor") or "hermes"
+        status = persisted.get("status") or "unknown"
+        terminal = status in {"completed", "failed", "timeout", "cancelled"}
+        if terminal:
+            return None, persisted, selected, True
+        # Map the persisted executor to the registry adapter name.
+        # ``executor_runs`` stores the canonical ``selected_executor``
+        # (``"claude-code-cli"`` or ``"hermes"``); the registry uses
+        # the same keys (see ``aee.adapters.bootstrap_defaults``).
+        from aee.core.registry import adapter_registry
+
+        adapter = None
+        try:
+            adapter = adapter_registry.get(selected)
+        except Exception:
+            adapter = None
+        # Fallback: if the named adapter is not registered (e.g.
+        # tests stub only Hermes), the caller will get a deterministic
+        # 503 below. We never silently downgrade to Hermes.
+        return adapter, persisted, selected, False
+
+    # 2) Dispatcher tasks (legacy POST /runs runs). The task row
+    # carries the original ``adapter_name``; fall back to ``"hermes"``
+    # when the column is absent (pre-AEE-2 rows).
+    manager = TaskManager()
+    task = manager.find_by_hermes_run_id(run_id)
+    if task is not None:
+        status = task.status
+        terminal = status in {"completed", "failed", "cancelled"}
+        if terminal:
+            return None, None, None, True
+        # Read the adapter name from the task row when present;
+        # default to ``"hermes"`` for pre-AEE-2 rows.
+        selected = getattr(task, "adapter_name", None) or "hermes"
+        from aee.core.registry import adapter_registry
+
+        adapter = None
+        try:
+            adapter = adapter_registry.get(selected)
+        except Exception:
+            adapter = None
+        return adapter, None, selected, False
+
+    return None, None, None, False
+
+
+async def _stop_run_executor_neutral(
+    run_id: str,
 ) -> Dict[str, Any]:
-    require_auth(authorization)
-    # Mark dispatcher task cancelled (best-effort).
+    """Executor-neutral cancellation core.
+
+    Routes the cancel call to the adapter named in the persisted
+    ``selected_executor`` (Hermes or Claude Code CLI). The caller
+    never has to branch on which executor dispatched the run.
+
+    Semantics (work-order §3.2 / §E):
+      * Unknown run            -> deterministic 404 JSON
+      * Already-terminal run   -> 200 + ``cancelled: False`` envelope
+                                   (no upstream call)
+      * Hermes active run      -> delegate to Hermes adapter
+      * Claude Code active run -> delegate to Claude Code adapter
+      * Adapter missing        -> 503 ``executor_unavailable``
+      * Adapter raises         -> 502 with the underlying message
+
+    Also best-effort cancels the dispatcher task (legacy runs) so
+    the watcher's reconciliation can short-circuit on the next poll.
+    """
+    from aee.adapters.base import RuntimeError as AdapterRuntimeError
+
+    # Validate the run_id shape the same way the other /runs routes do
+    # so unknown / malformed ids return a deterministic 400 instead
+    # of falling through to a 404.
+    if _malformed_run_id(run_id):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "malformed_run_id",
+                "message": (
+                    f"run_id {run_id!r} is not a valid run identifier; "
+                    f"expected a non-empty token of printable, non-slash chars"
+                ),
+            },
+        )
+
+    adapter, persisted, selected_executor, already_terminal = _resolve_stop_adapter(run_id)
+
+    if persisted is None and selected_executor is None:
+        # Legacy dispatcher task — still mark the task row cancelled
+        # best-effort so the watcher short-circuits.
+        manager = TaskManager()
+        task = manager.find_by_hermes_run_id(run_id)
+        if task is not None and task.status in {"queued", "running", "waiting"}:
+            try:
+                manager.cancel(task.task_id)
+            except IllegalTransition:
+                pass
+        # No persisted executor_runs row and no dispatcher task row
+        # either — deterministic 404.
+        if task is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "unknown_run_id",
+                    "message": (
+                        f"run_id {run_id!r} not found in executor_runs or tasks"
+                    ),
+                    "run_id": run_id,
+                },
+            )
+
+    if already_terminal:
+        return {
+            "run_id": run_id,
+            "cancelled": False,
+            "status": (persisted or {}).get("status", "terminal"),
+            "selected_executor": selected_executor,
+            "source": (persisted or {}).get("source", "dispatcher_tasks"),
+            "already_terminal": True,
+        }
+
+    if adapter is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "executor_unavailable",
+                "message": (
+                    f"no adapter registered for selected_executor={selected_executor!r}; "
+                    f"the run was dispatched via this executor but the adapter "
+                    f"is not currently loaded"
+                ),
+                "selected_executor": selected_executor,
+            },
+        )
+
+    try:
+        cancel_result = await adapter.cancel(run_id)
+    except AdapterRuntimeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Upstream {selected_executor} error: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+
+    # Best-effort dispatcher task cancel for legacy /runs rows that
+    # happened to land in the executor_runs store too.
     manager = TaskManager()
     task = manager.find_by_hermes_run_id(run_id)
     if task is not None and task.status in {"queued", "running", "waiting"}:
@@ -2619,21 +2800,49 @@ async def stop_run(
             manager.cancel(task.task_id)
         except IllegalTransition:
             pass
-    from aee.core.registry import adapter_registry
-    from aee.adapters.base import RuntimeError as AdapterRuntimeError
-    try:
-        adapter = adapter_registry.get("hermes")
-        cancel_result = await adapter.cancel(run_id)
-    except AdapterRuntimeError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Upstream Hermes error: {type(exc).__name__}: {exc}",
-        ) from exc
+
     return {
         "run_id": run_id,
         "cancelled": cancel_result.cancelled,
         "status": cancel_result.reason or "stop_requested",
+        "selected_executor": selected_executor,
+        "source": (persisted or {}).get("source", "executor_runs"),
     }
+
+
+@app.post("/runs/{run_id}/stop")
+async def stop_run(
+    run_id: str,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    """Executor-neutral cancellation.
+
+    Routes the cancel call to the adapter named in the persisted
+    ``selected_executor`` (Hermes or Claude Code CLI). The caller
+    never has to branch on which executor dispatched the run.
+
+    See :func:`_stop_run_executor_neutral` for the full semantics
+    matrix (unknown run, already-terminal, Hermes active, Claude
+    Code active, adapter missing).
+    """
+    require_auth(authorization)
+    return await _stop_run_executor_neutral(run_id)
+
+
+@app.post("/runs/{run_id}/cancel")
+async def cancel_run(
+    run_id: str,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    """Alias of ``POST /runs/{run_id}/stop``.
+
+    The new contract surface prefers ``/cancel`` (semantic verb);
+    ``/stop`` is preserved verbatim for backward compatibility with
+    existing ChatGPT Action configurations and shell scripts.
+    Both endpoints route through the same executor-neutral core.
+    """
+    require_auth(authorization)
+    return await _stop_run_executor_neutral(run_id)
 
 
 # ---------------------------------------------------------------------------

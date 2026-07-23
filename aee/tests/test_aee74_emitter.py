@@ -77,18 +77,22 @@ class TestEventValidation(unittest.TestCase):
         evt = Event(kind="completed", source="test")
         self.assertEqual(evt.kind, "completed")
 
-    def test_all_seventeen_kinds_construct(self) -> None:
+    def test_all_twenty_six_kinds_construct(self) -> None:
         """Every SOT kind is a valid ``Event.kind``.
 
         The SOT count grew from 17 (slice 1) to 22 (slice
         3) when we added the 5 ORCHESTRATOR kinds.  AEE-7.4
         finalization grew it to 23 by adding CLAIMED to
-        LIFECYCLE.  This test pins the *current* count;
-        a future shrink or unplanned growth fails the
-        assertion.
+        LIFECYCLE.  AEE v3 Telegram Completion Enforcement
+        Gate grew it to 26 by adding
+        ``notification_pending`` /
+        ``notification_completed`` /
+        ``notification_failed`` to LIFECYCLE.  This test
+        pins the *current* count; a future shrink or
+        unplanned growth fails the assertion.
         """
         from aee.observability import EventKind as _EK
-        self.assertEqual(len(_EK.all()), 23)
+        self.assertEqual(len(_EK.all()), 26)
         for kind in _EK.all():
             Event(kind=kind, source="test")
 
@@ -635,12 +639,16 @@ class TestSOTIntegration(unittest.TestCase):
         Slice 3 grew the SOT from 17 → 22 by adding
         the ORCHESTRATOR category's 5 kinds.  AEE-7.4
         finalization grew it 22 → 23 by adding CLAIMED
-        to LIFECYCLE.  This test is the lock-step
-        assertion that the SOT and ``Event`` agree on
-        the inventory.
+        to LIFECYCLE.  AEE v3 Telegram Completion
+        Enforcement Gate grew it 23 → 26 by adding
+        ``notification_pending`` /
+        ``notification_completed`` /
+        ``notification_failed`` to LIFECYCLE.  This test
+        is the lock-step assertion that the SOT and
+        ``Event`` agree on the inventory.
         """
         from aee.observability import EventKind as _EK
-        self.assertEqual(len(_EK.all()), 23)
+        self.assertEqual(len(_EK.all()), 26)
         for kind in _EK.all():
             evt = Event(kind=kind, source="t")
             self.assertEqual(evt.kind, kind)
@@ -671,7 +679,11 @@ class TestSOTIntegration(unittest.TestCase):
             e.emit(Event(kind=kind, source="t"))
         lines = stream.getvalue().splitlines()
         # AEE-7.4 finalization: 22 → 23 (CLAIMED added to LIFECYCLE).
-        self.assertEqual(len(lines), 23)
+        # AEE v3 Telegram Completion Enforcement Gate:
+        # 23 → 26 (notification_pending /
+        # notification_completed / notification_failed added to
+        # LIFECYCLE).
+        self.assertEqual(len(lines), 26)
         for line, kind in zip(lines, _EK.all()):
             parsed = json.loads(line)
             self.assertEqual(parsed["kind"], kind)

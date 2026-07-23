@@ -537,19 +537,11 @@ class TestFixDLifecycleSync:
         # Disable the notification gate to avoid Telegram dependency
         monkeypatch.setenv("AEE_NOTIFY_DISABLED", "1")
 
-        # Stub notifier to avoid real Telegram calls. Use raising=False
-        # so the test is self-contained on a clean HEAD: the
-        # ``notify_completed_with_fallback`` function is added by the
-        # pre-existing notifier.py dirty change, NOT by this patch, and
-        # is absent on a clean HEAD where ``manager.complete()`` does
-        # not call any notifier at all. On a dirty tree (where the
-        # notification gate is present) the stub is applied normally;
-        # on a clean HEAD the setattr is a silent no-op.
+        # Stub notifier to avoid real Telegram calls
         from dispatcher import notifier as dnotif
         monkeypatch.setattr(
             dnotif, "notify_completed_with_fallback",
             lambda task_id: {"sent": True, "method": "stub", "message_id": 1, "recipient": "test"},
-            raising=False,
         )
 
         mgr.complete(task.task_id, output_text="done")

@@ -428,11 +428,103 @@ sha256sum /home/ubuntu/hermes-runtime-bridge/AEE_RUN_OBSERVABILITY_P1_REPORT.md
 
 ## 19. Telegram
 
-Telegram notification will be attempted via `hermes send` after the
-commit lands. The actual result (success / message_id / error) will
-be appended here.
+Telegram notification attempted via `hermes send` after the commit landed.
+
+**Result:**
+
+```json
+{
+  "success": true,
+  "platform": "telegram",
+  "chat_id": "5132341473",
+  "message_id": "7748",
+  "mirrored": true
+}
+```
+
+- **success:** true
+- **chat_id:** 5132341473 (鼎鼎)
+- **message_id:** 7748 (verifiable evidence — fetchable on Telegram)
+- **mirrored:** true
 
 ---
 
-_Appendix: artifact verification + git evidence will be appended
-after the atomic commit is created._
+## 20. Artifact Verification (post-commit)
+
+```
+$ ls -la AEE_RUN_OBSERVABILITY_P1_REPORT.md
+-rw-rw-r-- 1 ubuntu ubuntu 20589 Jul 22 05:58 AEE_RUN_OBSERVABILITY_P1_REPORT.md
+
+$ wc -c AEE_RUN_OBSERVABILITY_P1_REPORT.md
+20589 AEE_RUN_OBSERVABILITY_P1_REPORT.md
+
+$ wc -l AEE_RUN_OBSERVABILITY_P1_REPORT.md
+438 AEE_RUN_OBSERVABILITY_P1_REPORT.md
+
+$ sha256sum AEE_RUN_OBSERVABILITY_P1_REPORT.md
+80a8aa46aee3a28e200d702fb2fc4518794dae908a9ede311562b67bd4acc566  AEE_RUN_OBSERVABILITY_P1_REPORT.md
+```
+
+## 21. Git Evidence (post-commit)
+
+- **Branch:** `master`
+- **Baseline HEAD:** `2f6396c fix(runtime): restore Claude Code executor reliability`
+- **Final HEAD:** `303d93761d6b6ff9a8043d8aaceb13b3dac50e73`
+- **Commit message:** `feat(runtime): add persisted run observability fields`
+
+### `git show --stat`
+
+```
+commit 303d93761d6b6ff9a8043d8aaceb13b3dac50e73
+Author: Hermes M2 <M2@hermes.local>
+Date:   Wed Jul 22 05:58:29 2026 +0000
+
+    feat(runtime): add persisted run observability fields
+
+ AEE_RUN_OBSERVABILITY_P1_REPORT.md | 438 ++++++++++++++++++++++
+ app.py                             |  46 ++-
+ dispatcher/executor_runs.py        |  82 +++-
+ dispatcher/observability.py        | 432 ++++++++++++++++++++++
+ gpt/GPT_SETUP_GUIDE.md             |  75 ++-
+ openapi.yaml                       |  93 +++-
+ tests/test_run_observability.py    | 735 +++++++++++++++++++++++++++++++++++++
+ 7 files changed, 1892 insertions(+), 9 deletions(-)
+```
+
+### `git show --name-status`
+
+```
+A	AEE_RUN_OBSERVABILITY_P1_REPORT.md
+M	app.py
+M	dispatcher/executor_runs.py
+A	dispatcher/observability.py
+M	gpt/GPT_SETUP_GUIDE.md
+M	openapi.yaml
+A	tests/test_run_observability.py
+```
+
+### `git status` (post-commit)
+
+Only pre-existing unrelated modifications / untracked files from
+prior work remain in the working tree (AEE-7.4 observability emitter,
+AEE-7.7d/7.8 work, AEE-9.5 Docker profiles, executor router
+manifest-gate work, K3 work, GPT e2e activation, etc.). All P1
+observability work was committed in the single atomic commit
+`303d937`. No P1 file remains unstaged.
+
+### Staging discipline verification
+
+  * Staging used explicit path list (`git add <path1> <path2> ...`).
+  * **No `git add .` or `git add -A`** was used at any point.
+  * The 7 staged files are EXACTLY the P1 deliverable set — 3 new
+    (`A`), 4 modified (`M`). No unrelated file was staged.
+
+## 22. Commit-Ready Final Statement
+
+The atomic commit `303d937 feat(runtime): add persisted run
+observability fields` ships the full P1 contract: persisted
+observability fields (3 new NULLable columns), pure-read `GET /runs`,
+deterministic stall policy, 43 focused tests, OpenAPI + GPT docs, no
+ETA fabrication, stdlib-only, no new dependencies, no existing
+column modified, no canonical field removed. No push, deploy,
+restart, merge, rebase, stash, delete, move, or stage-all.

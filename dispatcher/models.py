@@ -146,10 +146,24 @@ LEGAL_TRANSITIONS: Dict[str, List[str]] = {
     "queued":    ["running", "cancelled", "failed", "timeout"],
     "running":   ["waiting", "completed", "failed", "cancelled", "timeout"],
     "waiting":   ["running", "cancelled", "failed", "timeout"],
-    "completed": [],
+    "completed": [],  # terminal in observability-only mode
     "failed":    ["queued"],   # retry path
     "cancelled": [],
     "timeout":   ["queued"],   # retry path
+}
+
+# AEE v3 blocking gate — internal revert path. When
+# ``enforcement_gate.blocking == true`` and the notification gate fails
+# (sent=False OR message_id is None), the manager reverts a just-completed
+# task back to "running" so the orchestrator can retry the notification or
+# escalate. This transition is NOT in ``LEGAL_TRANSITIONS`` because
+# ``completed`` is terminal for the public state machine; the manager
+# performs the revert via a direct SQL UPDATE guarded by the blocking flag
+# (see ``dispatcher/manager.py:TaskManager.complete``). Exposing this in
+# ``LEGAL_TRANSITIONS`` would let external callers revert completed tasks,
+# breaking the terminal-status contract.
+BLOCKING_GATE_REVERT_TRANSITION: Dict[str, List[str]] = {
+    "completed": ["running"],  # internal-only, blocking-gate revert
 }
 
 

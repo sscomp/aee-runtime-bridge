@@ -107,26 +107,38 @@ class TestEventKindShape(unittest.TestCase):
     the rename before the orchestrator's filter code
     misroutes at runtime."""
 
-    def test_all_has_seventeen_kinds(self) -> None:
-        """23 canonical event kinds (14 LIFECYCLE + 1
+    def test_all_has_twenty_six_kinds(self) -> None:
+        """26 canonical event kinds (17 LIFECYCLE + 1
         DELIVERY + 1 INTENT + 2 POLICY + 5 ORCHESTRATOR).
         Slice 3 added the 5 ORCHESTRATOR kinds:
         ``provider_selected``, ``submit_started``,
         ``submit_completed``, ``submit_failed``,
         ``poll_completed``.  AEE-7.4 finalization added
-        CLAIMED to LIFECYCLE.  Any further drift is a
-        shape change that must be intentional."""
-        self.assertEqual(len(EventKind.all()), 23)
+        CLAIMED to LIFECYCLE.  AEE v3 Telegram
+        Completion Enforcement Gate added
+        ``notification_pending`` /
+        ``notification_completed`` /
+        ``notification_failed`` to LIFECYCLE.
+        Any further drift is a shape change that must be
+        intentional."""
+        self.assertEqual(len(EventKind.all()), 26)
 
     def test_lifecycle_kinds_count(self) -> None:
-        """14 LIFECYCLE event kinds (the ordinary task
+        """17 LIFECYCLE event kinds (the ordinary task
         lifecycle narration).  AEE-7.4 finalization added
-        CLAIMED (worker claim race winner)."""
+        CLAIMED (worker claim race winner).  AEE v3
+        Telegram Completion Enforcement Gate added
+        ``notification_pending`` /
+        ``notification_completed`` /
+        ``notification_failed`` to narrate the gate's
+        outcome (the gate itself is observability-only in
+        this iteration; ``status='completed'`` stays the
+        terminal state for backward compatibility)."""
         lifecycle = [
             k for k in EventKind.all()
             if category_for(k) == EventCategory.LIFECYCLE
         ]
-        self.assertEqual(len(lifecycle), 14)
+        self.assertEqual(len(lifecycle), 17)
 
     def test_delivery_kinds_count(self) -> None:
         """1 DELIVERY event kind (``delivery_unverified``)."""
@@ -434,13 +446,18 @@ class TestEventsByCategory(unittest.TestCase):
             keys, {"lifecycle", "delivery", "intent", "policy", "orchestrator"},
         )
 
-    def test_lifecycle_bucket_has_14(self) -> None:
+    def test_lifecycle_bucket_has_seventeen(self) -> None:
         """AEE-7.4 finalization: lifecycle bucket grew
         from 13 to 14 (CLAIMED added for worker claim
-        race winner).  See ``aee/observability/events.py``
-        for the authoritative inventory."""
+        race winner).  AEE v3 Telegram Completion
+        Enforcement Gate grew it from 14 to 17
+        (``notification_pending`` /
+        ``notification_completed`` /
+        ``notification_failed``).  See
+        ``aee/observability/events.py`` for the
+        authoritative inventory."""
         self.assertEqual(
-            len(events_by_category()["lifecycle"]), 14,
+            len(events_by_category()["lifecycle"]), 17,
         )
 
     def test_delivery_bucket_has_one(self) -> None:

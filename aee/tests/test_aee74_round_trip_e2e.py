@@ -192,7 +192,16 @@ class TestHappyPathRoundTrip(_RoundTripE2EBase):
     def test_create_queue_start_completed_event_sequence(self) -> None:
         """A successful task emits exactly the four
         canonical LIFECYCLE events in order: ``created`` /
-        ``queued`` / ``started`` / ``completed``."""
+        ``queued`` / ``started`` / ``completed``.
+
+        AEE v3 Telegram Completion Enforcement Gate adds an
+        optional observability notification event after
+        ``completed``.  In the test environment (no real
+        Telegram token) the gate emits
+        ``notification_failed``; in production it would emit
+        ``notification_completed``.  The notification event
+        is non-terminal and does not alter the four-event
+        LIFECYCLE prefix."""
         task_id = self._create_and_start()
         # AEE-7.4 finalization: ``complete()`` is kw-only
         # with ``(output_text, usage, raw, model_name)``.
@@ -205,8 +214,11 @@ class TestHappyPathRoundTrip(_RoundTripE2EBase):
             raw={"model": "MiniMaxAI/MiniMax-M3"},
         )
         kinds = self._emitted_kinds()
+        # The four canonical LIFECYCLE events MUST remain the
+        # first four, in order.  AEE v3 appends exactly one
+        # NOTIFICATION_* event afterwards.
         self.assertEqual(
-            kinds,
+            kinds[:4],
             [
                 EventKind.CREATED,
                 EventKind.QUEUED,
@@ -214,6 +226,14 @@ class TestHappyPathRoundTrip(_RoundTripE2EBase):
                 EventKind.COMPLETED,
             ],
         )
+        # AEE v3: exactly one NOTIFICATION_* event follows.
+        notification_kinds = {
+            EventKind.NOTIFICATION_PENDING,
+            EventKind.NOTIFICATION_COMPLETED,
+            EventKind.NOTIFICATION_FAILED,
+        }
+        self.assertEqual(len(kinds), 5)
+        self.assertIn(kinds[4], notification_kinds)
 
     def test_every_event_carries_task_id_and_schema_version(self) -> None:
         """Every emitted :class:`Event` has a non-empty

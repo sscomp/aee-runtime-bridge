@@ -1,5 +1,6 @@
-fastapi>=0.110
-uvicorn[standard]>=0.27
-httpx>=0.27
-python-dotenv>=1.0
-pydantic>=2.6
+# requirements.txt — thin redirect for Dockerfile compatibility.
+# The Dockerfile still does `pip install -r requirements.txt`, so this file
+# applies the constraints (upper bounds) and pulls the unpinned spec from requirements.in.
+# For hash-pinned reproducible installs, use: pip install --require-hashes -r requirements.lock
+-c constraints.txt
+-r requirements.in

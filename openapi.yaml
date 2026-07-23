@@ -169,6 +169,126 @@ components:
           type: integer
           description: 'Initial progress (5% by default).'
 
+    ExecutorsResponse:
+      type: object
+      description: |
+        Read-only executor capability discovery returned by ``GET /executors``.
+        Lists the executors this bridge currently supports, the configured
+        default, and the alias map that canonicalises a requested name to
+        its wire value. Pure read-only — it never dispatches, never creates
+        a run, never launches an executor, and never mutates runtime state.
+        Call this before ``POST /runs/executor`` to discover capabilities.
+      properties:
+        supported_executors:
+          type: array
+          items: { type: string }
+          description: Executors this bridge currently supports (e.g. claude-code-cli, hermes).
+        default_executor:
+          type: string
+          nullable: true
+          description: Configured default executor used when a create request omits the executor.
+        aliases:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Map of alias -> canonical executor name (identity self-maps are
+            excluded). Use this to canonicalise a caller-supplied executor
+            name before dispatch.
+
+    ExecutorRunRequest:
+      type: object
+      required: [prompt]
+      description: |
+        Request body for ``POST /runs/executor``. Shares the same internal
+        lifecycle write path as ``POST /runs``: both persist a run into the
+        durable ``executor_runs`` store, and the returned ``run_id`` is
+        usable with the executor-neutral lifecycle endpoints. The caller
+        does NOT re-supply the executor on subsequent lifecycle calls —
+        the bridge routes by persisted run metadata.
+      properties:
+        executor:
+          type: string
+          nullable: true
+          description: |
+            Executor to dispatch to. Accepted aliases: ``claude-code-cli``,
+            ``claude_code``, ``claude-code`` (canonical: ``claude-code-cli``),
+            and ``hermes`` (legacy Hermes provider). If omitted, the
+            configured default executor is used.
+        prompt:
+          type: string
+          minLength: 1
+          maxLength: 64000
+          description: The worker prompt, forwarded verbatim (never rewritten).
+        expected_artifacts:
+          type: array
+          nullable: true
+          items: { type: string, minLength: 1 }
+          description: Absolute paths the run is expected to produce; verified in the response.
+        timeout_sec:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: Run deadline in seconds. Falls back to the configured default.
+        repo_path:
+          type: string
+          nullable: true
+          description: |
+            Working directory for the executor / repo for read-only git
+            evidence. Must lie inside the configured repo allow-list.
+        max_turns:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: Override the configured Claude Code CLI --max-turns.
+
+    ExecutorRunResponse:
+      type: object
+      description: |
+        Full evidence envelope returned by ``POST /runs/executor``. Carries
+        the executor routing decision and the full per-run evidence
+        (artifact_paths, stdout/stderr summaries, exit_code, timeout_state,
+        cancel_state, git_evidence, artifact_verification, telegram_result,
+        runtime_identity). The same ``run_id`` is usable with the
+        executor-neutral lifecycle endpoints (``GET /runs``,
+        ``GET /runs/{run_id}``, ``GET /runs/{run_id}/summary``,
+        ``POST /runs/{run_id}/stop``) — the bridge routes by persisted
+        metadata, so the caller never re-supplies the executor.
+      required: [selected_executor, run_id, status, routing]
+      properties:
+        selected_executor: { type: string }
+        requested_executor: { type: string, nullable: true }
+        run_id: { type: string }
+        task_id: { type: string, nullable: true }
+        status:
+          type: string
+          enum: [queued, running, completed, failed, timeout, cancelled]
+        progress: { type: number, format: float, minimum: 0, maximum: 1 }
+        routing:
+          type: object
+          properties:
+            requested_executor: { type: string, nullable: true }
+            selected_executor: { type: string }
+            effective_executor: { type: string }
+            selection_source: { type: string }
+            was_forced: { type: boolean }
+            reason: { type: string }
+            effective_model: { type: string, nullable: true }
+        artifact_paths:
+          type: array
+          items: { type: string }
+        stdout_summary: { type: string }
+        stderr_summary: { type: string }
+        exit_code: { type: integer, nullable: true }
+        timeout_state: { type: string, nullable: true }
+        cancel_state: { type: string, nullable: true }
+        git_evidence: { type: object, nullable: true, additionalProperties: true }
+        artifact_verification:
+          type: array
+          items: { type: object, additionalProperties: true }
+        telegram_result: { type: object, additionalProperties: true }
+        runtime_identity: { type: object, nullable: true, additionalProperties: true }
+        error: { type: string, nullable: true }
+
     TaskSummary:
       type: object
       description: |
@@ -477,6 +597,30 @@ paths:
                   hermes: { type: string, description: 'reachable | http_<code> | error: ...' }
                   hermes_base_url: { type: string }
 
+  /executors:
+    get:
+      operationId: hermesListExecutors
+      summary: List supported executors, the default, and the alias map.
+      description: |
+        Read-only executor capability discovery. Returns the executors
+        this bridge supports, the configured default, and the alias map
+        that canonicalises a requested name to its wire value. Pure
+        read-only: no dispatch, no task creation, no executor launch, no
+        runtime mutation, no side effects. Querying this endpoint never
+        creates a run. Use it before ``POST /runs/executor`` to discover
+        capabilities.
+      responses:
+        '200':
+          description: Executor capability map.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecutorsResponse' }
+        '401':
+          description: Missing or invalid bridge API key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
   /runs:
     get:
       operationId: hermesListRuns
@@ -555,6 +699,55 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorBody' }
         '504':
           description: Upstream Hermes timeout.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /runs/executor:
+    post:
+      operationId: hermesCreateExecutorRun
+      summary: Dispatch a run to an explicit executor and return the full evidence envelope.
+      description: |
+        Backward-compatible explicit-executor create path. Shares the
+        same internal lifecycle write path as ``POST /runs``: both persist
+        a run into the durable ``executor_runs`` store, and the returned
+        ``run_id`` is usable with the executor-neutral lifecycle endpoints
+        (``GET /runs``, ``GET /runs/{run_id}``,
+        ``GET /runs/{run_id}/summary``, ``POST /runs/{run_id}/stop``).
+        The caller does NOT re-supply the executor on subsequent lifecycle
+        calls — the bridge routes by persisted run metadata, so the
+        Orchestrator only needs to persist ``run_id``. No silent fallback:
+        unsupported executors return a deterministic 400
+        ``unsupported_executor``. ``GET``-side lifecycle endpoints never
+        create a run.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExecutorRunRequest' }
+      responses:
+        '200':
+          description: Run created (sync executor) or queued (async Hermes).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecutorRunResponse' }
+        '400':
+          description: Unsupported executor or repo_path outside the allow-list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401':
+          description: Missing or invalid bridge API key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '502':
+          description: Upstream executor error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '504':
+          description: Upstream executor timeout.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorBody' }

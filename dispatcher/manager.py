@@ -36,6 +36,17 @@ from .progress import monotonic, validate_progress
 # will fail the build if a new literal leaks.
 from aee.observability import EventKind
 
+# AEE v3 Telegram Completion Enforcement Gate — 4-stage completion
+# state model. ``compute_completion_state`` derives the highest
+# reached stage from a task row + its ``task_outputs`` row; the
+# ``FINAL_COMPLETED`` constant is the only terminal stage under the
+# v3 model. See ``dispatcher/notification_state.py`` for the full
+# model and the reference analysis pointer.
+from dispatcher.notification_state import (
+    FINAL_COMPLETED,
+    compute_completion_state,
+)
+
 log = logging.getLogger("dispatcher.manager")
 
 _BRIDGE_ROOT = Path(__file__).resolve().parent.parent
@@ -179,6 +190,32 @@ class IllegalTransition(ValueError):
 
 
 class TaskNotFound(LookupError):
+    pass
+
+
+class NotificationBlocked(RuntimeError):
+    """AEE v3 blocking completion gate — raised by ``TaskManager.complete()``
+    when ``enforcement_gate.blocking == true`` AND the notification gate
+    fails to confirm delivery (``sent == False`` OR ``message_id is None``).
+
+    The exception is raised AFTER the manager has:
+
+    1. Reverted ``tasks.status`` from ``completed`` back to ``running`` (so
+       the orchestrator can retry the notification or escalate).
+    2. Persisted the failed-notification blob into
+       ``task_outputs.notification_json``.
+    3. Emitted a ``NOTIFICATION_FAILED`` event into ``task_events``.
+    4. Appended an audit record to ``logs/notification_audit.jsonl``.
+
+    The exception's ``args[0]`` is a dict with keys: ``task_id``,
+    ``notification`` (the full gate result dict), ``stage`` (the v3
+    completion stage the task reached — always ``evidence_completed``
+    under blocking mode because notification did not confirm).
+
+    Callers catching this exception can inspect ``exc.args[0]`` to
+    decide between retry / escalate / accept-as-observability-only.
+    """
+
     pass
 
 
@@ -559,6 +596,155 @@ class TaskManager:
         self._emit_event(task_id, EventKind.COMPLETED, {
             "duration_sec": duration, "result_path": result_path,
         })
+        # AEE v3 Telegram Completion Enforcement Gate — fire notification
+        # via the Hermes Telegram Gateway (the working path). The legacy
+        # notifier.notify_completed is the silent fallback. The gate's
+        # result is recorded in task_outputs.notification_json; a missing
+        # / failed notification leaves the task in `notification_pending`
+        # (non-terminal under the v3 model) but does NOT block the
+        # existing `status='completed'` for backward compatibility —
+        # the gate is observability-enforcement, not state-machine-blocking,
+        # in this iteration (a future iteration can flip to blocking once
+        # the 7-day shadow run is green).
+        try:
+            from dispatcher.notifier import notify_completed_with_fallback
+            notif = notify_completed_with_fallback(task_id)
+            notif_blob = json.dumps(notif, default=str, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001 — never raise from the gate
+            notif = {"sent": False, "method": "failed", "last_error": f"gate exception: {exc}"}
+            notif_blob = json.dumps(notif, default=str, ensure_ascii=False)
+            log.warning("manager.complete: notification gate exception task_id=%s err=%s", task_id, exc)
+        # Persist notification_json into task_outputs (idempotent UPDATE —
+        # the row may have been INSERTed above; use INSERT OR REPLACE pattern
+        # mirroring the delivery_json write at line 527, but only updating
+        # the notification_json column to avoid clobbering output_text/usage/raw).
+        with transaction() as conn3:
+            # If the row exists, UPDATE only notification_json. If not, INSERT
+            # a stub row with NULLs for the other columns.
+            cur = conn3.execute(
+                "SELECT 1 FROM task_outputs WHERE task_id = ?", (task_id,)
+            )
+            if cur.fetchone() is None:
+                conn3.execute(
+                    "INSERT INTO task_outputs (task_id, notification_json) VALUES (?, ?)",
+                    (task_id, notif_blob),
+                )
+            else:
+                conn3.execute(
+                    "UPDATE task_outputs SET notification_json = ? WHERE task_id = ?",
+                    (notif_blob, task_id),
+                )
+        # Emit the appropriate event for the gate result.
+        if notif.get("sent") and notif.get("message_id") is not None:
+            self._emit_event(task_id, EventKind.NOTIFICATION_COMPLETED, {
+                "method": notif.get("method"),
+                "recipient": notif.get("recipient"),
+                "message_id": notif.get("message_id"),
+                "ts_utc": notif.get("ts_utc"),
+                "ts_taipei": notif.get("ts_taipei"),
+            })
+        elif notif.get("sent") and notif.get("message_id") is None:
+            # sent but no message_id — treat as pending (queued but not delivered)
+            self._emit_event(task_id, EventKind.NOTIFICATION_PENDING, {
+                "method": notif.get("method"),
+                "last_error": notif.get("last_error"),
+            })
+        else:
+            self._emit_event(task_id, EventKind.NOTIFICATION_FAILED, {
+                "method": notif.get("method"),
+                "last_error": notif.get("last_error"),
+            })
+        # Structured completion log — extend the AEE-7.2 INFO line
+        # above with the notification gate's outcome so the dispatcher
+        # log remains the single source of truth for the v3 gate
+        # without requiring a join against task_outputs.
+        log.info(
+            "manager.complete: notification gate task_id=%s "
+            "notif_sent=%s notif_method=%s notif_msg_id=%s",
+            task_id,
+            bool(notif.get("sent")),
+            notif.get("method", ""),
+            notif.get("message_id"),
+        )
+        # AEE v3 blocking completion gate — runtime enforcement.
+        # When ``enforcement_gate.blocking == true`` AND the
+        # notification gate did NOT confirm delivery (``sent ==
+        # False`` OR ``message_id is None``), the manager reverts
+        # the just-set ``status='completed'`` back to ``running`` so
+        # the orchestrator can retry the notification or escalate,
+        # and raises ``NotificationBlocked`` so the caller knows the
+        # task did NOT reach ``FINAL_COMPLETED``.
+        #
+        # Config loading is defensive: any error reading
+        # ``enforcement_gate.blocking`` defaults to ``False``
+        # (observability-only) so a malformed config never blocks
+        # task completion silently.
+        blocking = False
+        try:
+            from config import load as _load_config
+            _gate_cfg = _load_config("notify").get("enforcement_gate", {})
+            blocking = bool(_gate_cfg.get("blocking", False))
+        except Exception as _cfg_exc:  # noqa: BLE001 — never block on config error
+            log.warning(
+                "manager.complete: enforcement_gate config read failed task_id=%s err=%s; "
+                "defaulting to observability-only",
+                task_id, _cfg_exc,
+            )
+            blocking = False
+        notif_confirmed = bool(notif.get("sent")) and notif.get("message_id") is not None
+        if blocking and not notif_confirmed:
+            # Revert the just-set ``status='completed'`` back to
+            # ``running`` so the task is no longer terminal. The
+            # revert uses a direct SQL UPDATE (NOT through
+            # ``is_legal_transition``) because ``completed ->
+            # running`` is intentionally NOT in the public
+            # ``LEGAL_TRANSITIONS`` table (completed is terminal for
+            # external callers). The revert is gated on
+            # ``enforcement_gate.blocking`` and only fires from
+            # inside ``complete()``, which is the single producer of
+            # the ``completed`` status.
+            #
+            # ``finished_at`` is cleared so the task is no longer
+            # terminal from the read-side ``compute_completion_state``
+            # perspective (it gates on ``finished_at`` for
+            # ``EVIDENCE_COMPLETED``).
+            #
+            # ``progress_pct`` is rolled back from 100 to the last
+            # running value (80 — the pre-completion ceiling in
+            # ``LEGAL_PROGRESS_PCTS``) so the dispatcher UI does not
+            # show 100% on a reverted task.
+            try:
+                with transaction() as conn_revert:
+                    conn_revert.execute(
+                        "UPDATE tasks SET status='running', "
+                        "finished_at=NULL, progress_pct=80 "
+                        "WHERE task_id=? AND status='completed'",
+                        (task_id,),
+                    )
+            except Exception as revert_exc:  # noqa: BLE001 — log + continue
+                log.warning(
+                    "manager.complete: blocking-gate revert failed task_id=%s err=%s",
+                    task_id, revert_exc,
+                )
+            log.warning(
+                "manager.complete: blocking gate reverted task_id=%s "
+                "notif_sent=%s notif_method=%s notif_msg_id=%s "
+                "(enforcement_gate.blocking=true, notification unconfirmed)",
+                task_id,
+                bool(notif.get("sent")),
+                notif.get("method", ""),
+                notif.get("message_id"),
+            )
+            raise NotificationBlocked({
+                "task_id": task_id,
+                "notification": notif,
+                "stage": "evidence_completed",
+                "blocking": True,
+                "reason": (
+                    "enforcement_gate.blocking=true and notification "
+                    "gate did not confirm message_id"
+                ),
+            })
         # Task-Mapping work-order (Fix D): mirror the terminal
         # ``completed`` status into ``executor_runs`` so GET /runs
         # list/summary reflect the true lifecycle. Best-effort.
@@ -986,7 +1172,7 @@ class TaskManager:
     def get_output(self, task_id: str) -> Optional[Dict[str, Any]]:
         conn = get_conn()
         row = conn.execute(
-            "SELECT output_text, usage_json, raw_json, delivery_json FROM task_outputs WHERE task_id = ?",
+            "SELECT output_text, usage_json, raw_json, delivery_json, notification_json FROM task_outputs WHERE task_id = ?",
             (task_id,),
         ).fetchone()
         if not row:
@@ -1009,7 +1195,57 @@ class TaskManager:
             "usage": usage,
             "raw": raw,
             "delivery_json": row["delivery_json"],
+            # AEE v3 Telegram Completion Enforcement Gate — the
+            # gate's result blob (sent / method / recipient /
+            # message_id / ts_utc / ts_taipei / attempts /
+            # last_error). NULL until complete() has fired the
+            # gate (or if the gate ran before this column was
+            # added — legacy rows keep NULL).
+            "notification_json": row["notification_json"],
         }
+
+    def completion_state(self, task_id: str) -> str:
+        """AEE v3 Telegram Completion Enforcement Gate — read API.
+
+        Fetch the task row + its ``task_outputs`` row, merge them
+        into a single dict, and return
+        ``compute_completion_state(merged_row)`` — one of the 4
+        v3 completion stage strings (``execution_completed`` /
+        ``evidence_completed`` / ``notification_completed`` /
+        ``final_completed``).
+
+        This is a pure read: it does NOT change ``complete()``
+        behaviour, does NOT mutate any row, and does NOT emit any
+        event. The orchestrator uses it to ask "how far did this
+        task actually get?" without having to know the
+        ``notification_json`` blob schema.
+
+        Returns ``"execution_completed"`` (the safest non-terminal
+        stage) when the task row is missing or when the
+        ``task_outputs`` row has no ``notification_json`` yet —
+        ``compute_completion_state`` is defensive against missing
+        keys / malformed JSON.
+        """
+        conn = get_conn()
+        task_row = conn.execute(
+            "SELECT status, finished_at FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            # Defensive: a missing task collapses to the earliest
+            # stage so the orchestrator's read path never breaks.
+            return "execution_completed"
+        out_row = conn.execute(
+            "SELECT delivery_json, notification_json FROM task_outputs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        merged: Dict[str, Any] = {
+            "status": task_row["status"],
+            "finished_at": task_row["finished_at"],
+            "delivery_json": out_row["delivery_json"] if out_row else None,
+            "notification_json": out_row["notification_json"] if out_row else None,
+        }
+        return compute_completion_state(merged)
 
     # ---- internal --------------------------------------------------------
 

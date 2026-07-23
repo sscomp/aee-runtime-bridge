@@ -26,10 +26,10 @@ constants, a single mapping per axis (kind → category,
 kind → severity), and a tripwire regression test that
 fails the build if the literals leak.
 
-Inventory of the 18 event kinds (canonical)
+Inventory of the 26 event kinds (canonical)
 -------------------------------------------
 
-LIFECYCLE (14 — the ordinary task lifecycle narration):
+LIFECYCLE (17 — the ordinary task lifecycle narration):
 
 * ``created``      — task created (POST /runs succeeded)
 * ``queued``       — task queued for dispatch
@@ -46,6 +46,20 @@ LIFECYCLE (14 — the ordinary task lifecycle narration):
   earlier one
 * ``openai_run_attached`` — a GPT Custom GPT attached an
   OpenAI run id to the task
+* ``claimed``      — worker claim race winner (AEE-7.4
+  finalization)
+* ``notification_pending`` — AEE v3 Telegram Completion
+  Enforcement Gate: the gate fired but the send has not been
+  confirmed (no ``message_id`` yet, e.g. queued but not
+  delivered, or the legacy fallback returned ``sent=True``
+  without a message id). LIFECYCLE WARN.
+* ``notification_completed`` — AEE v3 gate: the
+  Hermes-Telegram-Gateway (or the legacy notifier fallback)
+  returned a confirmed ``message_id``. LIFECYCLE INFO.
+* ``notification_failed`` — AEE v3 gate: both the gateway path
+  and the legacy fallback failed to send. LIFECYCLE WARN. The
+  task is still ``status='completed'`` for backward compat —
+  the gate is observability-only in this iteration.
 
 DELIVERY (1 — Phase 4 delivery verification):
 
@@ -142,6 +156,20 @@ class EventKind:
     # AEE-7.4 finalization — a worker claimed a job (race winner
     # in ``aee/api/jobs.py`` claim flow).  LIFECYCLE INFO.
     CLAIMED = "claimed"
+    # AEE v3 Telegram Completion Enforcement Gate — narrate the
+    # notification outcome. All three are LIFECYCLE (the gate is
+    # part of the ordinary task narration, not a new category):
+    #   * PENDING   — gate fired, no confirmed message_id yet (WARN)
+    #   * COMPLETED — gate returned a confirmed message_id (INFO)
+    #   * FAILED    — both gateway + legacy fallback failed (WARN)
+    # The gate is observability-only in this iteration; the task's
+    # ``status='completed'`` SQL UPDATE is unchanged. See
+    # ``dispatcher/notification_state.py`` for the 4-stage model
+    # and ``dispatcher/notifier.py:notify_completed_with_fallback``
+    # for the gate implementation.
+    NOTIFICATION_PENDING = "notification_pending"
+    NOTIFICATION_COMPLETED = "notification_completed"
+    NOTIFICATION_FAILED = "notification_failed"
 
     # --- DELIVERY (1) -----------------------------------------------------
     DELIVERY_UNVERIFIED = "delivery_unverified"
@@ -183,6 +211,9 @@ class EventKind:
                 cls.RETRY_OF,
                 cls.OPENAI_RUN_ATTACHED,
                 cls.CLAIMED,
+                cls.NOTIFICATION_PENDING,
+                cls.NOTIFICATION_COMPLETED,
+                cls.NOTIFICATION_FAILED,
                 cls.DELIVERY_UNVERIFIED,
                 cls.INTENT_MISMATCH,
                 cls.TRAVERSAL,
@@ -215,6 +246,12 @@ _CATEGORY_FOR_KIND: Dict[str, str] = {
     EventKind.RETRY_OF: EventCategory.LIFECYCLE.value,
     EventKind.OPENAI_RUN_ATTACHED: EventCategory.LIFECYCLE.value,
     EventKind.CLAIMED: EventCategory.LIFECYCLE.value,
+    # AEE v3 Telegram Completion Enforcement Gate — narrated as
+    # LIFECYCLE (the gate is part of the ordinary task narration,
+    # not a new category; minimal blast radius per the v3 design).
+    EventKind.NOTIFICATION_PENDING: EventCategory.LIFECYCLE.value,
+    EventKind.NOTIFICATION_COMPLETED: EventCategory.LIFECYCLE.value,
+    EventKind.NOTIFICATION_FAILED: EventCategory.LIFECYCLE.value,
     # DELIVERY
     EventKind.DELIVERY_UNVERIFIED: EventCategory.DELIVERY.value,
     # INTENT
@@ -250,6 +287,17 @@ _SEVERITY_FOR_KIND: Dict[str, str] = {
     EventKind.RETRY_OF: EventSeverity.INFO.value,
     EventKind.OPENAI_RUN_ATTACHED: EventSeverity.INFO.value,
     EventKind.CLAIMED: EventSeverity.INFO.value,
+    # AEE v3 Telegram Completion Enforcement Gate.
+    #   * PENDING   — WARN: the send is not yet confirmed (queued
+    #     or fell back to the legacy notifier which returns no
+    #     message_id).
+    #   * COMPLETED — INFO: the gate confirmed delivery (message_id
+    #     present).
+    #   * FAILED    — WARN: both the gateway + the legacy fallback
+    #     failed; the operator should inspect.
+    EventKind.NOTIFICATION_PENDING: EventSeverity.WARN.value,
+    EventKind.NOTIFICATION_COMPLETED: EventSeverity.INFO.value,
+    EventKind.NOTIFICATION_FAILED: EventSeverity.WARN.value,
     # DELIVERY: WARN — the task completed but the artifact is
     # missing.  Default action: orchestrator inspects and
     # decides.
