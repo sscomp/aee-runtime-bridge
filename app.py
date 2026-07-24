@@ -267,6 +267,25 @@ class CreateRunRequest(BaseModel):
             "in addition to the automatic scan of `input` for absolute paths."
         ),
     )
+    # WO-INCOMPLETE-DELIVERY-AUTORESCUE: rescue-loop cap. When the
+    # completion gate fires (any declared artifact missing) AND
+    # ``rescue_count < max_rescues``, the task transitions to the
+    # non-terminal ``incomplete_delivery`` state and the dispatcher
+    # auto-queues one ``_rescue()`` re-validation. The rescue
+    # re-stats the declared artifacts; on success the task reaches
+    # ``completed``, on failure it reaches ``failed``. Default 1
+    # (one auto-rescue attempt). 0 disables rescue entirely (the
+    # gate falls through to ``failed`` on the first miss — the
+    # WO-COMPLETION-GATE-MVP behavior).
+    max_rescues: Optional[int] = Field(
+        None, ge=0, le=5,
+        description=(
+            "WO-INCOMPLETE-DELIVERY-AUTORESCUE: max auto-rescue attempts "
+            "when the completion gate fires with missing declared "
+            "artifacts. 0 = disabled (fail on first miss). Default 1. "
+            "Capped at 5 to prevent runaway loops."
+        ),
+    )
     session_id: Optional[str] = Field(
         None,
         max_length=200,
@@ -1059,6 +1078,20 @@ async def create_run(
         # the Task.profile field always carries the canonical
         # profile that was active at dispatch time, never None.
         profile=resolved_profile,
+        # WO-COMPLETION-GATE-MVP: forward the caller's declared
+        # artifact list from the wire contract to the dispatcher's
+        # `manager.create(..., expected_artifacts=...)` kwarg. The
+        # dispatcher gates completion on these paths — if any are
+        # missing at complete() time, the task transitions to `failed`
+        # with reason `missing_expected_artifacts` instead of
+        # `completed`. None / empty → no contract → existing behavior.
+        expected_artifacts=body.expected_artifacts,
+        # WO-INCOMPLETE-DELIVERY-AUTORESCUE: forward the caller's
+        # rescue-loop cap. None → dispatcher default (1). 0 disables
+        # auto-rescue entirely (the gate falls through to `failed` on
+        # the first miss — the WO-COMPLETION-GATE-MVP behavior). The
+        # dispatcher clamps the value to [0, 5].
+        max_rescues=body.max_rescues,
     )
     task_id = task.task_id
     # Record the source + override note on the task log. This is the audit
@@ -2079,6 +2112,28 @@ def _executor_evidence_is_empty(persisted: Dict[str, Any]) -> bool:
     return True
 
 
+def _telegram_result_is_confirmed(value: Any) -> bool:
+    """Return True iff ``value`` represents a confirmed Telegram delivery.
+
+    A confirmed delivery is a dict where EITHER ``success`` OR ``sent``
+    is True AND ``message_id`` is a non-None value. This is the merge
+    gate used by ``_merge_task_evidence_into_envelope`` so the Hermes
+    async submit placeholder
+    (``{"success": False, "skipped": "hermes is async; ..."}``) — which
+    is a truthy dict but NOT a confirmed delivery — is treated as
+    empty and overwritten by the task-side ``telegram_result``
+    (built from ``task_outputs.notification_json``, carrying
+    ``sent: True`` + ``message_id`` from the Hermes Telegram Gateway).
+
+    WO-FIX-TELEGRAM-RESULT-SYNC.
+    """
+    if not isinstance(value, dict):
+        return False
+    success = bool(value.get("success", value.get("sent", False)))
+    message_id = value.get("message_id")
+    return success and message_id is not None
+
+
 def _collect_task_evidence(task_id: str) -> Optional[Dict[str, Any]]:
     """Read task-side evidence for ``task_id`` from the dispatcher DB.
 
@@ -2238,6 +2293,22 @@ def _merge_task_evidence_into_envelope(
     if not task_id:
         return envelope
     if not _executor_evidence_is_empty(envelope):
+        # WO-FIX-TELEGRAM-RESULT-SYNC: even when the executor-side
+        # envelope is NOT evidence-empty (e.g. reconciliation already
+        # wrote stdout_summary), a non-confirmed ``telegram_result``
+        # (the Hermes async submit placeholder) must still be replaced
+        # by the task-side ``notification_json`` outcome when the
+        # task-side has a confirmed delivery. Without this, stdout
+        # shows a successful Telegram send with message_id but the
+        # structured envelope returns ``telegram_result.success ==
+        # False`` because the placeholder dict is truthy and the
+        # early-return above skips the merge entirely.
+        task_evidence = _collect_task_evidence(task_id)
+        if task_evidence is not None and task_evidence.get("telegram_result"):
+            if not _telegram_result_is_confirmed(envelope.get("telegram_result")):
+                merged = dict(envelope)
+                merged["telegram_result"] = dict(task_evidence["telegram_result"])
+                return merged
         return envelope
     evidence = _collect_task_evidence(task_id)
     if evidence is None:
@@ -2271,7 +2342,25 @@ def _merge_task_evidence_into_envelope(
         merged["artifact_paths"] = list(evidence["artifact_paths"])
     if not merged.get("artifact_verification") and evidence.get("artifact_verification"):
         merged["artifact_verification"] = list(evidence["artifact_verification"])
-    if not merged.get("telegram_result") and evidence.get("telegram_result"):
+    # WO-FIX-TELEGRAM-RESULT-SYNC: the merge guard for telegram_result
+    # must NOT fire on mere dict truthiness. The Hermes async submit
+    # path (app.py:2027) persists a placeholder
+    # ``{"success": False, "skipped": "hermes is async; ..."}`` into
+    # executor_runs. That dict is truthy, so the previous
+    # ``not merged.get("telegram_result")`` guard never let the
+    # task-side ``telegram_result`` (built from
+    # ``task_outputs.notification_json`` by ``_collect_task_evidence``,
+    # carrying ``sent: True`` + ``message_id`` from the Hermes
+    # Telegram Gateway) override it. The result: stdout showed a
+    # successful Telegram send with message_id, but the structured
+    # envelope returned ``telegram_result.success == False``.
+    #
+    # Fix: treat the executor-side telegram_result as "empty" for
+    # merge purposes when it does NOT represent a confirmed delivery
+    # — i.e. neither ``success`` nor ``sent`` is True with a
+    # non-None ``message_id``. The task-side telegram_result then
+    # overrides the placeholder, preserving the actual send outcome.
+    if not _telegram_result_is_confirmed(merged.get("telegram_result")) and evidence.get("telegram_result"):
         merged["telegram_result"] = dict(evidence["telegram_result"])
     # git_evidence is NOT synthesized from the task side — the
     # dispatcher does not record git state for the task, and
@@ -2399,6 +2488,26 @@ async def get_run(
             "is_terminal": task.status in {
                 "completed", "failed", "cancelled",
             },
+            # WO-COMPLETION-GATE-MVP: surface the declared
+            # expected_artifacts contract + the Phase-4 delivery
+            # verification results (auto-scan) so callers can
+            # distinguish "completed with delivery warnings" from
+            # "failed at the gate". `expected_artifacts` is the
+            # explicit contract (empty list = no contract);
+            # `delivery_verification` is the Phase-4 auto-scan
+            # result (always present, observability-only).
+            "expected_artifacts": list(task.expected_artifacts or []),
+            "delivery_verification": out.get("delivery_json"),
+            # WO-INCOMPLETE-DELIVERY-AUTORESCUE: surface the rescue
+            # lifecycle counters so callers can distinguish
+            # ``incomplete_delivery`` (non-terminal, auto-rescue
+            # queued) from ``failed`` (terminal). ``rescue_count`` is
+            # the number of rescue attempts already executed;
+            # ``max_rescues`` is the configured cap (0 = rescue
+            # disabled). ``incomplete_delivery`` is non-terminal —
+            # excluded from the is_terminal set above.
+            "rescue_count": task.rescue_count,
+            "max_rescues": task.max_rescues,
         }
         # P1 observability for the dispatcher-tasks fallback. The
         # ``tasks`` table does not carry an explicit ``updated_at``
@@ -2582,6 +2691,19 @@ async def get_run_summary(
             },
             "source": "dispatcher_tasks",
             "current_hint": hint,
+            # WO-COMPLETION-GATE-MVP: surface the declared
+            # expected_artifacts contract + delivery verification
+            # results in the summary view too so the orchestrator
+            # can pattern-match on `missing_expected_artifacts`
+            # without parsing the error_message prose.
+            "expected_artifacts": list(task.expected_artifacts or []),
+            "delivery_verification": out.get("delivery_json"),
+            # WO-INCOMPLETE-DELIVERY-AUTORESCUE: surface rescue
+            # lifecycle counters in the summary view too so the
+            # orchestrator can pattern-match on
+            # ``incomplete_delivery`` without parsing prose.
+            "rescue_count": task.rescue_count,
+            "max_rescues": task.max_rescues,
         }
 
     # 3) No persisted record. Deterministic 404 — do NOT call the

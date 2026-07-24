@@ -146,6 +146,20 @@ _COLUMNS = (
     # time from the wire contract; not enforced. Legacy rows
     # have NULL here and the Task dataclass defaults to None.
     "profile",
+    # WO-COMPLETION-GATE-MVP note: ``expected_artifacts`` is
+    # decoded from the ``expected_artifacts_json`` storage
+    # column in ``_row_to_task`` (same pattern as
+    # ``required_capabilities`` above). It is NOT in
+    # ``_COLUMNS`` because the storage suffix is decoded
+    # explicitly; listing it here would cause a duplicate
+    # kwarg error in ``Task(**raw)``.
+    #
+    # WO-INCOMPLETE-DELIVERY-AUTORESCUE: ``rescue_count`` and
+    # ``max_rescues`` are stored as INTEGER columns (with
+    # defaults 0 / 1) and read straight into the Task dataclass
+    # without any JSON decoding. They ARE in ``_COLUMNS``
+    # because there is no ``_json`` storage suffix to strip.
+    "rescue_count", "max_rescues",
 )
 
 
@@ -157,11 +171,29 @@ def _row_to_task(row) -> Task:
     domain field. Callers that pass through the dataclass
     never see the JSON suffix. The raw `*_json` column is
     NOT in `_COLUMNS` — it's a storage-only detail.
+
+    WO-COMPLETION-GATE-MVP: same pattern for
+    `expected_artifacts_json` → `expected_artifacts: list[str]`.
+    NULL / malformed JSON → empty list (the default contract
+    is "no declared artifacts" → existing behavior preserved).
     """
     raw = {c: row[c] for c in _COLUMNS if c in row.keys()}
     raw["required_capabilities"] = db.decode_capabilities(
         row["required_capabilities_json"]
     )
+    # WO-COMPLETION-GATE-MVP: decode the declared-artifacts list.
+    # Defensive: NULL / missing / malformed JSON all fall back to
+    # the empty list so legacy rows keep the pre-gate behavior.
+    ea_raw = row["expected_artifacts_json"] if "expected_artifacts_json" in row.keys() else None
+    ea: List[str] = []
+    if ea_raw:
+        try:
+            decoded = json.loads(ea_raw)
+            if isinstance(decoded, list):
+                ea = [str(p) for p in decoded if isinstance(p, str)]
+        except (ValueError, TypeError):
+            ea = []
+    raw["expected_artifacts"] = ea
     return Task(**raw)
 
 
@@ -243,6 +275,8 @@ class TaskManager:
         repo_root: Optional[str] = None,
         executor_session_id: Optional[str] = None,
         profile: Optional[str] = None,
+        expected_artifacts: Optional[List[str]] = None,
+        max_rescues: Optional[int] = None,
     ) -> Task:
         """Create a new task. Generates the task_id, sets status, records event.
 
@@ -288,6 +322,34 @@ class TaskManager:
         # storage plumbing.
         if profile is not None:
             profile = profile.strip() or None
+        # WO-COMPLETION-GATE-MVP: normalize expected_artifacts at the
+        # wire boundary. None / empty → '[]' (no contract). Non-empty
+        # list → sorted unique set of absolute paths persisted as
+        # JSON in the `expected_artifacts_json` column. We dedupe
+        # and sort so the stored form is deterministic (same input
+        # always produces the same JSON blob).
+        if expected_artifacts is not None:
+            expected_artifacts = sorted(set(expected_artifacts))
+        # WO-FIX-ARTIFACT-PATH-CASE-PRESERVATION: persist
+        # ``expected_artifacts`` with original case preserved.
+        # ``encode_capabilities`` lowercases its inputs (capability
+        # strings are case-insensitive identifiers), but Linux
+        # filesystem paths are case-sensitive — lowercasing
+        # ``/home/ubuntu/Abacus/report.md`` to
+        # ``/home/ubuntu/abacus/report.md`` corrupts the contract and
+        # produces a false ``missing_expected_artifacts`` failure at
+        # ``complete()`` time. Use the dedicated artifact-paths helper
+        # which trims/dedupes/sorts WITHOUT case-folding.
+        ea_blob = db.encode_artifact_paths(expected_artifacts or [])
+        # WO-INCOMPLETE-DELIVERY-AUTORESCUE: clamp ``max_rescues`` to a
+        # sensible range. ``None`` means "use the schema default" (1)
+        # so legacy callers that don't pass it preserve existing
+        # behavior. Negative values are normalized to 0 (rescue
+        # disabled — the gate falls through to ``failed`` on the
+        # first miss). Capped at 5 to prevent runaway loops from a
+        # misconfigured caller.
+        if max_rescues is not None:
+            max_rescues = max(0, min(int(max_rescues), 5))
         task_id = ids.next_task_id()
         created_at = ids.now_iso()
         commit, branch = _git_info(workdir)
@@ -304,8 +366,10 @@ class TaskManager:
                   required_capabilities_json,
                   repo_root,
                   executor_session_id,
-                  profile
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  profile,
+                  expected_artifacts_json,
+                  max_rescues
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, title, type, priority, owner, initial_status,
@@ -316,6 +380,8 @@ class TaskManager:
                     repo_root,
                     executor_session_id,
                     profile,
+                    ea_blob,
+                    max_rescues if max_rescues is not None else 1,
                 ),
             )
         _append_log(task_id, "INFO", f"created title={title!r} type={type} priority={priority}")
@@ -498,6 +564,163 @@ class TaskManager:
         _append_log(task_id, "WARN", message)
         self._emit_event(task_id, EventKind.WARNING, {"message": message[:500]})
 
+    # WO-INCOMPLETE-DELIVERY-AUTORESCUE: automatic rescue re-validation.
+    # Called from ``complete()`` when the completion gate fires with
+    # rescue eligibility (``rescue_count < max_rescues``). The rescue
+    # does NOT re-execute the task — it uses the persisted evidence
+    # (the declared ``expected_artifacts`` list + the
+    # ``missing_declared`` paths captured at gate time) and
+    # re-validates the artifacts on disk. This is the MVP rescue
+    # pattern: in production the missing artifacts often appear
+    # shortly after ``complete()`` (e.g. the agent's ``write`` tool
+    # call completes after the manager's gate check), so a single
+    # synchronous re-validation closes the race without burning a
+    # full retry.
+    #
+    # Loop prevention: ``rescue_count`` is incremented atomically
+    # in the same transaction that transitions the task back to
+    # ``running``. The next miss (if artifacts are still missing)
+    # sees ``rescue_count == max_rescues`` and falls through to
+    # ``failed`` — there is no recursive rescue.
+    #
+    # This method is the single producer of the
+    # ``incomplete_delivery -> running`` transition; the public
+    # state machine in ``LEGAL_TRANSITIONS`` permits it but no
+    # other call site uses it.
+    def _rescue(
+        self,
+        task_id: str,
+        *,
+        declared_artifacts: List[str],
+        missing_paths: List[str],
+    ) -> Task:
+        """WO-INCOMPLETE-DELIVERY-AUTORESCUE: re-validate declared
+        artifacts and either complete or fail the task.
+
+        ``declared_artifacts`` is the persisted list of artifact
+        paths the caller declared at create() time.
+        ``missing_paths`` is the subset that was missing at gate
+        time (passed in so the rescue does not need to re-scan;
+        it re-stats just those paths).
+
+        The rescue transitions ``incomplete_delivery -> running``
+        (incrementing ``rescue_count``), re-stats the missing
+        paths, and:
+
+        * If all declared artifacts now exist → transitions to
+          ``completed`` (via the standard complete() path, which
+          re-runs the gate; the gate passes because the
+          artifacts are present).
+        * If any declared artifact is still missing → transitions
+          to ``failed`` with the deterministic
+          ``missing_expected_artifacts`` reason.
+
+        Idempotent for the same task: calling ``_rescue()`` twice
+        in a row is safe — the second call sees
+          ``status='running'`` (or ``completed`` / ``failed``) and
+        the state machine guards prevent the second transition.
+        """
+        # Atomically transition ``incomplete_delivery -> running``
+        # AND increment ``rescue_count`` in the same transaction
+        # so the loop counter is consistent with the observed
+        # state. The transition is guarded by
+        # ``is_legal_transition`` (the
+        # ``incomplete_delivery -> running`` edge is in
+        # ``LEGAL_TRANSITIONS``).
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT status, rescue_count, max_rescues FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise TaskNotFound(task_id)
+        old_status = row["status"]
+        if not is_legal_transition(old_status, "running"):
+            # The task is no longer in ``incomplete_delivery``
+            # (e.g. a concurrent caller already rescued it, or it
+            # was cancelled). This is a no-op for the rescue: we
+            # return the current state without raising so the
+            # caller's ``complete()`` does not blow up.
+            _append_log(
+                task_id, "INFO",
+                f"rescue: skipped (status={old_status}, "
+                f"not incomplete_delivery)",
+            )
+            return self.get_or_raise(task_id)
+        cur_count = int(row["rescue_count"]) if row["rescue_count"] is not None else 0
+        with transaction() as conn_rescue:
+            conn_rescue.execute(
+                "UPDATE tasks SET status='running', "
+                "rescue_count = rescue_count + 1, "
+                "error_message=NULL WHERE task_id=?",
+                (task_id,),
+            )
+        _append_log(
+            task_id, "INFO",
+            f"rescue: incomplete_delivery -> running "
+            f"(rescue_count {cur_count} -> {cur_count + 1})",
+        )
+        self._emit_event(task_id, EventKind.STATUS, {
+            "from": "incomplete_delivery",
+            "to": "running",
+            "reason": "auto_rescue_revalidation",
+            "rescue_count": cur_count + 1,
+        })
+        # Re-stat the previously-missing paths. If they all exist
+        # now, re-enter ``complete()`` so the standard completion
+        # path runs (Phase-4 auto-scan, notification gate, etc.).
+        # The gate will re-check ALL declared artifacts (not just
+        # the previously-missing subset) for safety.
+        still_missing: List[str] = []
+        for p in missing_paths:
+            try:
+                os.stat(p)
+            except OSError:
+                still_missing.append(p)
+        if not still_missing:
+            _append_log(
+                task_id, "INFO",
+                "rescue: all declared artifacts now present; "
+                "completing",
+            )
+            # Re-enter complete() so the standard completion
+            # path runs. The gate will re-check the declared
+            # artifacts; since they are now present, the gate
+            # passes and the task reaches ``completed``.
+            # ``output_text`` is None because the agent's
+            # original output was already recorded at the first
+            # complete() call (in ``task_outputs``); passing
+            # None here means ``complete()`` does not overwrite
+            # the persisted output.
+            return self.complete(task_id, output_text=None)
+        # Artifacts still missing after the rescue attempt.
+        # Transition to ``failed`` with the deterministic
+        # reason. The ``rescue_count`` is now >=
+        # ``max_rescues`` (because the rescue incremented it),
+        # so the next ``complete()`` would fall through to
+        # ``failed`` anyway — but we short-circuit here to
+        # avoid the extra round-trip.
+        missing_repr = ", ".join(still_missing)
+        gate_error = (
+            f"missing_expected_artifacts: {len(still_missing)} of "
+            f"{len(declared_artifacts)} declared artifact(s) still missing "
+            f"after rescue: {missing_repr}"
+        )[:500]
+        _append_log(
+            task_id, "ERROR",
+            f"rescue: {len(still_missing)} of "
+            f"{len(declared_artifacts)} declared artifact(s) "
+            f"still missing after rescue",
+        )
+        self._emit_event(task_id, EventKind.DELIVERY_UNVERIFIED, {
+            "gate": "missing_expected_artifacts_post_rescue",
+            "declared_count": len(declared_artifacts),
+            "missing_count": len(still_missing),
+            "missing_paths": still_missing,
+            "rescue_count": cur_count + 1,
+        })
+        return self.fail(task_id, gate_error)
+
     def complete(
         self,
         task_id: str,
@@ -510,7 +733,8 @@ class TaskManager:
         ts = ids.now_iso()
         conn = get_conn()
         row = conn.execute(
-            "SELECT status, started_at, model_name, input_text FROM tasks WHERE task_id = ?", (task_id,),
+            "SELECT status, started_at, model_name, input_text, expected_artifacts_json, rescue_count, max_rescues FROM tasks WHERE task_id = ?",
+            (task_id,),
         ).fetchone()
         if row is None:
             raise TaskNotFound(task_id)
@@ -531,6 +755,126 @@ class TaskManager:
         # expected file bumps warning_count so the task surfaces as
         # "completed but unverified" — never silently green.
         delivery = self._verify_expected_delivery(task_id, row["input_text"] or "")
+
+        # WO-COMPLETION-GATE-MVP: deterministic completion gate for
+        # explicitly-declared `expected_artifacts`. Unlike the Phase-4
+        # auto-scan (which is observability-only and never blocks the
+        # `completed` transition), this gate is a HARD gate: if the
+        # caller declared any artifact paths at create() time and any
+        # of them don't exist on disk at completion time, the task
+        # transitions to `failed` with reason `missing_expected_artifacts`
+        # INSTEAD of `completed`. Empty list / NULL = no contract →
+        # existing behavior preserved.
+        ea_raw = row["expected_artifacts_json"] if "expected_artifacts_json" in row.keys() else None
+        declared_artifacts: List[str] = []
+        if ea_raw:
+            try:
+                decoded_ea = json.loads(ea_raw)
+                if isinstance(decoded_ea, list):
+                    declared_artifacts = [str(p) for p in decoded_ea if isinstance(p, str)]
+            except (ValueError, TypeError):
+                declared_artifacts = []
+        missing_declared: List[str] = []
+        if declared_artifacts:
+            for p in declared_artifacts:
+                try:
+                    os.stat(p)
+                except OSError:
+                    missing_declared.append(p)
+        if missing_declared:
+            # Deterministic non-success outcome. The task does NOT
+            # reach `completed`. We use `failed` with an explicit
+            # reason prefix so downstream consumers can pattern-match
+            # on `missing_expected_artifacts` without parsing prose.
+            # The full list of missing paths is included (best-effort,
+            # truncated to 500 chars to fit the error_message column).
+            missing_repr = ", ".join(missing_declared)
+            gate_error = (
+                f"missing_expected_artifacts: {len(missing_declared)} of "
+                f"{len(declared_artifacts)} declared artifact(s) missing: "
+                f"{missing_repr}"
+            )[:500]
+            _append_log(
+                task_id, "ERROR",
+                f"completion gate: {len(missing_declared)} of "
+                f"{len(declared_artifacts)} declared artifact(s) missing",
+            )
+            self._emit_event(task_id, EventKind.DELIVERY_UNVERIFIED, {
+                "gate": "missing_expected_artifacts",
+                "declared_count": len(declared_artifacts),
+                "missing_count": len(missing_declared),
+                "missing_paths": missing_declared,
+            })
+            # WO-INCOMPLETE-DELIVERY-AUTORESCUE: deterministic rescue
+            # loop prevention. When the task has rescue budget left
+            # (``rescue_count < max_rescues``) the gate transitions
+            # to ``incomplete_delivery`` (non-terminal) and queues
+            # exactly one automatic ``_rescue()`` re-validation
+            # using the persisted evidence (declared_artifacts +
+            # the missing-paths list). The rescue increments
+            # ``rescue_count`` and re-checks the artifacts; on
+            # success the task reaches ``completed``, on failure
+            # it reaches ``failed``. When ``rescue_count >=
+            # max_rescues`` (or rescue is disabled via
+            # ``max_rescues == 0``) the gate falls through to
+            # ``failed`` directly — no rescue attempt is made.
+            cur_rescue_count = int(row["rescue_count"]) if "rescue_count" in row.keys() and row["rescue_count"] is not None else 0
+            cur_max_rescues = int(row["max_rescues"]) if "max_rescues" in row.keys() and row["max_rescues"] is not None else 1
+            rescue_eligible = cur_rescue_count < cur_max_rescues
+            if rescue_eligible:
+                # Transition to non-terminal ``incomplete_delivery``
+                # so the orchestrator (GPT) can observe the rescue
+                # in-flight state via the read API. ``_rescue()``
+                # then runs immediately (synchronously) using the
+                # persisted evidence — it does NOT re-execute the
+                # full task, only re-validates the declared
+                # artifacts and either completes or fails the task.
+                with transaction() as conn_rescue_gate:
+                    conn_rescue_gate.execute(
+                        "UPDATE tasks SET status='incomplete_delivery', "
+                        "error_message=? WHERE task_id=?",
+                        (gate_error, task_id),
+                    )
+                self._emit_event(task_id, EventKind.STATUS, {
+                    "from": "running",
+                    "to": "incomplete_delivery",
+                    "reason": "missing_expected_artifacts_rescue_eligible",
+                    "rescue_count": cur_rescue_count,
+                    "max_rescues": cur_max_rescues,
+                    "missing_paths": missing_declared,
+                })
+                _append_log(
+                    task_id, "INFO",
+                    f"completion gate: rescue eligible "
+                    f"({cur_rescue_count}/{cur_max_rescues}); "
+                    f"transitioning to incomplete_delivery",
+                )
+                # Auto-queue one rescue attempt. ``_rescue()`` is
+                # idempotent for the same task: it transitions back
+                # to ``running``, re-stats the declared artifacts,
+                # and either completes or fails. The
+                # ``rescue_count`` increment is the loop
+                # prevention — once it reaches ``max_rescues`` the
+                # next miss falls through to ``failed``.
+                return self._rescue(
+                    task_id,
+                    declared_artifacts=declared_artifacts,
+                    missing_paths=missing_declared,
+                )
+            # Rescue budget exhausted (or disabled). Fall through to
+            # ``failed`` with the deterministic reason prefix. This
+            # preserves the WO-COMPLETION-GATE-MVP contract: the
+            # task transitions to ``failed`` (NOT ``completed``)
+            # with the explicit reason so downstream consumers can
+            # pattern-match on ``missing_expected_artifacts``.
+            _append_log(
+                task_id, "INFO",
+                f"completion gate: rescue budget exhausted "
+                f"({cur_rescue_count}/{cur_max_rescues}); failing",
+            )
+            # Delegate to fail() for the state transition + event emit
+            # + executor_runs mirror. fail() emits FAILED event.
+            return self.fail(task_id, gate_error)
 
         # AEE-7.2 observability: emit one structured INFO line at
         # terminal status so operators can grep for `task.complete`

@@ -439,9 +439,15 @@ def notify_completed_hermes_gateway(
                 "last_error": f"hermes send stdout JSONDecodeError: {exc}",
             }
         # The Hermes CLI ``send --json`` contract returns a dict
-        # with at least ``ok`` (bool) and, on success, ``message_id``
-        # (int). Be defensive: accept either shape.
-        ok = bool(parsed.get("ok", parsed.get("sent", False)))
+        # with at least ``success`` (bool) and, on success,
+        # ``message_id`` (int). Older/alternate shapes used ``ok`` or
+        # ``sent``; accept any of the three so the parser stays
+        # forward- and backward-compatible.
+        ok = bool(
+            parsed.get("success",
+                       parsed.get("ok",
+                                  parsed.get("sent", False)))
+        )
         message_id = parsed.get("message_id")
         if not ok:
             return {

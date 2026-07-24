@@ -264,6 +264,49 @@ _AEE_V3_NOTIFICATION_MIGRATIONS: list[tuple[str, str]] = [
     ),
 ]
 
+# WO-COMPLETION-GATE-MVP: deterministic completion gate for declared
+# expected_artifacts. The dispatcher's ``complete()`` reads this column
+# (a JSON-encoded list of absolute file paths the caller declared as
+# required deliverables) and, when non-empty, performs deterministic
+# validation BEFORE transitioning to ``completed``. If any declared
+# artifact is missing on disk, the task transitions to ``failed`` with
+# ``error_message`` containing the explicit reason
+# ``missing_expected_artifacts`` and the list of missing paths.
+#
+# Storage shape: ``expected_artifacts_json TEXT`` (NULLable). NULL or
+# empty list ``[]`` = "no declared contract" → existing behavior
+# preserved (the auto-scan of ``input_text`` for absolute paths still
+# runs as Phase-4 observability; it does NOT gate completion). A
+# non-empty list = "explicit contract" → completion gates on every
+# declared path existing on disk.
+#
+# Idempotent ``PRAGMA table_info`` pattern, same as AEE-7.2 / AEE-8.2 /
+# AEE v3 notification. Legacy rows keep NULL → no behavioral change.
+# ``run_migrations()`` applies it on every call (no-op when column
+# already present).
+_WO_COMPLETION_GATE_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "expected_artifacts_json",
+        "ALTER TABLE tasks ADD COLUMN expected_artifacts_json TEXT",
+    ),
+    # WO-INCOMPLETE-DELIVERY-AUTORESCUE: rescue-loop counter + cap.
+    # ``rescue_count`` is incremented each time ``complete()`` triggers
+    # an automatic ``_rescue()`` re-validation; ``max_rescues`` is the
+    # configured ceiling (default 1). When ``rescue_count >= max_rescues``
+    # the gate falls through to ``failed`` instead of
+    # ``incomplete_delivery`` (prevents infinite rescue loops). Legacy
+    # rows keep 0 / 1 → behavior preserved for tasks without a rescue
+    # contract. Same idempotent ``PRAGMA table_info`` pattern as above.
+    (
+        "rescue_count",
+        "ALTER TABLE tasks ADD COLUMN rescue_count INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "max_rescues",
+        "ALTER TABLE tasks ADD COLUMN max_rescues INTEGER NOT NULL DEFAULT 1",
+    ),
+]
+
 # AEE-4: Worker metadata + status. Adds 11 columns to `workers` so any
 # registered worker can self-describe its runtime, environment, and
 # current state. The columns are NULLable except `status`, which
@@ -351,6 +394,35 @@ def normalize_capabilities(values: Optional[List[str]]) -> List[str]:
 def encode_capabilities(values: Optional[List[str]]) -> str:
     """Storage helper: normalize then JSON-encode."""
     return _json.dumps(normalize_capabilities(values))
+
+
+def encode_artifact_paths(values: Optional[List[str]]) -> str:
+    """Storage helper for ``expected_artifacts_json``: JSON-encode a
+    list of filesystem paths WITHOUT case-folding.
+
+    ``encode_capabilities`` lowercases its inputs because capability
+    strings are case-insensitive identifiers. Filesystem paths on Linux
+    are case-sensitive, so lowercasing ``/home/ubuntu/Abacus/report.md``
+    into ``/home/ubuntu/abacus/report.md`` corrupts the contract and
+    causes a false ``missing_expected_artifacts`` failure at
+    ``complete()`` time. This helper preserves the original case of
+    each path while still dropping empties, deduping, and sorting for
+    storage determinism (same input → same JSON blob).
+    """
+    if not values:
+        return "[]"
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        if not isinstance(v, str):
+            continue
+        norm = v.strip()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    out.sort()
+    return _json.dumps(out)
 
 
 def decode_capabilities(blob: Optional[str]) -> List[str]:
@@ -522,6 +594,25 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             print(
                 f"[db] AEE v3 notification migration: added task_outputs.{col}",
                 file=_sys_v3_notif.stderr,
+            )
+    # WO-COMPLETION-GATE-MVP: add the ``tasks.expected_artifacts_json``
+    # column. Same idempotent ``PRAGMA table_info`` pattern as AEE-7.2 /
+    # AEE-8.2 / AEE v3 notification above; legacy rows keep NULL, which
+    # the manager reads as "no declared contract" → existing behavior
+    # preserved. The CREATE TABLE statement is intentionally NOT changed
+    # (ALTER TABLE is the established idempotent path — see the comment
+    # block on ``_PHASE4_MIGRATIONS`` above).
+    import sys as _sys_wo_gate
+    for col, stmt in _WO_COMPLETION_GATE_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(
+                f"[db] WO completion gate migration: added tasks.{col}",
+                file=_sys_wo_gate.stderr,
             )
     # AEE-1: index for the new lookup path. Idempotent via IF NOT EXISTS.
     conn.execute(
@@ -717,6 +808,21 @@ def run_migrations() -> list[str]:
             conn.execute(stmt)
             print(
                 f"[db] AEE v3 notification migration: added task_outputs.{col}",
+                file=sys.stderr,
+            )
+            added.append(col)
+    # WO-COMPLETION-GATE-MVP: add the ``tasks.expected_artifacts_json``
+    # column. Same idempotent ``PRAGMA table_info`` pattern as above;
+    # legacy rows keep NULL → existing behavior preserved.
+    for col, stmt in _WO_COMPLETION_GATE_MIGRATIONS:
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+            (col,),
+        ).fetchone()
+        if row is None:
+            conn.execute(stmt)
+            print(
+                f"[db] WO completion gate migration: added tasks.{col}",
                 file=sys.stderr,
             )
             added.append(col)

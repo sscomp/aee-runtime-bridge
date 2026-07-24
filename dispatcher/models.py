@@ -114,6 +114,28 @@ class Task:
     # descriptor contract and ``AEE_PROFILE_UNIFICATION_DECISION_MINI.md``
     # §5 for the phase scope.
     profile: Optional[str] = None
+    # WO-COMPLETION-GATE-MVP: deterministic completion gate. The
+    # caller-declared list of absolute file paths the task is
+    # expected to produce. Persisted as JSON in the
+    # ``expected_artifacts_json`` storage column. ``complete()``
+    # reads this list; when non-empty AND any declared path is
+    # missing on disk, the task transitions to ``failed`` with
+    # ``reason='missing_expected_artifacts'`` instead of
+    # ``completed``. Empty list (the default) = "no declared
+    # contract" → existing behavior preserved (Phase-4 auto-scan
+    # still runs as observability, does NOT gate completion).
+    expected_artifacts: List[str] = field(default_factory=list)
+    # WO-INCOMPLETE-DELIVERY-AUTORESCUE: rescue-loop counter. The
+    # dispatcher increments this each time ``complete()`` triggers
+    # an automatic ``_rescue()`` re-validation. When
+    # ``rescue_count >= max_rescues`` the gate falls through to
+    # ``failed`` instead of ``incomplete_delivery`` (prevents
+    # infinite rescue loops). Persisted in the
+    # ``rescue_count`` storage column; legacy rows keep 0.
+    # ``max_rescues`` is read from the task row's
+    # ``max_rescues`` column (default 1).
+    rescue_count: int = 0
+    max_rescues: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -144,8 +166,24 @@ class TaskEvent:
 LEGAL_TRANSITIONS: Dict[str, List[str]] = {
     "pending":   ["queued", "running", "cancelled", "failed", "timeout"],
     "queued":    ["running", "cancelled", "failed", "timeout"],
-    "running":   ["waiting", "completed", "failed", "cancelled", "timeout"],
+    "running":   ["waiting", "completed", "failed", "cancelled", "timeout",
+                  # WO-INCOMPLETE-DELIVERY-AUTORESCUE: non-terminal rescue
+                  # state. When the completion gate detects missing
+                  # declared ``expected_artifacts`` AND ``rescue_count <
+                  # max_rescues``, the task transitions here instead of
+                  # ``failed``. The dispatcher auto-queues one rescue
+                  # attempt (``_rescue()``) that re-validates the
+                  # declared artifacts; on success the task reaches
+                  # ``completed``, on failure it reaches ``failed``.
+                  "incomplete_delivery"],
     "waiting":   ["running", "cancelled", "failed", "timeout"],
+    # WO-INCOMPLETE-DELIVERY-AUTORESCUE: non-terminal. The dispatcher
+    # transitions here from ``running`` when the completion gate fires
+    # with rescue eligibility. ``_rescue()`` transitions back to
+    # ``running`` (re-validation in progress) and then to ``completed``
+    # (artifacts now present) or ``failed`` (artifacts still missing
+    # after ``max_rescues`` attempts).
+    "incomplete_delivery": ["running", "completed", "failed", "cancelled", "timeout"],
     "completed": [],  # terminal in observability-only mode
     "failed":    ["queued"],   # retry path
     "cancelled": [],
