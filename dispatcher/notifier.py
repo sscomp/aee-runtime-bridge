@@ -300,20 +300,29 @@ def _now_iso_taipei() -> str:
     return datetime.now(timezone(timedelta(hours=8))).isoformat()
 
 
-def notify_completed_hermes_gateway(
+def notify_terminal_hermes_gateway(
     task_id: str,
+    status: str,
     *,
     chat_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Send the completion alert via the Hermes Telegram Gateway.
+    """Send a terminal-status alert via the Hermes Telegram Gateway.
+
+    Generalized form of ``notify_completed_hermes_gateway`` that
+    works for any terminal status (``"completed"``, ``"failed"``,
+    ``"timeout"``, ``"cancelled"``, and any future terminal
+    verdict). The ``status`` is used both as the alert body symbol
+    lookup (via ``_format_alert``) and as the subject suffix so the
+    operator can grep Telegram for ``AEE task failed:`` /
+    ``AEE task timeout:`` etc.
 
     Shells out to ``hermes send --to telegram:<chat_id> --subject
     <subject> --file <tmpfile> --json`` with a 30s timeout. The
     chat id defaults to the ``TELEGRAM_CHAT_ID`` env var when not
     passed explicitly. The subject is
-    ``"AEE task completed: <task_id>"``; the body is the formatted
-    alert text from ``_format_alert(task_id, "completed")`` (or a
-    minimal ``"task <id> completed"`` string when the formatter
+    ``"AEE task <status>: <task_id>"``; the body is the formatted
+    alert text from ``_format_alert(task_id, status)`` (or a
+    minimal ``"task <id> <status>"`` string when the formatter
     returns ``None`` — e.g. when the task row is missing).
 
     Returns a dict with keys:
@@ -357,21 +366,21 @@ def notify_completed_hermes_gateway(
             "last_error": "TELEGRAM_CHAT_ID not set and no chat_id passed",
         }
 
-    subject = f"AEE task completed: {task_id}"
+    subject = f"AEE task {status}: {task_id}"
     # Build the body. _format_alert returns None when the task
     # row is missing (e.g. the task was deleted between complete()
     # and the gate firing). Fall back to a minimal string so the
     # gateway still has a body to send.
     try:
-        body = _format_alert(task_id, "completed")
+        body = _format_alert(task_id, status)
     except Exception as exc:  # noqa: BLE001 — never raise from the formatter
         body = None
         log.warning(
-            "notifier.notify_completed_hermes_gateway: _format_alert raised task_id=%s err=%s",
-            task_id, exc,
+            "notifier.notify_terminal_hermes_gateway: _format_alert raised task_id=%s status=%s err=%s",
+            task_id, status, exc,
         )
     if not body:
-        body = f"task {task_id} completed"
+        body = f"task {task_id} {status}"
 
     tmpfile = None
     try:
@@ -528,46 +537,94 @@ def notify_completed_hermes_gateway(
                 pass
 
 
-def notify_completed_with_fallback(
+# Map a terminal task status to the legacy in-process notifier
+# function. ``completed`` -> ``notify_completed``, etc. Used by
+# ``notify_terminal_with_fallback`` to pick the right legacy
+# fallback so the gate reuses the existing per-status legacy
+# notifier rather than always falling back to ``notify_completed``.
+_LEGACY_NOTIFIER_BY_STATUS: Dict[str, Any] = {}  # populated below
+
+
+def _legacy_notifier_for(status: str):
+    """Return the legacy in-process notifier for ``status``, or
+    ``None`` when no legacy notifier exists for that status.
+
+    The lookup dereferences ``_LEGACY_NOTIFIER_BY_STATUS`` lazily
+    so a test that monkey-patches the module-level
+    ``notify_completed`` / ``notify_failed`` / etc. symbols
+    AFTER import still sees the patched function (the dict holds
+    a name, not a captured reference). This is essential for
+    the existing ``test_fallback_uses_legacy_when_gateway_fails``
+    test which patches ``dispatcher.notifier.notify_completed``.
+    """
+    fn = _LEGACY_NOTIFIER_BY_STATUS.get(status)
+    if fn is None:
+        return None
+    # Re-resolve through the module namespace so tests that
+    # patch the public ``notify_*`` symbols see the patch.
+    import sys
+    mod = sys.modules.get("dispatcher.notifier")
+    if mod is not None:
+        name = getattr(fn, "__name__", None)
+        if name:
+            patched = getattr(mod, name, None)
+            if patched is not None:
+                return patched
+    return fn
+
+
+def notify_terminal_with_fallback(
     task_id: str,
+    status: str,
     *,
     chat_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """AEE v3 gate — try the Hermes Telegram Gateway first, then
-    fall back to the legacy in-process notifier.
+    """AEE v3 guaranteed completion-notification gate — try the
+    Hermes Telegram Gateway first, then fall back to the legacy
+    in-process notifier.
 
-    The primary path (``notify_completed_hermes_gateway``) is the
-    working path. If it returns ``sent=False``, the legacy
-    ``notify_completed`` (which uses the in-process urllib
-    Telegram client) is tried as a fallback so a missing Hermes
-    CLI binary or a gateway outage does not silently drop the
-    alert.
+    Generalized form of the original
+    ``notify_completed_with_fallback`` that works for ANY
+    terminal status (``"completed"``, ``"failed"``,
+    ``"timeout"``, ``"cancelled"``). The primary path
+    (``notify_terminal_hermes_gateway``) is the working path. If
+    it returns ``sent=False``, the legacy in-process notifier
+    for the same status (e.g. ``notify_failed`` for ``failed``)
+    is tried as a fallback so a missing Hermes CLI binary or a
+    gateway outage does not silently drop the alert.
+
+    This is the single notification entry point called from
+    every terminal finalization path in
+    ``TaskManager`` (``complete``, ``fail``, ``timeout``,
+    ``cancel``). It guarantees a notification ATTEMPT for every
+    terminal transition, regardless of whether the artifact /
+    completion gate passed. Notification failure is recorded
+    but NEVER masks the original task outcome (the caller
+    keeps the terminal status the finalization path set).
 
     Returns a merged dict with the same key shape as
-    ``notify_completed_hermes_gateway``. ``method`` reflects
+    ``notify_terminal_hermes_gateway``. ``method`` reflects
     which path actually succeeded:
 
     * ``"hermes_send"`` — the gateway path succeeded.
-    * ``"notifier.notify_completed"`` — the gateway failed and
+    * ``"notifier.notify_<status>"`` — the gateway failed and
       the legacy fallback succeeded.
-    * ``"failed"`` — both paths failed; ``last_error`` is set to
-      a combined string.
+    * ``"failed"`` — both paths failed; ``last_error`` is set
+      to a combined string.
 
-    The legacy ``notify_completed`` returns a bool (not a dict),
-    so this wrapper synthesises the dict shape for the fallback
-    branch: ``message_id`` is ``None`` (the legacy path does not
-    capture the Telegram message id), ``attempts`` is 2, and the
-    timestamps are stamped at the moment the fallback returned.
+    The legacy notifier returns a bool (not a dict), so this
+    wrapper synthesises the dict shape for the fallback branch:
+    ``message_id`` is ``None`` (the legacy path does not
+    capture the Telegram message id), ``attempts`` is 2, and
+    the timestamps are stamped at the moment the fallback
+    returned.
     """
     # Try the Hermes Telegram Gateway first.
-    result = notify_completed_hermes_gateway(task_id, chat_id=chat_id)
+    result = notify_terminal_hermes_gateway(task_id, status, chat_id=chat_id)
     if result.get("sent") and result.get("message_id") is not None:
-        # AEE v3 auditability — record the confirmed-delivery outcome
-        # so the gate's evidence (message_id) can be independently
-        # verified from ``logs/notification_audit.jsonl`` without
-        # having to read the dispatcher DB.
         _append_notification_audit({
             "task_id": task_id,
+            "status": status,
             "sent": True,
             "method": result.get("method"),
             "recipient": result.get("recipient"),
@@ -580,23 +637,27 @@ def notify_completed_with_fallback(
         return result
 
     # Gateway did not confirm a message_id — fall back to the
-    # legacy in-process notifier.
+    # legacy in-process notifier for the same status.
     gateway_error = result.get("last_error")
-    try:
-        legacy_sent = notify_completed(task_id)
-    except Exception as exc:  # noqa: BLE001 — never raise from the gate
-        legacy_sent = False
-        legacy_error = f"notifier.notify_completed raised: {exc}"
+    legacy_fn = _legacy_notifier_for(status)
+    legacy_sent = False
+    legacy_error: Optional[str] = None
+    if legacy_fn is not None:
+        try:
+            legacy_sent = legacy_fn(task_id)
+        except Exception as exc:  # noqa: BLE001 — never raise from the gate
+            legacy_sent = False
+            legacy_error = f"notifier.notify_{status} raised: {exc}"
+        else:
+            legacy_error = None if legacy_sent else f"notifier.notify_{status} returned False"
     else:
-        legacy_error = None if legacy_sent else "notifier.notify_completed returned False"
+        legacy_error = f"no legacy notifier for status={status!r}"
 
+    legacy_method = f"notifier.notify_{status}"
     if legacy_sent:
-        # The legacy path does not capture message_id; stamp a
-        # fresh ts pair so the persisted blob reflects when the
-        # fallback actually fired.
         legacy_result = {
             "sent": True,
-            "method": "notifier.notify_completed",
+            "method": legacy_method,
             "recipient": result.get("recipient"),
             "message_id": None,
             "ts_utc": _now_iso_utc(),
@@ -604,15 +665,11 @@ def notify_completed_with_fallback(
             "attempts": 2,
             "last_error": None,
         }
-        # AEE v3 auditability — record the legacy-fallback outcome
-        # (message_id is None because the legacy path doesn't capture
-        # it; this is a known limitation, not a defect). The audit
-        # record lets the orchestrator distinguish "sent via legacy"
-        # from "sent via gateway" without parsing notification_json.
         _append_notification_audit({
             "task_id": task_id,
+            "status": status,
             "sent": True,
-            "method": "notifier.notify_completed",
+            "method": legacy_method,
             "recipient": legacy_result.get("recipient"),
             "message_id": None,
             "ts_utc": legacy_result.get("ts_utc"),
@@ -622,8 +679,8 @@ def notify_completed_with_fallback(
         })
         return legacy_result
 
-    # Both paths failed. Merge the errors so the operator can
-    # see why both were tried.
+    # Both paths failed (or no legacy fallback exists). Merge the
+    # errors so the operator can see why both were tried.
     combined = []
     if gateway_error:
         combined.append(f"gateway: {gateway_error}")
@@ -639,11 +696,9 @@ def notify_completed_with_fallback(
         "attempts": 2,
         "last_error": "; ".join(combined) if combined else "both paths failed",
     }
-    # AEE v3 auditability — record the both-paths-failed outcome so
-    # the orchestrator can grep the audit log for notification
-    # failures and correlate with NOTIFICATION_FAILED events.
     _append_notification_audit({
         "task_id": task_id,
+        "status": status,
         "sent": False,
         "method": "failed",
         "recipient": failed_result.get("recipient"),
@@ -654,3 +709,40 @@ def notify_completed_with_fallback(
         "attempts": 2,
     })
     return failed_result
+
+
+# Backward-compatibility aliases. Pre-existing call sites and
+# tests import ``notify_completed_hermes_gateway`` and
+# ``notify_completed_with_fallback``; keep those names working
+# as thin wrappers around the generalized terminal gate so the
+# public API surface is preserved.
+def notify_completed_hermes_gateway(
+    task_id: str,
+    *,
+    chat_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Backward-compat alias for ``notify_terminal_hermes_gateway(
+    task_id, "completed", chat_id=chat_id)``."""
+    return notify_terminal_hermes_gateway(task_id, "completed", chat_id=chat_id)
+
+
+def notify_completed_with_fallback(
+    task_id: str,
+    *,
+    chat_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Backward-compat alias for ``notify_terminal_with_fallback(
+    task_id, "completed", chat_id=chat_id)``."""
+    return notify_terminal_with_fallback(task_id, "completed", chat_id=chat_id)
+
+
+# Populate the legacy-notifier lookup AFTER the per-status
+# notifier functions are defined. Each entry maps a terminal
+# status string to the existing in-process notifier function
+# so the fallback path reuses the proven legacy code.
+_LEGACY_NOTIFIER_BY_STATUS = {
+    "completed": notify_completed,
+    "failed": notify_failed,
+    "timeout": notify_timeout,
+    "cancelled": notify_cancelled,
+}

@@ -615,52 +615,81 @@ class TestCompleteWiring(_TempDbMixin, unittest.TestCase):
 
 class TestFailureTimeoutRegression(_TempDbMixin, unittest.TestCase):
     """Test class 2 (per work order): failure / timeout regression.
-    The v3 gate is observability-only and wired only into complete();
-    fail() and timeout() paths must keep their pre-v3 behavior."""
 
-    def test_fail_does_not_emit_notification_event(self):
+    GUARANTEED COMPLETION NOTIFICATION UPDATE (this task): the
+    v3 gate is now wired into ``fail()`` and ``timeout()`` as
+    well as ``complete()``. Each terminal path MUST attempt a
+    Telegram notification. The gate is still
+    observability-only — it NEVER overwrites the just-set
+    terminal status. These tests reflect the new contract:
+    a ``NOTIFICATION_FAILED`` event (no chat_id / no hermes
+    binary in the test env) is expected on fail() and
+    timeout(); the terminal status is preserved.
+    """
+
+    def test_fail_emits_notification_attempt(self):
         m = TaskManager()
-        task_id = self._create_running_task(m, "F-NoNotif")
-        m.fail(task_id, error_message="boom")
+        task_id = self._create_running_task(m, "F-Notif")
+        os.environ.pop("TELEGRAM_CHAT_ID", None)
+        task = m.fail(task_id, error_message="boom")
+        # Terminal status preserved.
+        self.assertEqual(task.status, "failed")
         events = m.events(task_id)
         kinds = [e.kind for e in events]
         self.assertIn(EventKind.FAILED, kinds)
-        # No notification_* events should fire on fail().
-        self.assertNotIn(EventKind.NOTIFICATION_COMPLETED, kinds)
-        self.assertNotIn(EventKind.NOTIFICATION_PENDING, kinds)
-        self.assertNotIn(EventKind.NOTIFICATION_FAILED, kinds)
-        # notification_json column should be NULL (fail doesn't
-        # write it).
+        # Guaranteed completion notification: a notification
+        # attempt fired. With no chat_id / no hermes binary in
+        # the test env, the gate fails to send and emits
+        # NOTIFICATION_FAILED. (Sent=True would also be
+        # acceptable here — the contract is "an attempt was
+        # made", not "send must fail".)
+        notif_kinds = {
+            EventKind.NOTIFICATION_COMPLETED,
+            EventKind.NOTIFICATION_PENDING,
+            EventKind.NOTIFICATION_FAILED,
+        }
+        self.assertTrue(
+            notif_kinds & set(kinds),
+            f"expected a NOTIFICATION_* event on fail(), got kinds={kinds}",
+        )
+        # notification_json is persisted by _notify_terminal.
         out = m.get_output(task_id)
-        # fail() does write output_text? Actually fail() doesn't
-        # write to task_outputs at all — get_output returns None.
-        # Either way, no notification_json.
         if out is not None:
-            self.assertIsNone(out.get("notification_json"))
+            self.assertIsNotNone(out.get("notification_json"))
 
-    def test_timeout_does_not_emit_notification_event(self):
+    def test_timeout_emits_notification_attempt(self):
         m = TaskManager()
-        task_id = self._create_running_task(m, "T-NoNotif")
-        m.timeout(task_id, reason="ran too long")
+        task_id = self._create_running_task(m, "T-Notif")
+        os.environ.pop("TELEGRAM_CHAT_ID", None)
+        task = m.timeout(task_id, reason="ran too long")
+        self.assertEqual(task.status, "timeout")
         events = m.events(task_id)
         kinds = [e.kind for e in events]
         self.assertIn(EventKind.TIMEOUT, kinds)
-        self.assertNotIn(EventKind.NOTIFICATION_COMPLETED, kinds)
-        self.assertNotIn(EventKind.NOTIFICATION_FAILED, kinds)
+        notif_kinds = {
+            EventKind.NOTIFICATION_COMPLETED,
+            EventKind.NOTIFICATION_PENDING,
+            EventKind.NOTIFICATION_FAILED,
+        }
+        self.assertTrue(
+            notif_kinds & set(kinds),
+            f"expected a NOTIFICATION_* event on timeout(), got kinds={kinds}",
+        )
 
     def test_fail_status_unchanged_by_v3_gate(self):
         m = TaskManager()
         task_id = self._create_running_task(m, "F-Status")
+        os.environ.pop("TELEGRAM_CHAT_ID", None)
         task = m.fail(task_id, error_message="err")
         self.assertEqual(task.status, "failed")
-        # completion_state on a failed task: no notification, no
-        # delivery, no finished_at cascade — returns the lowest
-        # stage (EXECUTION_COMPLETED) because nothing is set yet
-        # OR finished_at is set. fail() sets finished_at, so we
-        # expect EVIDENCE_COMPLETED.
+        # completion_state on a failed task: notification_json
+        # is now written by _notify_terminal (sent=False, no
+        # message_id) → compute_completion_state returns
+        # EVIDENCE_COMPLETED (notification_pending stage is
+        # only reached when sent=True with no message_id).
         state = m.completion_state(task_id)
-        # finished_at is set by fail(); delivery_json + notification
-        # are NULL -> EVIDENCE_COMPLETED.
+        # finished_at is set by fail(); notification_json is
+        # present but sent=False → EVIDENCE_COMPLETED.
         self.assertEqual(state, EVIDENCE_COMPLETED)
 
 

@@ -1414,6 +1414,13 @@ class TaskManager:
         )
         _append_log(task_id, "ERROR", f"failed: {error_message}")
         self._emit_event(task_id, EventKind.FAILED, {"error": error_message[:500]})
+        # Guaranteed completion notification — attempt a Telegram
+        # alert for the failed transition. Fired AFTER the
+        # terminal status is persisted so the alert body can read
+        # the task's ``status='failed'`` + ``error_message``. The
+        # gate NEVER raises and NEVER overwrites the just-set
+        # terminal status (observability-enforcement only).
+        self._notify_terminal(task_id, "failed")
         # Task-Mapping work-order (Fix D): mirror the terminal
         # ``failed`` status into ``executor_runs`` so GET /runs
         # list/summary reflect the true lifecycle. Best-effort.
@@ -1445,6 +1452,10 @@ class TaskManager:
             )
         _append_log(task_id, "WARN", f"timeout: {reason}")
         self._emit_event(task_id, EventKind.TIMEOUT, {"reason": reason[:500]})
+        # Guaranteed completion notification — attempt a Telegram
+        # alert for the timeout transition. The gate NEVER raises
+        # and NEVER overwrites the just-set ``status='timeout'``.
+        self._notify_terminal(task_id, "timeout")
         # Task-Mapping work-order (Fix D): mirror terminal timeout into
         # executor_runs so GET /runs reflects the true lifecycle.
         self._sync_executor_runs_status(
@@ -1470,6 +1481,11 @@ class TaskManager:
             )
         _append_log(task_id, "INFO", f"cancelled duration={duration:.2f}s")
         self._emit_event(task_id, EventKind.CANCELLED, {"duration_sec": duration})
+        # Guaranteed completion notification — attempt a Telegram
+        # alert for the cancelled transition. The gate NEVER
+        # raises and NEVER overwrites the just-set
+        # ``status='cancelled'``.
+        self._notify_terminal(task_id, "cancelled")
         # Task-Mapping work-order (Fix D): mirror terminal cancelled
         # into executor_runs so GET /runs reflects the true lifecycle.
         self._sync_executor_runs_status(task_id, status="cancelled")
@@ -1592,6 +1608,126 @@ class TaskManager:
         return compute_completion_state(merged)
 
     # ---- internal --------------------------------------------------------
+
+    def _notify_terminal(
+        self,
+        task_id: str,
+        status: str,
+    ) -> Dict[str, Any]:
+        """Guaranteed completion-notification gate — attempt a
+        Telegram notification for the terminal transition
+        ``status`` (one of ``"completed"``, ``"failed"``,
+        ``"timeout"``, ``"cancelled"``).
+
+        This is the single entry point called from every
+        terminal finalization path (``complete``, ``fail``,
+        ``timeout``, ``cancel``). It:
+
+        * Calls ``notify_terminal_with_fallback`` (the v3 gate
+          that tries the Hermes Telegram Gateway then falls
+          back to the legacy in-process notifier).
+        * Persists the gate's result dict into
+          ``task_outputs.notification_json`` (idempotent
+          UPDATE-or-INSERT preserving existing columns).
+        * Emits the matching ``EventKind.NOTIFICATION_*``
+          event so the orchestrator can observe the
+          notification outcome without reading the DB.
+        * NEVER raises — any exception in the notification path
+          is caught and recorded as ``sent=False`` so the
+          original task outcome set by the caller is preserved.
+        * NEVER overwrites the task's terminal ``status`` — the
+          notification gate is observability-enforcement, not
+          state-machine-blocking, in this iteration.
+
+        Idempotency: this method does NOT guard against
+        duplicate terminal notifications by itself — the
+        caller (e.g. ``fail()``) is responsible for the
+        ``is_legal_transition`` check that prevents a second
+        terminal transition. The ``is_legal_transition`` guard
+        at the top of each terminal method is the dedup
+        boundary: once a task is in a terminal status, the
+        next call to ``fail``/``complete``/``timeout``/
+        ``cancel`` raises ``IllegalTransition`` BEFORE
+        reaching this method, so the notification is fired
+        exactly once per terminal transition.
+
+        Returns the gate's result dict (always non-None).
+        """
+        try:
+            from dispatcher.notifier import notify_terminal_with_fallback
+            notif = notify_terminal_with_fallback(task_id, status)
+            notif_blob = json.dumps(notif, default=str, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001 — never raise from the gate
+            notif = {
+                "sent": False,
+                "method": "failed",
+                "last_error": f"gate exception: {exc}",
+            }
+            notif_blob = json.dumps(notif, default=str, ensure_ascii=False)
+            log.warning(
+                "manager._notify_terminal: gate exception task_id=%s status=%s err=%s",
+                task_id, status, exc,
+            )
+        # Persist notification_json into task_outputs (idempotent
+        # UPDATE-or-INSERT mirroring the complete() write).
+        try:
+            with transaction() as conn_notif:
+                cur = conn_notif.execute(
+                    "SELECT 1 FROM task_outputs WHERE task_id = ?", (task_id,)
+                )
+                if cur.fetchone() is None:
+                    conn_notif.execute(
+                        "INSERT INTO task_outputs (task_id, notification_json) VALUES (?, ?)",
+                        (task_id, notif_blob),
+                    )
+                else:
+                    conn_notif.execute(
+                        "UPDATE task_outputs SET notification_json = ? WHERE task_id = ?",
+                        (notif_blob, task_id),
+                    )
+        except Exception as exc:  # noqa: BLE001 — never raise from the persistence
+            log.warning(
+                "manager._notify_terminal: persist failed task_id=%s status=%s err=%s",
+                task_id, status, exc,
+            )
+        # Emit the matching NOTIFICATION_* event.
+        try:
+            if notif.get("sent") and notif.get("message_id") is not None:
+                self._emit_event(task_id, EventKind.NOTIFICATION_COMPLETED, {
+                    "status": status,
+                    "method": notif.get("method"),
+                    "recipient": notif.get("recipient"),
+                    "message_id": notif.get("message_id"),
+                    "ts_utc": notif.get("ts_utc"),
+                    "ts_taipei": notif.get("ts_taipei"),
+                })
+            elif notif.get("sent") and notif.get("message_id") is None:
+                self._emit_event(task_id, EventKind.NOTIFICATION_PENDING, {
+                    "status": status,
+                    "method": notif.get("method"),
+                    "last_error": notif.get("last_error"),
+                })
+            else:
+                self._emit_event(task_id, EventKind.NOTIFICATION_FAILED, {
+                    "status": status,
+                    "method": notif.get("method"),
+                    "last_error": notif.get("last_error"),
+                })
+        except Exception as exc:  # noqa: BLE001 — never raise from the event emit
+            log.warning(
+                "manager._notify_terminal: event emit failed task_id=%s status=%s err=%s",
+                task_id, status, exc,
+            )
+        log.info(
+            "manager._notify_terminal: task_id=%s status=%s "
+            "notif_sent=%s notif_method=%s notif_msg_id=%s",
+            task_id,
+            status,
+            bool(notif.get("sent")),
+            notif.get("method", ""),
+            notif.get("message_id"),
+        )
+        return notif
 
     def _emit_event(self, task_id: str, kind: str, payload: Optional[Dict[str, Any]]) -> None:
         conn = get_conn()
