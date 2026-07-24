@@ -14,7 +14,7 @@
 | 元件 | 角色 | 端點 | 持久化 |
 |---|---|---|---|
 | ChatGPT Custom GPT Action | 任務派發者（Planner/Orchestrator） | OpenAI 內部 | 無（GPT session 結束即遺失） |
-| Hermes Runtime Bridge (`127.0.0.1:8787`) | 安全 façade、4 端點 thin pass-through | `/health` `/runs` `/runs/{id}` `/runs/{id}/summary` `/runs/{id}/stop` | 無 |
+| AEE Runtime Bridge (`127.0.0.1:8787`) | 安全 façade、4 端點 thin pass-through | `/health` `/runs` `/runs/{id}` `/runs/{id}/summary` `/runs/{id}/stop` | 無 |
 | Hermes M2 API Server (`127.0.0.1:8642`) | 任務執行 runtime、SSE event stream | `/v1/runs` 等 | Hermes 內部 session 機制（生命週期有限） |
 | supervisord (PID 7) | 服務守護 | – | – |
 | Cloudflare Tunnel | 對外暴露 `hermes-runtime.biaobecue.com` | – | – |

@@ -1,4 +1,4 @@
-# Hermes Runtime Bridge
+# AEE Runtime Bridge
 
 A thin, safe OpenAI-Custom-GPT-Action / MCP-friendly facade in front of the
 Hermes M2 (Abacus.ai) `/v1/runs` API. As of Epic 9 (ADR-009), this repository
@@ -9,7 +9,7 @@ across all four product profiles (`full`, `mini`, `edge`, `developer`).
 ChatGPT Custom GPT Action          (or MCP client)
         │  Authorization: Bearer ***
         ▼
-Hermes Runtime Bridge   (this service, 127.0.0.1:8787)
+AEE Runtime Bridge   (this service, 127.0.0.1:8787)
         │  Authorization: Bearer ***   (different key)
         ▼
 Hermes M2 API server    (127.0.0.1:8642, not exposed to internet)

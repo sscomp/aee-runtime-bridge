@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: Hermes Runtime Bridge
+  title: AEE Runtime Bridge
   version: 1.2.0
   description: |
     A thin, safe facade in front of the Hermes M2 (Abacus.ai) `/v1/runs` API,

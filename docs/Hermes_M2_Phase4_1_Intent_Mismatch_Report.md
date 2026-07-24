@@ -1,4 +1,4 @@
-# Hermes Runtime Bridge — Phase 4.1 Intent-Mismatch Detection
+# AEE Runtime Bridge — Phase 4.1 Intent-Mismatch Detection
 
 **Date:** 2026-07-08
 **Author:** M2 (Hermes assistant)

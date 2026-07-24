@@ -1,4 +1,4 @@
-# Hermes Runtime Bridge — Phase 4 Delivery Verification Layer
+# AEE Runtime Bridge — Phase 4 Delivery Verification Layer
 
 **Date:** 2026-07-08
 **Author:** M2 (Hermes assistant)

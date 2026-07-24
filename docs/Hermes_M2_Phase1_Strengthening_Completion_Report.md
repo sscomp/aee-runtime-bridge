@@ -77,7 +77,7 @@ POST /tasks/{task_id}/rerun              # clone + dispatch
 ```
 ChatGPT Custom GPT Action
   ↓ (POST /runs → task_id + run_id)
-Hermes Runtime Bridge (port 8787)
+AEE Runtime Bridge (port 8787)
   ├─ app.py — FastAPI, multi-key auth, danger check
   ├─ dispatcher/manager.py — state machine, 8 states, audit events
   ├─ dispatcher/db.py — SQLite (WAL) — 4 tables, single writer

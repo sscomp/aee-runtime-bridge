@@ -1,5 +1,5 @@
 """
-Hermes Runtime Bridge — Phase 1 (Dispatcher-enabled)
+AEE Runtime Bridge — Phase 1 (Dispatcher-enabled)
 ======================================================
 A thin, safe OpenAI-Custom-GPT-Action / MCP-friendly facade in front of the
 Hermes M2 (Abacus.ai) `/v1/runs` API, with a built-in Task Dispatcher so
@@ -200,7 +200,7 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Hermes Runtime Bridge",
+    title="AEE Runtime Bridge",
     version="1.3.0-aee2",
     description=(
         "A minimal bridge that exposes Hermes M2 (Abacus.ai) as a safe OpenAI "

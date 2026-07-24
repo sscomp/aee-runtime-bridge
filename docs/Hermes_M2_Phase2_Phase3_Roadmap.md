@@ -1,4 +1,4 @@
-# Hermes Runtime Bridge — Phase 2 / Phase 3 Roadmap
+# AEE Runtime Bridge — Phase 2 / Phase 3 Roadmap
 
 Author: M2 (Hermes assistant) · Date: 2026-07-07
 For: 鼎鼎 (Scott Chang)
