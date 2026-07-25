@@ -1,0 +1,51 @@
+# AEE Bootstrap v1 — Ubuntu/Debian apt dependency manifest (§6.1, §13.1, §13.2).
+#
+# Hard dependencies installed during stage 01_deps on Ubuntu/Debian only.
+# macOS and Windows are out of scope for W2 (spec §13.3 / §13.4).
+#
+# Format: one package name per line, blank lines and lines starting with
+# `#` are ignored. The deps.sh shell layer installs these via
+# `apt-get install --no-install-recommends` (spec §6.3) for
+# reproducibility.
+#
+# Floors (spec §1.4):
+#   git     2.30+
+#   python3 3.11+  (Ubuntu 22.04 ships 3.10 — bootstrap installs
+#                   python3.11 from deadsnakes PPA per §13.1;
+#                   Debian 12 ships 3.11 natively per §13.2)
+#   uv      latest (installed via pip after python3 is present — not
+#                   an apt package; handled by deps.sh post-apt step)
+#
+# Notes:
+#   * `python3.11` on Ubuntu 22.04 requires the deadsnakes PPA. The
+#     deps.sh layer adds the PPA before installing. On Debian 12 the
+#     system python3 is already 3.11 so this is a no-op.
+#   * `supervisor` is a profile-gated dep (§6.2: `mini` + `full`).
+#     Listed here so the manifest is the single source; deps.sh
+#     filters by profile.
+#   * `curl` is required for the uv installer fetch (astral.sh).
+#   * `ca-certificates` is required for HTTPS package mirrors.
+#   * `gnupg` is required for apt repo key import (deadsnakes).
+
+# --- Core hard dependencies (always installed) ---
+git
+python3
+python3-pip
+python3-venv
+curl
+ca-certificates
+gnupg
+
+# --- Ubuntu 22.04 Python 3.11 floor (no-op on Debian 12) ---
+python3.11
+python3.11-venv
+
+# --- Profile-gated: supervisor (mini + full) ---
+supervisor
+
+# --- Profile-gated: docker (full + edge) ---
+# docker.io is the Debian/Ubuntu native package. On Ubuntu it maps to
+# the docker.io apt source. Operators wanting the upstream Docker CE
+# build can pre-install it; deps.sh will skip if `docker` is already
+# on PATH (idempotency per §5.1).
+docker.io
