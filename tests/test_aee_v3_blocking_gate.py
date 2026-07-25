@@ -352,10 +352,16 @@ class TestBlockingGateFailureRegression(_TempDbMixin, unittest.TestCase):
         # fail() should NOT raise NotificationBlocked even with
         # blocking=true. It may try to send a failure notification,
         # but the blocking gate only applies to complete().
-        try:
-            m.fail(task_id, error_message="test failure")
-        except NotificationBlocked:
-            self.fail("fail() must NOT raise NotificationBlocked")
+        # Notification path MUST be stubbed so no real hermes send
+        # fires (same isolation gap as test_run_task_mapping.py).
+        with mock.patch(
+            "dispatcher.notifier.notify_terminal_with_fallback",
+            return_value={"sent": True, "message_id": 9999},
+        ):
+            try:
+                m.fail(task_id, error_message="test failure")
+            except NotificationBlocked:
+                self.fail("fail() must NOT raise NotificationBlocked")
         failed = m.get(task_id)
         self.assertEqual(failed.status, "failed")
 
@@ -365,10 +371,16 @@ class TestBlockingGateFailureRegression(_TempDbMixin, unittest.TestCase):
         os.environ["TELEGRAM_BOT_TOKEN"] = "dummy"
         m = TaskManager()
         task_id = self._create_running_task(m, "blocking-timeout-path")
-        try:
-            m.timeout(task_id, reason="shadow timeout test")
-        except NotificationBlocked:
-            self.fail("timeout() must NOT raise NotificationBlocked")
+        # Notification path MUST be stubbed so no real hermes send
+        # fires (same isolation gap as test_run_task_mapping.py).
+        with mock.patch(
+            "dispatcher.notifier.notify_terminal_with_fallback",
+            return_value={"sent": True, "message_id": 9999},
+        ):
+            try:
+                m.timeout(task_id, reason="shadow timeout test")
+            except NotificationBlocked:
+                self.fail("timeout() must NOT raise NotificationBlocked")
         timed = m.get(task_id)
         self.assertEqual(timed.status, "timeout")
 

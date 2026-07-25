@@ -940,76 +940,27 @@ class TaskManager:
         self._emit_event(task_id, EventKind.COMPLETED, {
             "duration_sec": duration, "result_path": result_path,
         })
-        # AEE v3 Telegram Completion Enforcement Gate — fire notification
-        # via the Hermes Telegram Gateway (the working path). The legacy
-        # notifier.notify_completed is the silent fallback. The gate's
-        # result is recorded in task_outputs.notification_json; a missing
-        # / failed notification leaves the task in `notification_pending`
-        # (non-terminal under the v3 model) but does NOT block the
-        # existing `status='completed'` for backward compatibility —
-        # the gate is observability-enforcement, not state-machine-blocking,
-        # in this iteration (a future iteration can flip to blocking once
-        # the 7-day shadow run is green).
-        try:
-            from dispatcher.notifier import notify_completed_with_fallback
-            notif = notify_completed_with_fallback(task_id)
-            notif_blob = json.dumps(notif, default=str, ensure_ascii=False)
-        except Exception as exc:  # noqa: BLE001 — never raise from the gate
-            notif = {"sent": False, "method": "failed", "last_error": f"gate exception: {exc}"}
-            notif_blob = json.dumps(notif, default=str, ensure_ascii=False)
-            log.warning("manager.complete: notification gate exception task_id=%s err=%s", task_id, exc)
-        # Persist notification_json into task_outputs (idempotent UPDATE —
-        # the row may have been INSERTed above; use INSERT OR REPLACE pattern
-        # mirroring the delivery_json write at line 527, but only updating
-        # the notification_json column to avoid clobbering output_text/usage/raw).
-        with transaction() as conn3:
-            # If the row exists, UPDATE only notification_json. If not, INSERT
-            # a stub row with NULLs for the other columns.
-            cur = conn3.execute(
-                "SELECT 1 FROM task_outputs WHERE task_id = ?", (task_id,)
-            )
-            if cur.fetchone() is None:
-                conn3.execute(
-                    "INSERT INTO task_outputs (task_id, notification_json) VALUES (?, ?)",
-                    (task_id, notif_blob),
-                )
-            else:
-                conn3.execute(
-                    "UPDATE task_outputs SET notification_json = ? WHERE task_id = ?",
-                    (notif_blob, task_id),
-                )
-        # Emit the appropriate event for the gate result.
-        if notif.get("sent") and notif.get("message_id") is not None:
-            self._emit_event(task_id, EventKind.NOTIFICATION_COMPLETED, {
-                "method": notif.get("method"),
-                "recipient": notif.get("recipient"),
-                "message_id": notif.get("message_id"),
-                "ts_utc": notif.get("ts_utc"),
-                "ts_taipei": notif.get("ts_taipei"),
-            })
-        elif notif.get("sent") and notif.get("message_id") is None:
-            # sent but no message_id — treat as pending (queued but not delivered)
-            self._emit_event(task_id, EventKind.NOTIFICATION_PENDING, {
-                "method": notif.get("method"),
-                "last_error": notif.get("last_error"),
-            })
-        else:
-            self._emit_event(task_id, EventKind.NOTIFICATION_FAILED, {
-                "method": notif.get("method"),
-                "last_error": notif.get("last_error"),
-            })
-        # Structured completion log — extend the AEE-7.2 INFO line
-        # above with the notification gate's outcome so the dispatcher
-        # log remains the single source of truth for the v3 gate
-        # without requiring a join against task_outputs.
-        log.info(
-            "manager.complete: notification gate task_id=%s "
-            "notif_sent=%s notif_method=%s notif_msg_id=%s",
-            task_id,
-            bool(notif.get("sent")),
-            notif.get("method", ""),
-            notif.get("message_id"),
-        )
+        # AEE v3 Telegram Completion Enforcement Gate — fire the
+        # terminal notification through the SAME centralized
+        # ``_notify_terminal`` path used by ``fail()`` / ``timeout()``
+        # / ``cancel()``. This unifies the terminal-notification
+        # behaviour across all terminal transitions: the gate's
+        # result is recorded in ``task_outputs.notification_json``,
+        # the matching ``EventKind.NOTIFICATION_*`` event is emitted,
+        # and any persistence / event-emit exception is isolated so
+        # the just-set ``status='completed'`` is preserved. A
+        # missing / failed notification leaves the task in
+        # ``notification_pending`` (non-terminal under the v3 model)
+        # but does NOT block the existing ``status='completed'`` for
+        # backward compatibility — the gate is
+        # observability-enforcement, not state-machine-blocking, in
+        # this iteration (a future iteration can flip to blocking
+        # once the 7-day shadow run is green).
+        #
+        # ``_notify_terminal`` returns the gate's result dict so the
+        # blocking gate below can inspect ``sent`` / ``message_id``
+        # and decide whether to revert + raise ``NotificationBlocked``.
+        notif = self._notify_terminal(task_id, "completed")
         # AEE v3 blocking completion gate — runtime enforcement.
         # When ``enforcement_gate.blocking == true`` AND the
         # notification gate did NOT confirm delivery (``sent ==

@@ -739,11 +739,18 @@ class TestMissingTelegramHandling(_TempDbMixin, unittest.TestCase):
         self.assertFalse(notif["sent"])
 
     def test_complete_with_gateway_exception_does_not_raise(self):
-        """If notify_completed_with_fallback itself raises
-        (defensive — it shouldn't), the gate's try/except in
-        complete() catches it and records a 'gate exception'
-        notification_json — complete() never raises from the
-        gate."""
+        """If the centralized ``_notify_terminal`` gate itself raises
+        (defensive — ``notify_terminal_with_fallback`` should not),
+        ``_notify_terminal`` catches it and records a 'gate
+        exception' notification_json — ``complete()`` never raises
+        from the gate. After unifying the terminal-notification
+        path, ``complete()`` calls ``_notify_terminal(task_id,
+        \"completed\")`` which in turn calls
+        ``notify_terminal_with_fallback`` (the generalized gate),
+        so the patch target moves from the legacy
+        ``notify_completed_with_fallback`` alias to the
+        generalized function.
+        """
 
         m = TaskManager()
         task_id = self._create_running_task(m, "M-Exc")
@@ -753,7 +760,7 @@ class TestMissingTelegramHandling(_TempDbMixin, unittest.TestCase):
             raise RuntimeError("unexpected gate failure")
 
         with mock.patch(
-            "dispatcher.notifier.notify_completed_with_fallback",
+            "dispatcher.notifier.notify_terminal_with_fallback",
             side_effect=boom,
         ):
             task = m.complete(task_id, output_text="done")
