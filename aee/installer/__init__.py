@@ -76,6 +76,31 @@ from aee.installer.backend import (
     UNIVERSAL_STEPS,
     plan_install,
 )
+# Bootstrap v1 — W1 shared bootstrap core skeleton (§4 + §5 + §10.4).
+# Lifecycle / stage vocabulary / marker store / detection framework hooks.
+# Imported here so future CLI layers (W3/W4/W5) consume a single canonical
+# ``aee.installer`` surface.
+from aee.installer.lifecycle import (
+    EXIT_DEPENDENCY_FLOOR_NOT_MET,
+    EXIT_DRIFT_DETECTED,
+    EXIT_NETWORK_ERROR,
+    EXIT_SECRET_MISSING,
+    EXIT_STAGE_FAILED_PERMANENT,
+    EXIT_STAGE_FAILED_RETRYABLE,
+    MAX_RETRY,
+    PYTHON_STAGES,
+    RETRY_BACKOFF_SECONDS,
+    SHELL_STAGES,
+    BootstrapLifecycle,
+    BootstrapState,
+    InMemoryMarkerStore,
+    MarkerStore,
+    StageMarker,
+    StageName,
+    StageState,
+    default_profile_for,
+    detect_platform,
+)
 
 __all__ = [
     "EXIT_OK",
@@ -95,4 +120,24 @@ __all__ = [
     "MINI_HARDENING_STEPS",
     "UNIVERSAL_STEPS",
     "plan_install",
+    # Bootstrap v1 — W1 shared bootstrap core skeleton
+    "EXIT_STAGE_FAILED_RETRYABLE",
+    "EXIT_STAGE_FAILED_PERMANENT",
+    "EXIT_DRIFT_DETECTED",
+    "EXIT_NETWORK_ERROR",
+    "EXIT_SECRET_MISSING",
+    "EXIT_DEPENDENCY_FLOOR_NOT_MET",
+    "MAX_RETRY",
+    "RETRY_BACKOFF_SECONDS",
+    "SHELL_STAGES",
+    "PYTHON_STAGES",
+    "StageName",
+    "StageState",
+    "StageMarker",
+    "BootstrapState",
+    "MarkerStore",
+    "InMemoryMarkerStore",
+    "BootstrapLifecycle",
+    "detect_platform",
+    "default_profile_for",
 ]
