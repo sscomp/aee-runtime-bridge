@@ -198,15 +198,5 @@ class TestOpenApiDescriptionDefault80(unittest.TestCase):
         self.assertNotIn("default 50", desc,
                          "stale 'default 50' must be gone from OpenAPI")
 
-    def test_e2e_evidence_openapi_description_says_80(self) -> None:
-        path = REPO_ROOT / "AEE_GPT_E2E_EVIDENCE" / "gpt_aee_executor_openapi.json"
-        self.assertTrue(path.exists())
-        with path.open() as fh:
-            data = json.load(fh)
-        schema = data["components"]["schemas"]["ExecutorRunRequest"]
-        desc = schema["properties"]["max_turns"]["description"]
-        self.assertIn("default 80", desc)
-
-
 if __name__ == "__main__":
     unittest.main(verbosity=2)

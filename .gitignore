@@ -24,12 +24,23 @@ secrets/
 private/
 
 # ---------- 2. Runtime data ----------
-# SQLite DBs (WAL + SHM sidecar)
+# ---------- 2. Runtime data ----------
+# SQLite DBs (WAL + SHM sidecar) under data/
 data/*.db
-data/*.db-*
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+# Pre-rebuild DB backups under data/ (e.g. dispatcher.db.pre-rebuild-20260711T152000Z{,-shm,-wal})
+data/*.pre-rebuild*
+# Root-level runtime DB (legacy path; data/ is the canonical location)
+/dispatcher.db
+/dispatcher.db-journal
+/dispatcher.db-wal
+/dispatcher.db-shm
+# Runtime evidence capture directory
+/AEE_GPT_E2E_EVIDENCE/
+# Hash receipts generated alongside root-level work-order reports
+/*.sha256
 # Local-only runtime_data (introduced in AEE-0)
 runtime_data/
 # Logs
