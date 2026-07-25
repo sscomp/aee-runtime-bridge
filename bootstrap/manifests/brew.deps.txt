@@ -1,0 +1,54 @@
+# AEE Bootstrap v1 — macOS Homebrew formulae manifest (§6.1, §6.3, §13.3).
+#
+# Hard dependencies installed during stage 01_deps on macOS only.
+# Ubuntu/Debian (apt) and Windows (winget) are out of scope for W3
+# (spec §13.1 / §13.2 / §13.4).
+#
+# Format: one Homebrew formula name per line, blank lines and lines
+# starting with `#` are ignored. The macos_deps.sh shell layer installs
+# these via `brew install` (spec §6.3) for reproducibility. brew's own
+# "already installed" short-circuit provides idempotency (§5.1).
+#
+# Floors (spec §1.4, §6.1):
+#   git           2.30+
+#   python@3.11   3.11+  (Homebrew formula `python@3.11`; the bootstrap
+#                         does NOT use the system Python on macOS since
+#                         it may be 3.9 or older and is owned by Apple)
+#   curl          latest  (bundled with macOS but pinned via brew for
+#                         reproducibility; the uv installer fetch from
+#                         astral.sh needs a recent curl)
+#   ca-certificates  latest  (HTTPS trust store for brew + pip)
+#
+# Notes:
+#   * `python@3.11` is a Homebrew versioned formula; `brew install
+#     python@3.11` installs the 3.11 interpreter and pip. The bootstrap
+#     does NOT install `python` (unversioned) — versioned formulae are
+#     the canonical pinned path per spec §6.3.
+#   * `supervisor` is listed for parity with apt.deps.txt but is
+#     profile-gated to mini+full. On macOS v1 the only supported
+#     profile is `developer` (spec §13.3, MacOSDefaults.profile_supported
+#     == ("developer",)), so the supervisor formula is NEVER installed
+#     by the W3 slice. It is kept in the manifest so the file is the
+#     single source of truth and a future macOS profile expansion can
+#     enable it without touching the manifest.
+#   * `docker` is similarly listed for parity but profile-gated to
+#     full+edge and is therefore NEVER installed by W3 on macOS.
+#   * `uv` is installed via pip after python@3.11 is present — not a
+#     Homebrew formula in this slice (handled by macos_deps.sh post-brew
+#     step, mirroring the W2 install_uv helper).
+#
+# Profile-gated formulae (macos_bootstrap.py + macos_deps.sh filter):
+#   supervisor  → mini + full   (NEVER installed on macOS v1; developer-only)
+#   docker      → full + edge   (NEVER installed on macOS v1; developer-only)
+
+# --- Core hard dependencies (always installed on macOS) ---
+git
+python@3.11
+curl
+ca-certificates
+
+# --- Profile-gated: supervisor (mini + full; never on macOS v1) ---
+supervisor
+
+# --- Profile-gated: docker (full + edge; never on macOS v1) ---
+docker
