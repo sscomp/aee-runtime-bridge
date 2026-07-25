@@ -59,7 +59,7 @@
             "type": "integer",
             "format": "int32",
             "minimum": 1,
-            "description": "Override the configured Claude Code CLI --max-turns (default 50).",
+            "description": "Override the configured Claude Code CLI --max-turns (default 80).",
             "example": 10
           }
         }

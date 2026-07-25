@@ -136,7 +136,7 @@ class ClaudeCodeCliRunner:
         self,
         *,
         binary: str = "/home/ubuntu/.local/bin/claude",
-        max_turns: int = 50,
+        max_turns: int = 80,
         output_format: str = "text",
         bare: bool = False,
         cancel_grace_seconds: float = 5.0,
@@ -157,7 +157,7 @@ class ClaudeCodeCliRunner:
         extra = cfg.get("extra_cli_args") or []
         return cls(
             binary=str(cfg.get("claude_cli_binary") or "/home/ubuntu/.local/bin/claude"),
-            max_turns=int(cfg.get("max_turns") or 50),
+            max_turns=int(cfg.get("max_turns") or 80),
             output_format=str(cfg.get("output_format") or "text"),
             bare=bool(cfg.get("bare", False)),
             extra_cli_args=[str(a) for a in extra] if extra else None,

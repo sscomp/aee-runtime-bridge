@@ -35,7 +35,7 @@ _DEFAULTS: Dict[str, Any] = {
     "default_executor": "claude-code-cli",
     "default_timeout_sec": 120,
     "max_timeout_sec": 7200,
-    "max_turns": 50,
+    "max_turns": 80,
     "bare": False,
     "output_format": "text",
     "stdout_summary_cap": 2000,
