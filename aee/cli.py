@@ -73,6 +73,15 @@ EXIT_PRE_FLIGHT_FAILED = 4
 #: reinstall").
 EXIT_PROFILE_SWITCH_REJECTED = 5
 
+#: Exit code returned by ``aee doctor`` when all required checks pass
+#: but at least one optional check raised a caveat. Distinct from the
+#: installer's exit codes (0/2/3/4/5/6) — see :mod:`aee.doctor`.
+EXIT_DOCTOR_CAVEATS = 7
+
+#: Exit code returned by ``aee doctor`` when at least one required
+#: check failed.
+EXIT_DOCTOR_FAILED = 8
+
 
 def _profile_choices_help() -> str:
     """Build the ``--profile`` help string from the canonical tuple."""
@@ -184,6 +193,47 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Emit the dispatch contract as a JSON object on stdout.",
+    )
+
+    # ``doctor`` subcommand (Phase 2 — AEE readiness health check).
+    # The doctor is read-only and side-effect free; it never sends
+    # credentials, mutates the dispatcher DB, or writes to disk. The
+    # ``--no-network`` flag skips the upstream reachability probe for
+    # air-gapped environments; ``--repo-root`` overrides the detected
+    # repo root (defaults to cwd); ``--json`` emits a machine-readable
+    # report on stdout.
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help=(
+            "Run a comprehensive AEE readiness health check. Validates "
+            "Python/runtime version, git availability, Hermes Runtime "
+            "connectivity, required dependencies, configuration files, "
+            "environment-variable presence, directory permissions, "
+            "and optional Docker availability. Reports a PASS / "
+            "PASS WITH CAVEATS / FAIL summary. Read-only; no side "
+            "effects. Exit codes: 0 = OK, 7 = caveats, 8 = fail."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--no-network",
+        action="store_true",
+        help=(
+            "Skip the upstream Hermes Runtime reachability probe "
+            "(use in air-gapped or offline environments)."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--repo-root",
+        default=None,
+        help=(
+            "Path to the AEE repository root (defaults to the current "
+            "working directory)."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the report as a JSON object on stdout.",
     )
     return parser
 
@@ -350,6 +400,53 @@ def _install_dispatch(
     return EXIT_OK
 
 
+def _doctor_dispatch(
+    profile: str,
+    *,
+    no_network: bool = False,
+    repo_root: Optional[str] = None,
+    json_output: bool = False,
+) -> int:
+    """Run the ``aee doctor`` health check (Phase 2).
+
+    Imports :mod:`aee.doctor` lazily so a missing optional dependency
+    cannot break ``aee install``. Maps the doctor's verdict to the
+    doctor-specific exit codes (:data:`EXIT_OK`,
+    :data:`EXIT_DOCTOR_CAVEATS`, :data:`EXIT_DOCTOR_FAILED`).
+
+    The doctor is read-only: it never sends credentials, mutates the
+    dispatcher DB, or writes to disk. The ``--no-network`` flag skips
+    the upstream reachability probe for air-gapped environments.
+    """
+    from aee.doctor import (
+        DoctorRunner,
+        EXIT_DOCTOR_CAVEATS,
+        EXIT_DOCTOR_FAILED,
+        EXIT_DOCTOR_OK,
+    )
+    from pathlib import Path
+
+    runner = DoctorRunner(
+        repo_root=Path(repo_root) if repo_root else None,
+        profile=profile,
+        network=not no_network,
+    )
+    report = runner.run()
+
+    if json_output:
+        import json
+        sys.stdout.write(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(report.to_text())
+
+    if report.verdict == "PASS":
+        return EXIT_DOCTOR_OK
+    if report.verdict == "CAVEAT":
+        return EXIT_DOCTOR_CAVEATS
+    return EXIT_DOCTOR_FAILED
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Unified AEE CLI entrypoint.
 
@@ -383,6 +480,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             effective,
             json_output=getattr(args, "json", False),
         )
+    if args.subcommand == "doctor":
+        # ``aee doctor`` — read-only readiness health check (Phase 2).
+        # The doctor runs against the global ``--profile`` (recovered
+        # via the same pre-pass as ``install`` because argparse's
+        # subparser also overwrites ``args.profile`` here). The
+        # ``--no-network`` flag and ``--repo-root`` flag are
+        # subcommand-specific. The doctor module is imported lazily so
+        # a missing optional dependency cannot break ``aee install``.
+        global_profile = _extract_global_profile(argv)
+        return _doctor_dispatch(
+            profile=global_profile,
+            no_network=getattr(args, "no_network", False),
+            repo_root=getattr(args, "repo_root", None),
+            json_output=getattr(args, "json", False),
+        )
     # Future §21.x subcommands land here. Unknown subcommand is
     # impossible (argparse rejects it), but keep a defensive branch.
     parser.error("unknown subcommand: {sc!r}".format(sc=args.subcommand))
@@ -396,6 +508,8 @@ __all__ = [
     "EXIT_PROFILE_ERROR",
     "EXIT_PRE_FLIGHT_FAILED",
     "EXIT_PROFILE_SWITCH_REJECTED",
+    "EXIT_DOCTOR_CAVEATS",
+    "EXIT_DOCTOR_FAILED",
     "main",
 ]
 
