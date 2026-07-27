@@ -189,6 +189,59 @@ def _build_parser() -> argparse.ArgumentParser:
             "this flag is accepted for forward-compat with §21.3)."
         ),
     )
+    # Phase 4B — approved installer CLI flags (§21.3). These are
+    # parsed + recorded in the InstallCliOptions / InstallCliResult
+    # shape but do NOT trigger shell-level side effects in this
+    # slice; the §21.3 shell execution path (system user, env file,
+    # supervisord reload, smoke test) is a separately authorizable
+    # follow-up. ``--execute`` requests the shell path; the backend
+    # raises ExecuteNotAuthorizedError (exit 6) until that follow-up
+    # lands. ``--resume`` / ``--from`` / ``--rollback-to`` are
+    # audit-only (no git operations, no marker replay).
+    install_parser.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "Request the shell-level install execution path (§21.3). "
+            "In this slice the path is gated by "
+            "ExecuteNotAuthorizedError (exit code 6); the flag is "
+            "recorded in the result so CI / tests can observe that "
+            "the request was received. The default is dry-run."
+        ),
+    )
+    install_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume a previously-started install run (§10.4 stage "
+            "marker replay). Audit-only in this slice — the flag is "
+            "recorded in the result; no stage-marker replay is "
+            "performed (the shell trampolines W6/W7 are the "
+            "separately authorizable follow-up)."
+        ),
+    )
+    install_parser.add_argument(
+        "--from",
+        dest="from_ref",
+        default=None,
+        metavar="<ref>",
+        help=(
+            "Install from a specific git ref (e.g. a tag, branch, or "
+            "commit SHA). Audit-only in this slice — the ref is "
+            "recorded in the result; no git operations are performed."
+        ),
+    )
+    install_parser.add_argument(
+        "--rollback-to",
+        dest="rollback_to",
+        default=None,
+        metavar="<ref>",
+        help=(
+            "Rollback to a specific git ref before installing. "
+            "Audit-only in this slice — the ref is recorded in the "
+            "result; no git operations are performed."
+        ),
+    )
     install_parser.add_argument(
         "--json",
         action="store_true",
@@ -443,6 +496,84 @@ def _install_dispatch(
     return EXIT_OK
 
 
+def _install_dispatch_phase4b(
+    profile: str,
+    *,
+    execute: bool = False,
+    resume: bool = False,
+    from_ref: Optional[str] = None,
+    rollback_to: Optional[str] = None,
+    json_output: bool = False,
+) -> int:
+    """Phase 4B ``aee install`` dispatch (§21.3 approved flags).
+
+    Delegates to :func:`aee.installer.cli_install.run_install` so the
+    approved flag metadata (``--execute`` / ``--resume`` / ``--from`` /
+    ``--rollback-to``) is captured in an :class:`InstallCliResult`.
+    Renders the result as either plain text or JSON (when ``--json``)
+    and returns the result's exit code.
+
+    This dispatch path is taken only when at least one Phase 4B flag
+    is present; the Phase 9.2 :func:`_install_dispatch` path is
+    preserved verbatim for backward compat when no flags are passed.
+    """
+    from aee.installer.cli_install import (
+        InstallCliOptions,
+        run_install,
+    )
+
+    options = InstallCliOptions(
+        profile=profile,
+        execute=execute,
+        resume=resume,
+        from_ref=from_ref,
+        rollback_to=rollback_to,
+        repo_root=None,
+    )
+    result = run_install(options)
+
+    if json_output:
+        import json
+        payload = result.to_dict()
+        payload["subcommand"] = "install"
+        payload["default_profile"] = DEFAULT_PROFILE
+        payload["known_profiles"] = list(KNOWN_PROFILES)
+        payload["phase"] = "4B"
+        sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True))
+        sys.stdout.write("\n")
+        return result.exit_code
+
+    lines = [
+        "aee install (Phase 4B / §21.3 installer CLI)",
+        "  profile (resolved)  : {p}".format(p=result.profile),
+        "  execute_requested   : {e}".format(e=result.execute_requested),
+        "  resume              : {r}".format(r=result.resume),
+        "  from_ref            : {f}".format(f=result.from_ref),
+        "  rollback_to         : {rb}".format(rb=result.rollback_to),
+        "  executed            : {ex}".format(ex=result.executed),
+        "  exit_code           : {ec}".format(ec=result.exit_code),
+    ]
+    if result.plan is not None:
+        step_ids = [s.step_id for s in result.plan.steps]
+        lines.append(
+            "  plan steps          : {n} ({ids})".format(
+                n=len(result.plan.steps), ids=", ".join(step_ids)
+            )
+        )
+    if result.preflight is not None:
+        lines.append(
+            "  preflight ok        : {ok}".format(
+                ok=result.preflight.ok
+            )
+        )
+    if result.error:
+        lines.append("  error               : {e}".format(e=result.error))
+    for note in result.notes:
+        lines.append("  note                : {n}".format(n=note))
+    sys.stdout.write("\n".join(lines) + "\n")
+    return result.exit_code
+
+
 def _doctor_dispatch(
     profile: str,
     *,
@@ -624,6 +755,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         global_profile = _extract_global_profile(argv)
         sub_profile = args.profile  # None when subcommand flag omitted
         effective = _resolve_profile(global_profile, sub_profile)
+        # Phase 4B — when any of the approved installer flags is
+        # present, route through the new run_install flow so the
+        # flag metadata is captured in the InstallCliResult. When
+        # none of the flags is present, preserve the Phase 9.2
+        # ``_install_dispatch`` path verbatim for backward compat
+        # (existing tests assert on its exact stdout text).
+        phase4b_flags = (
+            getattr(args, "execute", False),
+            getattr(args, "resume", False),
+            getattr(args, "from_ref", None) is not None,
+            getattr(args, "rollback_to", None) is not None,
+        )
+        if any(phase4b_flags):
+            return _install_dispatch_phase4b(
+                effective,
+                execute=getattr(args, "execute", False),
+                resume=getattr(args, "resume", False),
+                from_ref=getattr(args, "from_ref", None),
+                rollback_to=getattr(args, "rollback_to", None),
+                json_output=getattr(args, "json", False),
+            )
         return _install_dispatch(
             effective,
             json_output=getattr(args, "json", False),
