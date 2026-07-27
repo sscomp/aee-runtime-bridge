@@ -235,6 +235,49 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit the report as a JSON object on stdout.",
     )
+
+    # ``prepare`` subcommand (Phase 3 — end-to-end installer workflow).
+    # Composes the Phase 2 doctor + §21.3 installer backend + W2/W3
+    # bootstrap detection + directory init + config bootstrap + projected
+    # post-install verification into a single dry-run-by-default
+    # workflow. Read-only; no side effects. Exit codes reuse the
+    # existing vocabulary (0/4/5/6/7/8).
+    prepare_parser = subparsers.add_parser(
+        "prepare",
+        help=(
+            "Run the end-to-end AEE installer workflow (Phase 3). "
+            "Composes the doctor readiness probe, the installer "
+            "backend plan, the platform bootstrap dependency plan, "
+            "directory initialization, configuration bootstrap, and "
+            "projected post-install verification into a single "
+            "dry-run-by-default workflow. Read-only; no side effects. "
+            "Exit codes: 0 = OK, 7 = caveats, 8 = fail, 4 = pre-flight "
+            "failed, 5 = profile switch rejected, 6 = execute not "
+            "authorized."
+        ),
+    )
+    prepare_parser.add_argument(
+        "--no-network",
+        action="store_true",
+        help=(
+            "Skip the upstream Hermes Runtime reachability probe "
+            "(forwarded to the doctor stage; use in air-gapped or "
+            "offline environments)."
+        ),
+    )
+    prepare_parser.add_argument(
+        "--repo-root",
+        default=None,
+        help=(
+            "Path to the AEE repository root (defaults to the current "
+            "working directory)."
+        ),
+    )
+    prepare_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the workflow result as a JSON object on stdout.",
+    )
     return parser
 
 
@@ -447,6 +490,111 @@ def _doctor_dispatch(
     return EXIT_DOCTOR_FAILED
 
 
+def _prepare_dispatch(
+    profile: str,
+    *,
+    no_network: bool = False,
+    repo_root: Optional[str] = None,
+    json_output: bool = False,
+) -> int:
+    """Run the ``aee prepare`` end-to-end installer workflow (Phase 3).
+
+    Imports :mod:`aee.installer.workflow` lazily so a missing optional
+    dependency cannot break ``aee install`` or ``aee doctor``. Maps
+    the workflow's overall verdict to the existing exit-code
+    vocabulary (0/4/5/6/7/8).
+
+    The workflow is dry-run by default; there is no ``--execute`` flag
+    on this subcommand (the shell-level execution path is a
+    separately authorizable follow-up, matching the §21.3 guard).
+    """
+    from pathlib import Path
+    from aee.installer.workflow import run_workflow
+
+    result = run_workflow(
+        profile=profile,
+        repo_root=Path(repo_root) if repo_root else None,
+        network=not no_network,
+        dry_run=True,
+    )
+
+    if json_output:
+        import json
+        sys.stdout.write(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(_prepare_result_to_text(result))
+
+    return result.summary.overall_exit_code
+
+
+def _prepare_result_to_text(result: object) -> str:
+    """Render the workflow result as a plain-text summary."""
+    s = getattr(result, "summary", None)
+    if s is None:
+        return "aee prepare: no summary\n"
+    lines = [
+        "aee prepare (dry-run / Phase 3 installer workflow)",
+        "  profile             : {p}".format(p=getattr(s, "profile", "")),
+        "  dry_run             : {d}".format(d=getattr(s, "dry_run", True)),
+        "  doctor_verdict       : {v}".format(v=getattr(s, "doctor_verdict", "")),
+        "  doctor_exit_code     : {c}".format(c=getattr(s, "doctor_exit_code", 0)),
+        "  install_exit_code    : {c}".format(c=getattr(s, "install_exit_code", 0)),
+        "  overall_exit_code    : {c}".format(c=getattr(s, "overall_exit_code", 0)),
+        "  overall_verdict      : {v}".format(v=getattr(s, "overall_verdict", "")),
+    ]
+    # Directory init plan summary.
+    di = getattr(result, "directory_init", None)
+    if di is not None:
+        entries = getattr(di, "entries", ()) or ()
+        missing = [p for p, _, e in entries if not e]
+        lines.append(
+            "  directory_init       : {n} entries, {m} missing".format(
+                n=len(entries), m=len(missing),
+            )
+        )
+    # Config bootstrap summary.
+    cb = getattr(result, "config_bootstrap", None)
+    if cb is not None:
+        lines.append(
+            "  config_bootstrap      : env_would_install={e}, sup_would_install={s}, marker_would_write={m}".format(
+                e=getattr(cb, "env_file_would_install", False),
+                s=getattr(cb, "supervisor_conf_would_install", False),
+                m=getattr(cb, "profile_marker_would_write", False),
+            )
+        )
+    # Platform bootstrap summary.
+    pb = getattr(result, "platform_bootstrap", None)
+    if pb is not None:
+        lines.append(
+            "  platform_bootstrap    : platform={p}, supported={s}, profile_allowed={a}".format(
+                p=getattr(pb, "platform", "unknown"),
+                s=getattr(pb, "supported", False),
+                a=getattr(pb, "profile_allowed", False),
+            )
+        )
+        err = getattr(pb, "error", "")
+        if err:
+            lines.append("    error: {e}".format(e=err))
+    # Post-install verification summary.
+    pv = getattr(result, "post_install_verification", None)
+    if pv is not None:
+        checks = getattr(pv, "checks", ()) or ()
+        would_pass_all = all(p for _, p, _ in checks) if checks else True
+        lines.append(
+            "  post_install_verify   : {n} checks, would_pass_all={a}".format(
+                n=len(checks), a=would_pass_all,
+            )
+        )
+        notes = getattr(pv, "notes", ()) or ()
+        for note in notes:
+            lines.append("    note: {n}".format(n=note))
+    error = getattr(result, "error", "")
+    if error:
+        lines.append("  error                : {e}".format(e=error))
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Unified AEE CLI entrypoint.
 
@@ -490,6 +638,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         # a missing optional dependency cannot break ``aee install``.
         global_profile = _extract_global_profile(argv)
         return _doctor_dispatch(
+            profile=global_profile,
+            no_network=getattr(args, "no_network", False),
+            repo_root=getattr(args, "repo_root", None),
+            json_output=getattr(args, "json", False),
+        )
+    if args.subcommand == "prepare":
+        # ``aee prepare`` — end-to-end installer workflow (Phase 3).
+        # Composes doctor + installer backend + platform bootstrap +
+        # directory init + config bootstrap + projected post-install
+        # verification. Dry-run by default; --execute is refused
+        # (shell-level execution is a separately authorizable
+        # follow-up, matching the §21.3 guard). Exit codes reuse the
+        # existing vocabulary (0/4/5/6/7/8).
+        global_profile = _extract_global_profile(argv)
+        return _prepare_dispatch(
             profile=global_profile,
             no_network=getattr(args, "no_network", False),
             repo_root=getattr(args, "repo_root", None),
