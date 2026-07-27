@@ -51,6 +51,20 @@ from aee.profiles.descriptor import (
     parse_profile,
 )
 
+# Phase 4A — import the proposed bootstrap v1 exit-code constants (§10.4)
+# from the lifecycle module so the backend's exception classes can map to
+# them without duplicating the canonical definitions.  The lifecycle module
+# owns these constants (W1 skeleton); the backend owns the exception
+# hierarchy.  No circular import: lifecycle imports only platform.current.
+from aee.installer.lifecycle import (
+    EXIT_STAGE_FAILED_RETRYABLE,
+    EXIT_STAGE_FAILED_PERMANENT,
+    EXIT_DRIFT_DETECTED,
+    EXIT_NETWORK_ERROR,
+    EXIT_SECRET_MISSING,
+    EXIT_DEPENDENCY_FLOOR_NOT_MET,
+)
+
 
 # ---------------------------------------------------------------------------
 # Exit codes
@@ -158,6 +172,139 @@ class ExecuteNotAuthorizedError(InstallerError):
             "the §21.3 shell-level install path is a separately "
             "authorizable follow-up (use plan() + preflight() only)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4A — bootstrap v1 exit-code exception hierarchy (§10.4 proposed)
+# ---------------------------------------------------------------------------
+#
+# Each new exception maps 1:1 to a §10.4 proposed exit-code constant
+# imported from ``aee.installer.lifecycle`` (W1 skeleton owns the
+# constants; the backend owns the exception hierarchy).  These are
+# *introduced* in Phase 4A as named, raisable exception classes so the
+# future W4/W5 CLI layers (and the shell trampolines W6/W7) can map a
+# failure mode to the correct exit code via ``except StageFailedRetryableError``
+# rather than re-deriving the integer.  The constants themselves are
+# NOT renumbered — they are the same values already pinned by
+# ``aee/tests/test_installer_lifecycle.py::TestExitConstants``.
+
+
+class StageFailedRetryableError(InstallerError):
+    """A bootstrap stage failed but is retryable (§10.4 code 7).
+
+    Re-run with ``--resume``.  Raised by the future execute path when
+    a stage reports a transient failure (e.g. temporary network
+    blip, lock contention).  Phase 4A introduces the class; the
+    shell layer (W6/W7) will raise it.
+    """
+
+    exit_code = EXIT_STAGE_FAILED_RETRYABLE
+
+    def __init__(self, stage: str, reason: str = "") -> None:
+        msg = "stage '{s}' failed (retryable)".format(s=stage)
+        if reason:
+            msg += ": {r}".format(r=reason)
+        super().__init__(msg)
+        self.stage = stage
+        self.reason = reason
+
+
+class StageFailedPermanentError(InstallerError):
+    """A bootstrap stage failed permanently (§10.4 code 8).
+
+    Max retries exceeded; requires ``--force-retry`` or operator
+    intervention.  Raised by the future execute path when a stage
+    has exhausted its ``MAX_RETRY`` budget.
+    """
+
+    exit_code = EXIT_STAGE_FAILED_PERMANENT
+
+    def __init__(self, stage: str, reason: str = "") -> None:
+        msg = "stage '{s}' failed (permanent)".format(s=stage)
+        if reason:
+            msg += ": {r}".format(r=reason)
+        super().__init__(msg)
+        self.stage = stage
+        self.reason = reason
+
+
+class DriftDetectedError(InstallerError):
+    """On-disk state drifted from the recorded pin (§10.4 code 9).
+
+    ``commit_sha`` or ``requirements_lock_sha256`` mismatch detected
+    by ``aee doctor`` or ``aee update``.  Read-only detection — the
+    caller decides whether to re-pin or re-install.
+    """
+
+    exit_code = EXIT_DRIFT_DETECTED
+
+    def __init__(self, field: str, expected: str, actual: str) -> None:
+        super().__init__(
+            "drift detected: {f} expected={e} actual={a}".format(
+                f=field, e=expected, a=actual,
+            )
+        )
+        self.field = field
+        self.expected = expected
+        self.actual = actual
+
+
+class NetworkError(InstallerError):
+    """Network / git error (§10.4 code 10).
+
+    Clone, fetch, or package-mirror unreachable.  Raised by the
+    future execute path (W4/W5) when a network-dependent step fails
+    for reasons distinct from a stage retryable failure.
+    """
+
+    exit_code = EXIT_NETWORK_ERROR
+
+    def __init__(self, operation: str, reason: str = "") -> None:
+        msg = "network error during '{op}'".format(op=operation)
+        if reason:
+            msg += ": {r}".format(r=reason)
+        super().__init__(msg)
+        self.operation = operation
+        self.reason = reason
+
+
+class SecretMissingError(InstallerError):
+    """A required secret is missing or invalid (§10.4 code 11).
+
+    Raised by the future execute path (W4/W5) or ``aee doctor``
+    when a required secret (API key, token, password) is absent or
+    fails validation.  Never include the secret value in the
+    message — only the secret *name*.
+    """
+
+    exit_code = EXIT_SECRET_MISSING
+
+    def __init__(self, secret_name: str) -> None:
+        super().__init__(
+            "required secret missing or invalid: '{n}'".format(n=secret_name)
+        )
+        self.secret_name = secret_name
+
+
+class DependencyFloorNotMetError(InstallerError):
+    """A hard dependency floor is not met (§10.4 code 12).
+
+    git, python, or node version below the required floor and cannot
+    be auto-installed.  Raised by the future execute path (W4/W5)
+    during the ``01_deps`` stage.
+    """
+
+    exit_code = EXIT_DEPENDENCY_FLOOR_NOT_MET
+
+    def __init__(self, dependency: str, required: str, found: str) -> None:
+        super().__init__(
+            "dependency floor not met for '{d}': required>={r} found={f}".format(
+                d=dependency, r=required, f=found,
+            )
+        )
+        self.dependency = dependency
+        self.required = required
+        self.found = found
 
 
 # ---------------------------------------------------------------------------
