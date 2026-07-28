@@ -1,0 +1,53 @@
+# AEE Bootstrap v1 — Windows winget/PowerShell dependency manifest (§6.1, §6.3, §13.4).
+#
+# Hard dependencies installed during stage 01_deps on Windows only.
+# Ubuntu/Debian (apt) and macOS (brew) are out of scope for W7
+# (spec §13.1 / §13.2 / §13.3).
+#
+# Format: one winget package id per line, blank lines and lines starting
+# with `#` are ignored. The deps.ps1 shell layer installs these via
+# `winget install --id <pkg> --silent --accept-package-agreements`
+# (spec §6.3) for reproducibility. winget's own "already installed"
+# short-circuit provides idempotency (§5.1).
+#
+# Floors (spec §1.4):
+#   Git.Git            2.30+   (winget installs latest stable)
+#   Python.Python.3.11 3.11+   (winget installs latest 3.11.x)
+#   Python.Python.3.12 3.12+   (optional; for future py3.12 floor)
+#
+# Notes:
+#   * `Git.Git` is the winget id for Git for Windows.
+#   * `Python.Python.3.11` is the winget id for the python.org 3.11
+#     installer. PowerShell 5.1 is built into Windows 11; no winget
+#     package is needed for it.
+#   * `curl` ships with Windows 10+ (curl.exe in System32); no winget
+#     package is needed.
+#   * `supervisor` is a profile-gated dep on POSIX (§6.2: `mini` + `full`).
+#     On Windows, supervisor is a Python package installed via
+#     ``pip install supervisor`` (spec §6.2), NOT a winget package.
+#     §13.4 says Windows uses a Windows Service or scheduled task instead
+#     of the supervisor package. The entry is kept here for manifest
+#     parity with the POSIX manifests; the deps.ps1 Filter-PackagesByProfile
+#     function excludes it from the winget install set on every profile.
+#     Operators running `mini`/`full` on Windows must register the
+#     Windows Service / scheduled task by hand (spec §13.4), and install
+#     the supervisor Python package via pip if the supervisor runtime is
+#     needed.
+#   * `Docker.DockerDesktop` is profile-gated (§6.2: `full` + `edge`).
+#     Docker Desktop requires Windows 11 Pro/Enterprise or WSL2; this
+#     manifest does NOT enforce that — winget will fail with a clear
+#     message if the SKU is insufficient.
+
+# --- Core hard dependencies (always installed) ---
+Git.Git
+Python.Python.3.11
+
+# --- Filtered out on Windows: supervisor (mini + full on POSIX) ---
+# supervisor is a pip package on Windows (spec §6.2), not a winget id.
+# Filter-PackagesByProfile excludes it from the winget install set on
+# every profile. Operators register the Windows Service / scheduled task
+# by hand (spec §13.4). Kept for manifest parity with POSIX manifests.
+supervisor
+
+# --- Profile-gated: Docker Desktop (full + edge) ---
+Docker.DockerDesktop
