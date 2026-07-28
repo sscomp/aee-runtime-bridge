@@ -331,6 +331,92 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit the workflow result as a JSON object on stdout.",
     )
+
+    # ``update`` subcommand (Phase 4C — W5 update CLI surface).
+    # Advances the install to the latest of the current channel, or
+    # switches channel with ``--channel {stable,rc,dev}`` / ``--ref``.
+    # Performs projected drift detection (read-only, no git fetch) and
+    # read-only pre-flight. Dry-run by default; ``--execute`` is
+    # gated by :class:`ExecuteNotAuthorizedError` (exit code 6),
+    # matching the §21.3 guard. Exit codes reuse the existing
+    # vocabulary (0/3/4/5/6) plus the proposed drift code (9).
+    update_parser = subparsers.add_parser(
+        "update",
+        help=(
+            "Advance the install to the latest of the current "
+            "channel, or switch channel with --channel. Performs "
+            "projected drift detection (read-only) + read-only "
+            "pre-flight. Dry-run by default. Exit codes: 0 = OK, "
+            "3 = unknown profile/channel, 4 = pre-flight failed, "
+            "5 = profile switch rejected, 6 = execute not "
+            "authorized, 9 = drift detected (projected)."
+        ),
+    )
+    update_parser.add_argument(
+        "--channel",
+        default="stable",
+        choices=("stable", "rc", "dev"),
+        help=(
+            "Release channel to advance to (§21.3 / W9). One of: "
+            "stable, rc, dev. Default: stable (the canonical "
+            "default; matches aee.installer.update.DEFAULT_CHANNEL)."
+        ),
+    )
+    update_parser.add_argument(
+        "--ref",
+        default=None,
+        metavar="<ref>",
+        help=(
+            "Update from a specific git ref (e.g. a tag, branch, or "
+            "commit SHA). Audit-only in this slice — the ref is "
+            "recorded in the result; no git operations are performed."
+        ),
+    )
+    update_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Non-interactive confirmation (skip the interactive "
+            "prompt). Audit-only in this slice — recorded in the "
+            "result; does NOT bypass the --execute guard."
+        ),
+    )
+    update_parser.add_argument(
+        "--offline-bundle",
+        default=None,
+        metavar="<path>",
+        help=(
+            "Path to a pre-downloaded offline bundle. Audit-only in "
+            "this slice — recorded in the result; no filesystem "
+            "reads beyond existence projection."
+        ),
+    )
+    update_parser.add_argument(
+        "--log-format",
+        default=None,
+        metavar="<format>",
+        help=(
+            "Log format (e.g. text, json). Audit-only in this slice "
+            "— recorded in the result; no log configuration is "
+            "performed."
+        ),
+    )
+    update_parser.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "Request the shell-level update execution path (§21.3). "
+            "In this slice the path is gated by "
+            "ExecuteNotAuthorizedError (exit code 6); the flag is "
+            "recorded in the result so CI / tests can observe that "
+            "the request was received. The default is dry-run."
+        ),
+    )
+    update_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the update result as a JSON object on stdout.",
+    )
     return parser
 
 
@@ -726,6 +812,99 @@ def _prepare_result_to_text(result: object) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _update_dispatch(
+    profile: str,
+    *,
+    channel: str = "stable",
+    ref: Optional[str] = None,
+    yes: bool = False,
+    offline_bundle: Optional[str] = None,
+    log_format: Optional[str] = None,
+    execute: bool = False,
+    json_output: bool = False,
+) -> int:
+    """Phase 4C ``aee update`` dispatch (W5 update CLI surface).
+
+    Delegates to :func:`aee.installer.update.run_update` so the
+    approved flag metadata (``--channel`` / ``--ref`` / ``--yes`` /
+    ``--offline-bundle`` / ``--log-format`` / ``--execute``) is
+    captured in an :class:`UpdateCliResult`. Renders the result as
+    either plain text or JSON (when ``--json``) and returns the
+    result's exit code.
+    """
+    from aee.installer.update import (
+        UpdateCliOptions,
+        run_update,
+    )
+
+    options = UpdateCliOptions(
+        profile=profile,
+        channel=channel,
+        ref=ref,
+        yes=yes,
+        offline_bundle=offline_bundle,
+        log_format=log_format,
+        execute=execute,
+        repo_root=None,
+    )
+    result = run_update(options)
+
+    if json_output:
+        import json
+        payload = result.to_dict()
+        payload["subcommand"] = "update"
+        payload["default_channel"] = "stable"
+        payload["known_channels"] = ["stable", "rc", "dev"]
+        payload["phase"] = "4C"
+        sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True))
+        sys.stdout.write("\n")
+        return result.exit_code
+
+    lines = [
+        "aee update (Phase 4C / W5 update CLI)",
+        "  profile (resolved)  : {p}".format(p=result.profile),
+        "  channel             : {c}".format(c=result.channel),
+        "  ref                 : {r}".format(r=result.ref),
+        "  yes                 : {y}".format(y=result.yes),
+        "  offline_bundle      : {ob}".format(ob=result.offline_bundle),
+        "  log_format          : {lf}".format(lf=result.log_format),
+        "  execute_requested   : {e}".format(e=result.execute_requested),
+        "  executed            : {ex}".format(ex=result.executed),
+        "  exit_code           : {ec}".format(ec=result.exit_code),
+    ]
+    if result.plan is not None:
+        step_ids = [s.step_id for s in result.plan.steps]
+        lines.append(
+            "  plan steps          : {n} ({ids})".format(
+                n=len(result.plan.steps), ids=", ".join(step_ids)
+            )
+        )
+    if result.preflight is not None:
+        lines.append(
+            "  preflight ok        : {ok}".format(
+                ok=result.preflight.ok
+            )
+        )
+    # Drift summary.
+    d = result.drift
+    lines.append(
+        "  drift (projected)   : would_drift={wd}, "
+        "recorded_commit={rc}, on_disk_commit={oc}".format(
+            wd=d.would_drift,
+            rc=d.recorded_commit_sha,
+            oc=d.on_disk_commit_sha,
+        )
+    )
+    if d.would_drift and d.reason:
+        lines.append("    drift reason       : {r}".format(r=d.reason))
+    if result.error:
+        lines.append("  error               : {e}".format(e=result.error))
+    for note in result.notes:
+        lines.append("  note                : {n}".format(n=note))
+    sys.stdout.write("\n".join(lines) + "\n")
+    return result.exit_code
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Unified AEE CLI entrypoint.
 
@@ -808,6 +987,29 @@ def main(argv: Optional[List[str]] = None) -> int:
             profile=global_profile,
             no_network=getattr(args, "no_network", False),
             repo_root=getattr(args, "repo_root", None),
+            json_output=getattr(args, "json", False),
+        )
+    if args.subcommand == "update":
+        # ``aee update`` — W5 update CLI surface (Phase 4C). Advances
+        # the install to the latest of the current channel, or
+        # switches channel with ``--channel``. Performs projected
+        # drift detection (read-only) + read-only pre-flight. Dry-run
+        # by default; ``--execute`` is gated by
+        # ExecuteNotAuthorizedError (exit code 6). Exit codes reuse
+        # the existing vocabulary (0/3/4/5/6) plus the proposed drift
+        # code (9). The update runs against the global ``--profile``
+        # (recovered via the same pre-pass as ``install``/``doctor``/
+        # ``prepare`` because argparse's subparser overwrites
+        # ``args.profile``).
+        global_profile = _extract_global_profile(argv)
+        return _update_dispatch(
+            profile=global_profile,
+            channel=getattr(args, "channel", "stable"),
+            ref=getattr(args, "ref", None),
+            yes=getattr(args, "yes", False),
+            offline_bundle=getattr(args, "offline_bundle", None),
+            log_format=getattr(args, "log_format", None),
+            execute=getattr(args, "execute", False),
             json_output=getattr(args, "json", False),
         )
     # Future §21.x subcommands land here. Unknown subcommand is
