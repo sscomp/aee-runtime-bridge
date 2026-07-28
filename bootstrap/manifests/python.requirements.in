@@ -1,0 +1,34 @@
+# AEE Bootstrap v1 — Python runtime requirements manifest (spec §6.1, §6.3).
+#
+# This is the bootstrap-manifest copy of the repo's runtime Python deps.
+# The canonical source for runtime deps is the repo-root
+# ``requirements.in`` / ``requirements.lock``; this manifest exists so
+# the bootstrap layer has a single self-contained manifests/ tree (spec
+# §3 layout) and the future ``aee doctor --reproducibility`` check can
+# verify the lock hash without reaching outside ``bootstrap/``.
+#
+# Format: one requirement per line, compatible with ``uv pip install
+# -r``. No version pins here — the lockfile (python.requirements.lock)
+# is the source of truth for pinned versions + hashes.
+#
+# Spec §6.1 hard deps:
+#   * No additional Python hard deps beyond the runtime's own
+#     requirements. The bootstrap itself is stdlib-only (lifecycle,
+#     redaction, detect all use only Python stdlib).
+#
+# Spec §6.2 profile-gated:
+#   * ``full`` / ``edge`` — no extra Python deps (Docker is system-level).
+#   * ``mini`` — no extra Python deps (supervisor is system-level apt/brew).
+#   * ``developer`` — no extra Python deps (Node.js is system-level).
+#
+# This manifest intentionally mirrors ``../../requirements.in`` so the
+# bootstrap layer is self-describing. When the repo's runtime deps
+# change, this file and ``python.requirements.lock`` MUST be regenerated
+# via ``uv pip compile -o bootstrap/manifests/python.requirements.lock
+# bootstrap/manifests/python.requirements.in``.
+
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+pydantic
