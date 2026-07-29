@@ -454,17 +454,38 @@ def detect_drift(repo_root: Path) -> DriftResult:
 def validate_channel(channel: str) -> str:
     """Validate ``channel`` against :data:`KNOWN_CHANNELS`.
 
-    Returns the canonical channel name. Raises ``ValueError`` on an
-    unknown channel (the CLI layer's argparse ``choices`` already
-    rejects this, but a programmatic caller may bypass argparse).
+    Returns the canonical (lowercase, stripped) channel name. Raises
+    ``ValueError`` on an unknown channel (the CLI layer's argparse
+    ``choices`` already rejects this, but a programmatic caller may
+    bypass argparse).
+
+    .. note::
+
+       This validator is **case-insensitive** and strips surrounding
+       whitespace, matching :func:`aee.installer.backend.validate_channel`.
+       Prior to Phase 7 it was case-sensitive; the two surfaces were
+       harmonised so that a programmatic caller switching between the
+       CLI and backend modules sees identical behaviour. The exception
+       type remains ``ValueError`` (CLI surface) rather than
+       :class:`aee.installer.backend.UnknownChannelError` (backend
+       surface) — the CLI preserves its pre-existing exception contract
+       for backwards compatibility with callers that catch
+       ``ValueError``.
     """
-    if channel not in KNOWN_CHANNELS:
+    if not isinstance(channel, str) or not channel:
         raise ValueError(
             "unknown channel: {c!r} (known: {k})".format(
                 c=channel, k=", ".join(KNOWN_CHANNELS),
             )
         )
-    return channel
+    canonical = channel.strip().lower()
+    if canonical not in KNOWN_CHANNELS:
+        raise ValueError(
+            "unknown channel: {c!r} (known: {k})".format(
+                c=channel, k=", ".join(KNOWN_CHANNELS),
+            )
+        )
+    return canonical
 
 
 # ---------------------------------------------------------------------------#

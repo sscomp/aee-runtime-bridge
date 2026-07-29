@@ -72,6 +72,13 @@ from aee.installer.backend import (
     ProfileSwitchRejectedError,
     PreFlightFailedError,
     ExecuteNotAuthorizedError,
+    # Phase 7 / W9 — release channel + ref pinning + drift detection (§9)
+    KNOWN_CHANNELS,
+    DEFAULT_CHANNEL,
+    UnknownChannelError,
+    validate_channel,
+    ReleasePin,
+    DriftReport,
     # Phase 4A — bootstrap v1 exit-code exception hierarchy (§10.4)
     StageFailedRetryableError,
     StageFailedPermanentError,
@@ -134,6 +141,13 @@ __all__ = [
     "MINI_HARDENING_STEPS",
     "UNIVERSAL_STEPS",
     "plan_install",
+    # Phase 7 / W9 — release channel + ref pinning + drift detection
+    "KNOWN_CHANNELS",
+    "DEFAULT_CHANNEL",
+    "UnknownChannelError",
+    "validate_channel",
+    "ReleasePin",
+    "DriftReport",
     # Bootstrap v1 — W1 shared bootstrap core skeleton
     "EXIT_STAGE_FAILED_RETRYABLE",
     "EXIT_STAGE_FAILED_PERMANENT",

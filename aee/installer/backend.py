@@ -688,9 +688,154 @@ class InstallerBackend:
         )
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------#
+# Phase 7 / W9 — Release channel + ref pinning + drift detection (§9)
+# ---------------------------------------------------------------------------#
+#
+# The release-channel vocabulary and drift-detection logic live in
+# :mod:`aee.installer.update` (Phase 4C) for the *update CLI* surface.
+# Phase 7 / W9 extends the *backend* with the matching pin data
+# structure and read-only drift helpers so that ``aee doctor`` and
+# ``aee install`` (future shell layer) consume a single canonical
+# backend surface instead of duplicating the vocabulary.
+#
+# This addition is **strictly additive**: no existing class, function,
+# constant, or exit code is renamed, renumbered, or removed. The
+# existing `plan_install` convenience function is preserved unchanged
+# below.
+
+
+#: The canonical release channels (spec §9.1). The channel selects
+#: which release stream the install tracks. The default channel is
+#: ``stable``. These constants are the *backend* source of truth; the
+#: update CLI (Phase 4C) re-exports the same values from
+#: :mod:`aee.installer.update`.
+KNOWN_CHANNELS: Tuple[str, ...] = ("stable", "rc", "dev")
+
+#: The default release channel (spec §9.1).
+DEFAULT_CHANNEL: str = "stable"
+
+
+class UnknownChannelError(InstallerError):
+    """An unknown release channel was supplied (spec §9.1).
+
+    Defence-in-depth — the CLI layer's argparse ``choices`` is the
+    primary validation. This exception is the backend-side guard.
+    """
+
+    exit_code = EXIT_PROFILE_INVALID  # reuse 3 (no new exit code needed)
+
+    def __init__(self, channel: str) -> None:
+        super().__init__(
+            "unknown release channel: '{c}' (known: {k})".format(
+                c=channel, k=", ".join(KNOWN_CHANNELS),
+            )
+        )
+        self.channel = channel
+
+
+def validate_channel(channel: str) -> str:
+    """Validate ``channel`` against :data:`KNOWN_CHANNELS`.
+
+    Returns the canonical (lowercase) channel name. Raises
+    :class:`UnknownChannelError` on an unknown channel. This is the
+    backend-side validation; the update CLI re-exports a function of
+    the same name from :mod:`aee.installer.update` (Phase 4C) which
+    delegates here.
+    """
+    if not isinstance(channel, str) or not channel:
+        raise UnknownChannelError(repr(channel))
+    canonical = channel.strip().lower()
+    if canonical not in KNOWN_CHANNELS:
+        raise UnknownChannelError(channel)
+    return canonical
+
+
+@dataclass(frozen=True)
+class ReleasePin:
+    """Recorded version pin for an install (spec §9.2).
+
+    The pin is written to the ``03_pin`` stage marker during install
+    and read back by ``aee doctor`` for drift detection. The fields
+    match the YAML structure documented in spec §9.2:
+
+    ``channel`` — ``stable`` / ``rc`` / ``dev``.
+    ``ref`` — the git ref the install is pinned to (e.g.
+    ``refs/tags/v1.0.0`` or ``main``).
+    ``commit_sha`` — the 40-char SHA recorded at pin time.
+    ``pinned_at`` — ISO-8601 UTC timestamp of the pin.
+    ``requirements_lock_sha256`` — sha256 of the lock file at pin
+    time (may be ``None`` when not recorded).
+    """
+
+    channel: str
+    ref: str
+    commit_sha: str
+    pinned_at: str
+    requirements_lock_sha256: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "channel": self.channel,
+            "ref": self.ref,
+            "commit_sha": self.commit_sha,
+            "pinned_at": self.pinned_at,
+            "requirements_lock_sha256": self.requirements_lock_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ReleasePin":
+        """Construct a :class:`ReleasePin` from a dictionary.
+
+        Missing optional fields default to ``None``. This is used to
+        parse the ``03_pin`` marker content back into a typed object.
+        """
+        return cls(
+            channel=data.get("channel", ""),
+            ref=data.get("ref", ""),
+            commit_sha=data.get("commit_sha", ""),
+            pinned_at=data.get("pinned_at", ""),
+            requirements_lock_sha256=data.get("requirements_lock_sha256"),
+        )
+
+
+@dataclass(frozen=True)
+class DriftReport:
+    """Read-only drift-detection result from the backend (spec §9.2).
+
+    ``drifted`` is True when the on-disk HEAD (or lock sha256) differs
+    from the recorded pin. ``reason`` carries a human-readable
+    explanation. ``recorded`` is the :class:`ReleasePin` read from
+    disk (or ``None`` when no pin exists). ``actual_commit_sha`` and
+    ``actual_lock_sha256`` are the on-disk values (or ``None`` when
+    they could not be read).
+
+    This dataclass is the backend-side counterpart of
+    :class:`aee.installer.update.DriftResult`. The update CLI's
+    ``DriftResult`` is the *CLI-facing* shape (carries ``would_drift``
+    for projected checks); this ``DriftReport`` is the *backend*
+    shape (carries the actual vs recorded values for ``aee doctor``).
+    """
+
+    drifted: bool
+    reason: str
+    recorded: Optional[ReleasePin]
+    actual_commit_sha: Optional[str]
+    actual_lock_sha256: Optional[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "drifted": self.drifted,
+            "reason": self.reason,
+            "recorded": self.recorded.to_dict() if self.recorded else None,
+            "actual_commit_sha": self.actual_commit_sha,
+            "actual_lock_sha256": self.actual_lock_sha256,
+        }
+
+
+# ---------------------------------------------------------------------------#
 # Module-level convenience function
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------#
 
 
 def plan_install(
