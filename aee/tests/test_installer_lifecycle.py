@@ -526,7 +526,9 @@ class TestBootstrapLifecycleRunId(unittest.TestCase):
 
 class TestDetectPlatformHook(unittest.TestCase):
     """detect_platform delegates to the existing resolver; Windows
-    resolves to UNKNOWN (honest skeleton — no Windows adapter yet)."""
+    resolves to WINDOWS (W1 skeleton — Windows adapter is a skeleton
+    that declines to materialize; the resolver returns
+    UnknownDefaults unless the operator passes --adapter windows)."""
 
     def test_linux(self) -> None:
         self.assertEqual(detect_platform("linux"), PlatformIdentity.LINUX)
@@ -535,11 +537,16 @@ class TestDetectPlatformHook(unittest.TestCase):
     def test_macos(self) -> None:
         self.assertEqual(detect_platform("darwin"), PlatformIdentity.MACOS)
 
-    def test_windows_resolves_to_unknown(self) -> None:
-        # W1 narrow scope: no Windows adapter; the hook does NOT
-        # pretend Windows is supported.
-        self.assertEqual(detect_platform("win32"), PlatformIdentity.UNKNOWN)
-        self.assertEqual(detect_platform("cygwin"), PlatformIdentity.UNKNOWN)
+    def test_windows_resolves_to_windows(self) -> None:
+        # W1 shipped: WINDOWS identity + WindowsAdapter skeleton. The
+        # hook surfaces WINDOWS (not UNKNOWN) so the installer can
+        # route Windows hosts to the skeleton adapter when the operator
+        # opts in via --adapter windows. The default mapping is still
+        # None (UnknownDefaults) per §17.3 Phase C. Per §14.1 the
+        # WINDOWS identity covers win32, cygwin, and msys.
+        self.assertEqual(detect_platform("win32"), PlatformIdentity.WINDOWS)
+        self.assertEqual(detect_platform("cygwin"), PlatformIdentity.WINDOWS)
+        self.assertEqual(detect_platform("msys"), PlatformIdentity.WINDOWS)
 
     def test_unknown_platforms_resolve_to_unknown(self) -> None:
         self.assertEqual(detect_platform("haiku"), PlatformIdentity.UNKNOWN)

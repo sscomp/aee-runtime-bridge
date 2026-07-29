@@ -72,6 +72,7 @@ class PlatformIdentity(enum.Enum):
 
     LINUX = "linux"
     MACOS = "darwin"
+    WINDOWS = "windows"
     UNKNOWN = "unknown"
 
 
@@ -87,6 +88,7 @@ def resolve_platform_identity(platform: Optional[str] = None) -> PlatformIdentit
 
     * ``"linux"`` / ``"linux2"`` → :data:`PlatformIdentity.LINUX`
     * ``"darwin"``              → :data:`PlatformIdentity.MACOS`
+    * ``"win32"`` / ``"cygwin"`` / ``"msys"`` → :data:`PlatformIdentity.WINDOWS`
     * anything else             → :data:`PlatformIdentity.UNKNOWN`
     """
     p = platform if platform is not None else sys.platform
@@ -94,6 +96,8 @@ def resolve_platform_identity(platform: Optional[str] = None) -> PlatformIdentit
         return PlatformIdentity.LINUX
     if p == "darwin":
         return PlatformIdentity.MACOS
+    if p in ("win32", "cygwin", "msys"):
+        return PlatformIdentity.WINDOWS
     return PlatformIdentity.UNKNOWN
 
 
@@ -103,11 +107,19 @@ def resolve_platform_identity(platform: Optional[str] = None) -> PlatformIdentit
 
 
 #: Maps :class:`PlatformIdentity` → default adapter name in the §21.6
-#: registry. ``UNKNOWN`` maps to ``None`` (no adapter; the resolver
-#: returns :data:`UnknownDefaults` without raising).
+#: registry. ``UNKNOWN`` and ``WINDOWS`` map to ``None``: ``UNKNOWN``
+#: because there is no adapter; ``WINDOWS`` because the Windows adapter
+#: is a **skeleton** (W1, §16) — per §17.3 Phase C "Windows runs in
+#: UNKNOWN capability mode; first-class support waits on the Windows
+#: adapter". Operators who want the skeleton pass ``--adapter windows``
+#: explicitly; the resolver otherwise returns
+#: :data:`UnknownDefaults` for ``PlatformIdentity.WINDOWS`` so the
+#: installer surfaces a clear "Windows is experimental" message rather
+#: than pretending to provision.
 _DEFAULT_ADAPTER_BY_IDENTITY = {
     PlatformIdentity.LINUX: "abacus",
     PlatformIdentity.MACOS: "macbook",
+    PlatformIdentity.WINDOWS: None,
     PlatformIdentity.UNKNOWN: None,
 }
 

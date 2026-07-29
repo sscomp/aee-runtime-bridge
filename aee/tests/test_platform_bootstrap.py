@@ -114,9 +114,17 @@ class TestPlatformIdentity(unittest.TestCase):
     def test_darwin(self) -> None:
         self.assertEqual(resolve_platform_identity("darwin"), PlatformIdentity.MACOS)
 
+    def test_windows(self) -> None:
+        self.assertEqual(resolve_platform_identity("win32"), PlatformIdentity.WINDOWS)
+        self.assertEqual(
+            resolve_platform_identity("cygwin"), PlatformIdentity.WINDOWS
+        )
+        self.assertEqual(
+            resolve_platform_identity("msys"), PlatformIdentity.WINDOWS
+        )
+
     def test_unknown(self) -> None:
         self.assertEqual(resolve_platform_identity(""), PlatformIdentity.UNKNOWN)
-        self.assertEqual(resolve_platform_identity("win32"), PlatformIdentity.UNKNOWN)
         self.assertEqual(
             resolve_platform_identity("freebsd"), PlatformIdentity.UNKNOWN
         )
@@ -128,6 +136,9 @@ class TestPlatformIdentity(unittest.TestCase):
         with patch("aee.platform.current.sys") as mock_sys:
             mock_sys.platform = "darwin"
             self.assertEqual(resolve_platform_identity(), PlatformIdentity.MACOS)
+        with patch("aee.platform.current.sys") as mock_sys:
+            mock_sys.platform = "win32"
+            self.assertEqual(resolve_platform_identity(), PlatformIdentity.WINDOWS)
         with patch("aee.platform.current.sys") as mock_sys:
             mock_sys.platform = "haiku"
             self.assertEqual(resolve_platform_identity(), PlatformIdentity.UNKNOWN)
@@ -350,6 +361,120 @@ class TestUnknownFallback(unittest.TestCase):
             cap = resolve_capabilities()
             self.assertEqual(cap.os_name, "unknown")
             self.assertEqual(cap, UnknownDefaults)
+
+
+# ---------------------------------------------------------------------------
+# Windows adapter skeleton (W1, §16 + §17.3 Phase C)
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsAdapterSkeleton(unittest.TestCase):
+    """W1 deliverable: the Windows adapter is a **skeleton**.
+
+    Per §17.3 Phase C "Windows runs in UNKNOWN capability mode;
+    first-class support waits on the Windows adapter (W1 already
+    shipped in Phase A as a skeleton)". These tests pin the skeleton
+    contract:
+
+    * ``detect()`` returns an honest Windows HostCapabilities document
+      that passes :func:`~aee.deploy.contract.validate_capabilities`
+      (so it can be loaded from a ``host.capabilities.yaml`` without
+      a contract error) and reports ``os == "windows"`` /
+      ``filesystem == "windows-wsl"``.
+    * ``materialize()`` **declines** for every known profile — the
+      skeleton does not provision resources (§17.3 Phase C +
+      §13.4 "Windows is experimental in v1").
+    * ``health_check()`` returns ``UNKNOWN`` (no live probe).
+    * The adapter is exported from :mod:`aee.deploy.adapters`.
+    * The default adapter mapping for
+      :data:`PlatformIdentity.WINDOWS` is ``None`` (the resolver
+      returns :data:`UnknownDefaults` unless the operator passes
+      ``--adapter windows`` explicitly).
+    """
+
+    def test_detect_returns_windows_os(self) -> None:
+        from aee.deploy.adapters.windows import WindowsAdapter
+
+        cap = WindowsAdapter().detect()
+        self.assertEqual(cap.os, "windows")
+        self.assertEqual(cap.filesystem, "windows-wsl")
+        self.assertEqual(cap.class_, "laptop")
+        self.assertEqual(cap.detected, False)
+        self.assertEqual(cap.source, "declared")
+
+    def test_detect_passes_contract_validation(self) -> None:
+        from aee.deploy.adapters.windows import WindowsAdapter
+        from aee.deploy.contract import validate_capabilities
+
+        cap = WindowsAdapter().detect()
+        # validate_capabilities raises ContractValidationError on the
+        # first violation; no raise means the document is valid.
+        validate_capabilities(cap)
+
+    def test_materialize_declines_known_profiles(self) -> None:
+        from aee.deploy.adapters.windows import WindowsAdapter
+        from aee.deploy.contract import RESOURCE_FLOOR_BY_PROFILE
+
+        adapter = WindowsAdapter()
+        cap = adapter.detect()
+        for profile in RESOURCE_FLOOR_BY_PROFILE:
+            result = adapter.materialize(profile, cap)
+            self.assertTrue(
+                result.declined,
+                f"windows skeleton must decline profile={profile!r}",
+            )
+            self.assertEqual(result.adapter_name, "windows")
+            self.assertEqual(result.profile, profile)
+
+    def test_materialize_unknown_profile_declines(self) -> None:
+        from aee.deploy.adapters.windows import WindowsAdapter
+
+        adapter = WindowsAdapter()
+        cap = adapter.detect()
+        result = adapter.materialize("nonexistent-profile", cap)
+        self.assertTrue(result.declined)
+        self.assertIn("unknown profile", result.decline_reason)
+
+    def test_health_check_unknown(self) -> None:
+        from aee.deploy.adapters.windows import WindowsAdapter
+
+        status = WindowsAdapter().health_check("developer")
+        self.assertEqual(status.state, "UNKNOWN")
+        self.assertEqual(status.adapter_name, "windows")
+
+    def test_adapter_exported_from_package(self) -> None:
+        from aee.deploy.adapters import WindowsAdapter as ExportedAdapter
+        from aee.deploy.adapters.windows import WindowsAdapter
+
+        self.assertIs(ExportedAdapter, WindowsAdapter)
+
+    def test_windows_identity_default_adapter_is_none(self) -> None:
+        # Per §17.3 Phase C the default mapping for WINDOWS is None —
+        # the resolver returns UnknownDefaults unless the operator
+        # passes --adapter windows explicitly.
+        from aee.platform.current import _DEFAULT_ADAPTER_BY_IDENTITY
+
+        self.assertIsNone(_DEFAULT_ADAPTER_BY_IDENTITY[PlatformIdentity.WINDOWS])
+
+    def test_windows_identity_resolves_to_unknown_defaults_by_default(self) -> None:
+        # Without an explicit adapter_name, WINDOWS resolves to
+        # UnknownDefaults (the same safe fallback as UNKNOWN).
+        cap = resolve_capabilities(platform_id=PlatformIdentity.WINDOWS)
+        self.assertEqual(cap, UnknownDefaults)
+
+    def test_windows_identity_with_explicit_adapter_uses_skeleton(self) -> None:
+        # With --adapter windows the resolver selects the skeleton.
+        # The registry must have the adapter registered by name for
+        # this to work; if it is not registered the resolver raises
+        # AdapterNotFoundError (which is the honest signal that the
+        # skeleton is not wired into the default registry yet).
+        from aee.deploy.registry import AdapterNotFoundError
+
+        with self.assertRaises(AdapterNotFoundError):
+            resolve_capabilities(
+                platform_id=PlatformIdentity.WINDOWS,
+                adapter_name="windows",
+            )
 
 
 if __name__ == "__main__":

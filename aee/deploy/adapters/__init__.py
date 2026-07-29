@@ -13,6 +13,7 @@ Reference adapters (§21.6.E table):
 * :mod:`aee.deploy.adapters.macbook`   — `laptop` (MacBook Pro) — launchd / tmux
 * :mod:`aee.deploy.adapters.docker`    — `docker-host` — docker-compose
 * :mod:`aee.deploy.adapters.terraform_aws` — `cloud-vm`/`cloud-container` (optional, placeholder)
+* :mod:`aee.deploy.adapters.windows`      — Windows host (skeleton, W1 §16)
 
 Design invariants (§21.6.D):
 
@@ -37,6 +38,7 @@ from aee.deploy.adapters.zo import ZoAdapter
 from aee.deploy.adapters.macbook import MacBookAdapter
 from aee.deploy.adapters.docker import DockerAdapter
 from aee.deploy.adapters.terraform_aws import TerraformAwsAdapter
+from aee.deploy.adapters.windows import WindowsAdapter
 
 __all__ = [
     "PlatformAdapter",
@@ -45,4 +47,5 @@ __all__ = [
     "MacBookAdapter",
     "DockerAdapter",
     "TerraformAwsAdapter",
+    "WindowsAdapter",
 ]

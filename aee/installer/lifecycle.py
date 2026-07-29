@@ -28,9 +28,11 @@ build on. It is deliberately minimal and side-effect free:
   existing :mod:`aee.platform.current` resolver and the
   :mod:`aee.deploy.capabilities` defaults. They deliberately do
   **not** claim full Ubuntu / Debian / macOS / Windows installer
-  support — Windows resolves to :data:`PlatformIdentity.UNKNOWN`
-  (no adapter), matching the existing honest-skeleton contract in
-  :mod:`aee.platform.current`.
+  support — Windows resolves to :data:`PlatformIdentity.WINDOWS`
+  (W1 skeleton adapter; the default mapping is ``None`` so the
+  resolver returns :data:`UnknownDefaults` unless the operator
+  passes ``--adapter windows``), matching the existing honest-skeleton
+  contract in :mod:`aee.platform.current`.
 * **Proposed exit constants 7–12.** §10.4 defines six new exit codes
   for the bootstrap v1 surface. They are recorded here as module
   constants so future CLI layers (W3/W4/W5) import a single canonical
@@ -583,23 +585,24 @@ def _new_run_id() -> str:
 # ---------------------------------------------------------------------------#
 #
 # These hooks are thin wrappers over the existing Phase 1 resolver
-# (aee.platform.current). W1 does NOT extend PlatformIdentity —
-# Windows stays UNKNOWN (honest skeleton). Future W1-follow-ups that
-# add a WINDOWS identity + WindowsAdapter will modify
-# aee.platform.current directly; this module will then surface the new
-# value automatically.
+# (aee.platform.current). W1 has shipped the WINDOWS identity +
+# WindowsAdapter skeleton; detect_platform now surfaces WINDOWS for
+# win32/cygwin. The default adapter mapping for WINDOWS is None
+# (UnknownDefaults) per §17.3 Phase C — operators opt in via
+# --adapter windows.
 
 
 def detect_platform(platform: Optional[str] = None) -> PlatformIdentity:
     """Detect the current :class:`PlatformIdentity` (§2.3 framework hook).
 
     Delegates to :func:`aee.platform.current.resolve_platform_identity`.
-    Windows (``"win32"`` / ``"cygwin"``) currently resolves to
-    :data:`PlatformIdentity.UNKNOWN` because no Windows adapter is
-    registered yet (§16 W1 narrow scope — Windows adapter is a
-    follow-up). This is the **honest** placeholder: callers receive
-    :data:`UnknownDefaults` capabilities rather than a fabricated
-    Windows capability set.
+    Windows (``"win32"`` / ``"cygwin"``) resolves to
+    :data:`PlatformIdentity.WINDOWS` (W1 skeleton adapter shipped). The
+    default adapter mapping for WINDOWS is ``None`` per §17.3 Phase C,
+    so the resolver returns :data:`UnknownDefaults` unless the operator
+    passes ``--adapter windows`` explicitly. This is the **honest**
+    placeholder: callers receive :data:`UnknownDefaults` capabilities
+    rather than a fabricated Windows capability set.
 
     Tests inject ``platform`` explicitly (no ``sys.platform`` mock
     needed for the hook itself; the underlying resolver is the only
