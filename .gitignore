@@ -48,10 +48,27 @@ logs/
 *.log
 # Per-task reports
 reports/TASK-*/
+# Generated report sidecar/envelope JSON (e.g. *_verification_sidecar.json,
+# *_cli_smoke_envelope.json). Tracked report specs are all .md, so .json in
+# reports/ is always generated — ignore to reduce git status noise.
+# Evidence: 2 untracked reports/*.json at audit; 0 tracked reports/*.json.
+/reports/*.json
 # Backups
 *.bak.*
 *.bak-*
 data.bak.*/
+
+# ---------- 2b. Dependency lockfile policy (TD-001) ----------
+# Lockfiles and dependency specs are INTENTIONALLY TRACKED, not ignored.
+# Per README §"Dependency management" (lines 188-202):
+#   requirements.in         → requirements.lock         (Linux)
+#   requirements-dev.in     → requirements-dev.lock     (dev)
+#   requirements.lock.darwin                            (macOS)
+#   constraints.txt          — version upper bounds
+#   scripts/compile-deps.sh — regenerate lockfiles (uv pip compile)
+#   scripts/verify-deps.sh   — read-only lockfile verification
+# These files SHOULD be committed in a separate work order (WO-1-AC).
+# Do NOT add ignore rules for requirements.* / constraints.txt / scripts/.
 
 # ---------- 3. Build / tooling artifacts ----------
 .venv/
