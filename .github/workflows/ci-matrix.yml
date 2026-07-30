@@ -11,12 +11,12 @@
 #   `install.sh --profile ${{ matrix.profile }}` → smoke test →
 #   targeted tests → regression suite. `full` runs the complete
 #   suite; `mini`/`edge`/`developer` run subset suites. All 4 jobs
-#   must pass for merge to `master`. Each job runs in its own
+#   must pass for merge to `main`. Each job runs in its own
 #   container with its own tempdir DB.
 #
 # Acceptance (§21.A item 7):
 #
-#   §21.7 — CI/CD matrix runs 4 profile jobs; all 4 green on `master`.
+#   §21.7 — CI/CD matrix runs 4 profile jobs; all 4 green on `main`.
 #
 # Safety contract (workorder §5):
 #
@@ -46,16 +46,21 @@
 #   - touch a production database
 #   - invoke `terraform`, `aws`, `gcloud`, or `az`
 #
-# Trigger: pull request to `master` (the §21.7 "all 4 must pass for
-# merge to `master`" gate) + push to `master` (regression on merge).
+# Trigger: pull request to `main` (the §21.7 "all 4 must pass for
+# merge to `main`" gate) + push to `main` (regression on merge).
 #
 name: AEE CI Matrix (§21.7)
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
   push:
-    branches: [master]
+    branches: [main]
+
+# Least-privilege: the workflow only needs to read repository content
+# for checkout + test execution. No write scope is required.
+permissions:
+  contents: read
 
 # Fail fast is intentional: if one profile job fails, the others
 # may continue (so the operator sees the full failure profile), but
@@ -216,7 +221,7 @@ jobs:
 
   # -----------------------------------------------------------------
   # Merge gate — the §21.7 "All 4 jobs must pass for merge to
-  # `master`" enforcement point. This job does NOT run tests; it
+  # `main`" enforcement point. This job does NOT run tests; it
   # only depends on the 4 profile jobs and is required by branch
   # protection. It is the single source of truth for "is the
   # matrix green?".
@@ -239,7 +244,7 @@ jobs:
           set -e
           echo "profile-job result: ${{ needs.profile-job.result }}"
           if [ "${{ needs.profile-job.result }}" != "success" ]; then
-            echo "::error::§21.7 merge gate failed: profile-job did not succeed (got ${{ needs.profile-job.result }}). All 4 profiles must be green for merge to master."
+            echo "::error::§21.7 merge gate failed: profile-job did not succeed (got ${{ needs.profile-job.result }}). All 4 profiles must be green for merge to main."
             exit 1
           fi
           echo "§21.7 merge gate: all 4 profiles green. OK to merge."
