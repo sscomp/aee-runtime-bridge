@@ -1,0 +1,54 @@
+# AEE Epic 9.6 §21.6.B — Canonical Host Capability Document: M2 (Abacus.ai container)
+#
+# This is the canonical `host.capabilities.yaml` for the M2 host
+# (Abacus.ai container). It is the §21.6.B "source of truth for what
+# the host can run." The four suffixed reference documents under
+# `aee/deploy/samples/host.capabilities.<name>.yaml` remain as
+# templates for other hosts; this file is the live declaration for
+# this host.
+#
+# Grounded in live host evidence captured 2026-07-30 on M2:
+#   * supervisord process supervisor (/tmp/supervisor.sock present;
+#     5 supervised programs RUNNING, including `hermes-runtime-bridge`
+#     and `cloudflared-tunnel`)
+#   * Cloudflare Tunnel for egress (cloudflared process running,
+#     config at /home/ubuntu/.cloudflared/config.yml); no inbound
+#   * /home/ubuntu persistent across container resets
+#   * /tmp is wiped on container reset
+#   * os=linux, arch=x86_64, kernel 6.17.0-1009-aws, Python 3.11.2
+#   * profile=full reference host (CPU 32, mem ~507 GB, disk ~3 TB)
+#
+# The `provider_hint: abacus` field is INFORMATIONAL ONLY. AEE Core
+# and the installer MUST NOT branch on it. It exists purely for
+# operator observability and audit logs. The `class: container`
+# field drives adapter selection (§21.6.B last paragraph).
+
+host:
+  name: m2-abacus
+  class: container
+  provider_hint: abacus
+  os: linux
+  arch: x86_64
+  python: ">=3.11"
+  filesystem: posix
+  supervisor: supervisord
+  network_egress: tunnel
+  tunnel_kind: cloudflared
+  inbound_allowed: false
+  db_path_writable: true
+  tempdir_writable: true
+  persistent_paths:
+    - /home/ubuntu
+
+runtime_profile:
+  supported: [full, mini, edge, developer]
+  default: full
+  resource_floor:
+    full:      { cpu: 2, mem_mb: 4096, disk_mb: 2048 }
+    mini:      { cpu: 1, mem_mb: 1024, disk_mb: 1024 }
+    edge:      { cpu: 1, mem_mb: 1024, disk_mb: 512  }
+    developer: { cpu: 1, mem_mb: 1024, disk_mb: 512  }
+
+upstream_llm:
+  reachable: true
+  endpoint_kind: openai-compatible

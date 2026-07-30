@@ -247,6 +247,27 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit the dispatch contract as a JSON object on stdout.",
     )
+    # WO-2 — ``--capabilities <path>`` (plumbing-only). Accepts a path
+    # to a Host Capability Document YAML. The path is recorded in the
+    # InstallCliResult and surfaced as an audit-only note; the backend
+    # contract binding (load + validate + refuse on invalid) is WO-3
+    # and is NOT performed in this slice. A light read-only
+    # ``os.path.exists`` check in the audit note surfaces whether the
+    # file is present, but does not change the exit code.
+    install_parser.add_argument(
+        "--capabilities",
+        dest="capabilities",
+        default=None,
+        metavar="<path>",
+        help=(
+            "Path to a Host Capability Document YAML (§21.6.B). "
+            "When supplied, the document is loaded and authoritatively "
+            "validated against the §21.6.B / §21.6.C contract before "
+            "install/materialization; an invalid document refuses the "
+            "install (exit 13). When omitted, legacy pre-WO-3 behavior "
+            "is preserved (no loading, no validation, no extra exit code)."
+        ),
+    )
 
     # ``doctor`` subcommand (Phase 2 — AEE readiness health check).
     # The doctor is read-only and side-effect free; it never sends
@@ -589,15 +610,16 @@ def _install_dispatch_phase4b(
     resume: bool = False,
     from_ref: Optional[str] = None,
     rollback_to: Optional[str] = None,
+    capabilities: Optional[str] = None,
     json_output: bool = False,
 ) -> int:
     """Phase 4B ``aee install`` dispatch (§21.3 approved flags).
 
     Delegates to :func:`aee.installer.cli_install.run_install` so the
     approved flag metadata (``--execute`` / ``--resume`` / ``--from`` /
-    ``--rollback-to``) is captured in an :class:`InstallCliResult`.
-    Renders the result as either plain text or JSON (when ``--json``)
-    and returns the result's exit code.
+    ``--rollback-to`` / ``--capabilities``) is captured in an
+    :class:`InstallCliResult`. Renders the result as either plain text
+    or JSON (when ``--json``) and returns the result's exit code.
 
     This dispatch path is taken only when at least one Phase 4B flag
     is present; the Phase 9.2 :func:`_install_dispatch` path is
@@ -614,6 +636,7 @@ def _install_dispatch_phase4b(
         resume=resume,
         from_ref=from_ref,
         rollback_to=rollback_to,
+        capabilities=capabilities,
         repo_root=None,
     )
     result = run_install(options)
@@ -945,6 +968,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             getattr(args, "resume", False),
             getattr(args, "from_ref", None) is not None,
             getattr(args, "rollback_to", None) is not None,
+            getattr(args, "capabilities", None) is not None,
         )
         if any(phase4b_flags):
             return _install_dispatch_phase4b(
@@ -953,6 +977,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 resume=getattr(args, "resume", False),
                 from_ref=getattr(args, "from_ref", None),
                 rollback_to=getattr(args, "rollback_to", None),
+                capabilities=getattr(args, "capabilities", None),
                 json_output=getattr(args, "json", False),
             )
         return _install_dispatch(

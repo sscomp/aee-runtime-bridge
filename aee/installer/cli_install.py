@@ -54,6 +54,13 @@ Exit code mapping (composed with the backend's exit codes):
   :class:`ExecuteNotAuthorizedError`. Distinct from exit 0 so an
   operator can tell "I asked for execute and it was refused" apart
   from "I didn't ask for execute".
+* :data:`EXIT_CAPABILITIES_INVALID` (13) — WO-3 (§21.6.G item 3): the
+  Host Capability Document supplied via ``--capabilities`` is
+  missing, unreadable, malformed, or fails the §21.6.B contract /
+  §21.6.C resource-floor validation. Distinct from 3-6 so an operator
+  can tell "the capabilities contract was rejected" apart from "the
+  install plan / pre-flight failed". When ``--capabilities`` is
+  omitted, this exit code is never produced (backward compat).
 
 Run: ``PYTHONPATH=. python3 -m unittest aee.tests.test_aee_phase4b_install_cli -v``
 """
@@ -64,11 +71,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from aee.installer.backend import (
+    EXIT_CAPABILITIES_INVALID,
     EXIT_EXECUTE_NOT_AUTHORIZED,
     EXIT_OK,
     EXIT_PRE_FLIGHT_FAILED,
     EXIT_PROFILE_INVALID,
     EXIT_PROFILE_SWITCH_REJECTED,
+    CapabilitiesValidationResult,
     ExecuteNotAuthorizedError,
     InstallPlan,
     InstallResult,
@@ -109,6 +118,15 @@ class InstallCliOptions:
     * ``repo_root`` — the repo root path used to construct the
       :class:`InstallerBackend`. Defaults to the current working
       directory when ``None`` (the backend's own default).
+    * ``capabilities`` — the path to a Host Capability Document
+      YAML supplied via ``--capabilities <path>``, or ``None`` when
+      the flag was omitted. WO-2 (this field) is **plumbing-only**:
+      the path is recorded in the result and an audit note is
+      emitted; the backend contract binding (loading + validating
+      the document and refusing the install when it is invalid)
+      is WO-3 and is NOT performed here. A light read-only
+      ``os.path.exists`` check surfaces whether the file is
+      present, but does not change the exit code.
     """
 
     profile: str = DEFAULT_PROFILE
@@ -117,6 +135,7 @@ class InstallCliOptions:
     from_ref: Optional[str] = None
     rollback_to: Optional[str] = None
     repo_root: Optional[Path] = None
+    capabilities: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -126,6 +145,7 @@ class InstallCliOptions:
             "from_ref": self.from_ref,
             "rollback_to": self.rollback_to,
             "repo_root": str(self.repo_root) if self.repo_root else None,
+            "capabilities": self.capabilities,
         }
 
 
@@ -149,6 +169,10 @@ class InstallCliResult:
     * ``execute_requested`` — whether ``--execute`` was passed.
     * ``resume`` — whether ``--resume`` was passed.
     * ``from_ref`` / ``rollback_to`` — the operator-supplied refs.
+    * ``capabilities`` — the path to the Host Capability Document
+      YAML supplied via ``--capabilities <path>``, or ``None`` when
+      the flag was omitted. WO-2 plumbing-only — recorded for the
+      future WO-3 backend binding; not enforced here.
     * ``plan`` — the :class:`InstallPlan` (``None`` only on profile
       validation failure).
     * ``preflight`` — the :class:`PreFlightResult` (``None`` only on
@@ -168,6 +192,7 @@ class InstallCliResult:
     resume: bool
     from_ref: Optional[str]
     rollback_to: Optional[str]
+    capabilities: Optional[str]
     plan: Optional[InstallPlan]
     preflight: Optional[PreFlightResult]
     executed: bool = False
@@ -182,6 +207,7 @@ class InstallCliResult:
             "resume": self.resume,
             "from_ref": self.from_ref,
             "rollback_to": self.rollback_to,
+            "capabilities": self.capabilities,
             "plan": self.plan.to_dict() if self.plan is not None else None,
             "preflight": (
                 self.preflight.to_dict()
@@ -195,6 +221,44 @@ class InstallCliResult:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------#
+# WO-3 — capabilities validation-success audit note
+# ---------------------------------------------------------------------------#
+
+
+def _capabilities_validated_note(
+    capabilities_path: str,
+    cap_result: CapabilitiesValidationResult,
+) -> str:
+    """Build the audit note for a successfully validated ``--capabilities``
+    document (WO-3).
+
+    WO-3 binds the installer backend to the authoritative §21.6.B /
+    §21.6.C contract: the document is loaded via the canonical loader
+    and validated via :func:`validate_capabilities` +
+    :func:`validate_resource_floor` BEFORE any plan/preflight/execute
+    action. This note is emitted only when validation succeeded
+    (``cap_result.ok is True``); failure notes are emitted by the
+    ``run_install`` WO-3 guard above.
+
+    The note surfaces the validated host name + class so an operator
+    can see what was accepted, and records that the install proceeded
+    past the contract gate.
+    """
+    cap = cap_result.capabilities
+    host_name = cap.name if cap is not None else "(unknown)"
+    host_class = cap.class_ if cap is not None else "(unknown)"
+    return (
+        " WO-3: --capabilities {p} validated via canonical §21.6.B / "
+        "§21.6.C contract (host={n}, class={c}); install proceeded "
+        "past the contract gate."
+    ).format(
+        p=capabilities_path,
+        n=host_name,
+        c=host_class,
+    )
+
+
 # run_install — the canonical entrypoint
 # ---------------------------------------------------------------------------
 
@@ -231,6 +295,7 @@ def run_install(options: InstallCliOptions) -> InstallCliResult:
             resume=options.resume,
             from_ref=options.from_ref,
             rollback_to=options.rollback_to,
+            capabilities=options.capabilities,
             plan=None,
             preflight=None,
             executed=False,
@@ -245,10 +310,57 @@ def run_install(options: InstallCliOptions) -> InstallCliResult:
     #    Even when ``--execute`` is requested, the backend is
     #    constructed with ``dry_run=True`` — the execute-refused path
     #    below encodes the §21.3 guard explicitly.
+    #    WO-3 (§21.6.G item 3): when ``--capabilities <path>`` is
+    #    supplied, the ``cap_path`` is threaded into the backend so
+    #    :meth:`validate_capabilities_document` can load + validate it
+    #    via the canonical §21.6.B / §21.6.C contract BEFORE any
+    #    plan/preflight/execute action.
     backend = InstallerBackend(
         repo_root=options.repo_root,
         dry_run=True,
+        cap_path=options.capabilities,
     )
+
+    # 2.5 WO-3: validate the supplied Host Capability Document (if any)
+    #     BEFORE any plan/preflight/execute action. When
+    #     ``--capabilities`` is omitted, ``options.capabilities`` is
+    #     ``None`` and the backend's ``validate_capabilities_document``
+    #     returns ``ok=True`` with ``capabilities=None`` (the
+    #     backward-compat path — no extra I/O, no validation). When
+    #     supplied, a failure is surfaced as a deterministic,
+    #     user-visible :class:`CapabilitiesValidationResult` with a
+    #     stable ``reason_kind``; the CLI maps it to
+    #     :data:`EXIT_CAPABILITIES_INVALID` (13) and does NOT proceed
+    #     to plan/preflight.
+    cap_result: CapabilitiesValidationResult = (
+        backend.validate_capabilities_document(profile=canonical)
+    )
+    if not cap_result.ok:
+        cap_note = (
+            "WO-3: --capabilities {p} rejected (reason_kind={k}); "
+            "install refused before plan/preflight. "
+            "reason: {r}"
+        ).format(
+            p=cap_result.cap_path or options.capabilities or "",
+            k=cap_result.reason_kind,
+            r=cap_result.reason,
+        )
+        if cap_result.field:
+            cap_note += " (field={f})".format(f=cap_result.field)
+        return InstallCliResult(
+            exit_code=EXIT_CAPABILITIES_INVALID,
+            profile=canonical,
+            execute_requested=options.execute,
+            resume=options.resume,
+            from_ref=options.from_ref,
+            rollback_to=options.rollback_to,
+            capabilities=options.capabilities,
+            plan=None,
+            preflight=None,
+            executed=False,
+            error=cap_result.reason,
+            notes=(cap_note,),
+        )
 
     plan: Optional[InstallPlan]
     preflight: Optional[PreFlightResult]
@@ -273,6 +385,7 @@ def run_install(options: InstallCliOptions) -> InstallCliResult:
             resume=options.resume,
             from_ref=options.from_ref,
             rollback_to=options.rollback_to,
+            capabilities=options.capabilities,
             plan=None,
             preflight=None,
             executed=False,
@@ -291,6 +404,7 @@ def run_install(options: InstallCliOptions) -> InstallCliResult:
             resume=options.resume,
             from_ref=options.from_ref,
             rollback_to=options.rollback_to,
+            capabilities=options.capabilities,
             plan=None,
             preflight=None,
             executed=False,
@@ -318,6 +432,7 @@ def run_install(options: InstallCliOptions) -> InstallCliResult:
             resume=options.resume,
             from_ref=options.from_ref,
             rollback_to=options.rollback_to,
+            capabilities=options.capabilities,
             plan=plan,
             preflight=preflight,
             executed=False,
@@ -354,6 +469,10 @@ def run_install(options: InstallCliOptions) -> InstallCliResult:
                 " --rollback-to {ref} recorded; no git operations "
                 "performed.".format(ref=options.rollback_to)
             )
+        if options.capabilities is not None:
+            execute_note += _capabilities_validated_note(
+                options.capabilities, cap_result
+            )
         return InstallCliResult(
             exit_code=EXIT_EXECUTE_NOT_AUTHORIZED,
             profile=canonical,
@@ -361,6 +480,7 @@ def run_install(options: InstallCliOptions) -> InstallCliResult:
             resume=options.resume,
             from_ref=options.from_ref,
             rollback_to=options.rollback_to,
+            capabilities=options.capabilities,
             plan=plan,
             preflight=preflight,
             executed=False,
@@ -386,6 +506,10 @@ def run_install(options: InstallCliOptions) -> InstallCliResult:
             "Phase 4B: --rollback-to {ref} recorded; no git "
             "operations performed.".format(ref=options.rollback_to)
         )
+    if options.capabilities is not None:
+        audit_notes.append(
+            _capabilities_validated_note(options.capabilities, cap_result)
+        )
     return InstallCliResult(
         exit_code=EXIT_OK,
         profile=canonical,
@@ -393,6 +517,7 @@ def run_install(options: InstallCliOptions) -> InstallCliResult:
         resume=options.resume,
         from_ref=options.from_ref,
         rollback_to=options.rollback_to,
+        capabilities=options.capabilities,
         plan=plan,
         preflight=preflight,
         executed=False,

@@ -39,7 +39,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import FrozenSet, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 # Canonical source of truth — NO parallel hard-coded matrix.
 from aee.profiles.descriptor import (
@@ -75,6 +75,67 @@ EXIT_PROFILE_INVALID = 3
 EXIT_PRE_FLIGHT_FAILED = 4
 EXIT_PROFILE_SWITCH_REJECTED = 5
 EXIT_EXECUTE_NOT_AUTHORIZED = 6
+
+#: WO-3 (§21.6.G item 3) — the supplied Host Capability Document is
+#: missing, unreadable, malformed, or fails the §21.6.B contract /
+#: §21.6.C resource-floor validation. This exit code is distinct from
+#: the §21.3 installer exit codes (3-6) so an operator can tell
+#: "the capabilities contract was rejected" apart from "the install
+#: plan / pre-flight failed". Value 13 is in the free range {7..127}
+#: and does not collide with the §10.4 bootstrap v1 constants (7-12)
+#: defined in :mod:`aee.installer.lifecycle`.
+EXIT_CAPABILITIES_INVALID = 13
+
+
+#: The stable, machine-readable failure-mode vocabulary for
+#: :class:`CapabilitiesValidationResult.reason_kind`. The CLI layer and
+#: tests assert against these strings (not against free-form prose).
+#: Defined here (before the result dataclass) so the dataclass can
+#: reference it in its docstring without a forward reference.
+CAPABILITIES_REASON_KINDS: Tuple[str, ...] = (
+    "missing_file",          # os.path.exists → False
+    "unreadable_file",       # OSError on read_text (permissions / not a file)
+    "malformed_yaml",        # loader raised ValueError (parse failure)
+    "contract_violation",    # validate_capabilities raised ContractValidationError
+    "resource_floor",        # validate_resource_floor raised ContractValidationError
+    "unknown_error",         # any other exception (defensive)
+)
+
+
+# ---------------------------------------------------------------------------#
+# WO-3 — Capabilities validation (§21.6.G item 3, §21.6.B, §21.6.C)
+# ---------------------------------------------------------------------------#
+#
+# The installer backend (§21.3) is bound to the authoritative
+# Provider-Neutral Deployment Contract (§21.6.A–§21.6.F) implemented in
+# :mod:`aee.deploy.contract` + :mod:`aee.deploy.loader`. When the
+# installer is supplied a ``--capabilities <path>`` (WO-2 CLI surface),
+# the backend loads the YAML via the canonical loader and validates it
+# via :func:`aee.deploy.contract.validate_capabilities` (§21.6.B
+# schema) and :func:`aee.deploy.contract.validate_resource_floor`
+# (§21.6.C resource floor for the requested profile) BEFORE any
+# plan/preflight/execute action. A failure is surfaced as a
+# deterministic, user-visible :class:`CapabilitiesValidationResult`
+# with a stable ``reason_kind`` vocabulary; the CLI layer maps it to
+# :data:`EXIT_CAPABILITIES_INVALID` (13).
+#
+# Design invariants:
+#
+# 1. The backend does NOT branch on ``provider_hint`` (per §21.6.B
+#    last paragraph). Validation is purely structural + resource-floor.
+# 2. The backend does NOT probe the host (that is
+#    :meth:`PlatformAdapter.detect`'s job); the supplied document is
+#    the declared source of truth.
+# 3. When ``cap_path`` is ``None`` (the flag was omitted), the backend
+#    behaves identically to the pre-WO-3 surface — no loading, no
+#    validation, no extra I/O. Backward compatibility is preserved.
+# 4. The validated :class:`HostCapabilities` is carried on the result
+#    for the future shell layer / adapter-selection (WO-4+); this slice
+#    does NOT pass it into ``plan`` / ``preflight`` (those still use the
+#    auto-detected :class:`PlatformCapabilities` facade). The data is
+#    "passed through only as required by the current installer
+#    architecture" — i.e. it is available to the caller but does not
+#    alter the existing plan/preflight path.
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +183,100 @@ class InstallerError(Exception):
     """Base class for installer backend errors."""
 
     exit_code: int = EXIT_OK  # overridden by subclasses
+
+
+# ---------------------------------------------------------------------------#
+# WO-3 — Capabilities validation result + error (§21.6.G item 3)
+# ---------------------------------------------------------------------------#
+#
+# Defined after :class:`InstallerError` so :class:`CapabilitiesValidationError`
+# can subclass it without a forward reference. The
+# :data:`EXIT_CAPABILITIES_INVALID` constant and
+# :data:`CAPABILITIES_REASON_KINDS` vocabulary are defined above (near
+# the other exit codes) so the CLI layer can import them without
+# pulling the full backend error hierarchy.
+
+
+@dataclass(frozen=True)
+class CapabilitiesValidationResult:
+    """Result of :meth:`InstallerBackend.validate_capabilities_document`.
+
+    Carries the deterministic, user-visible outcome of loading +
+    validating a Host Capability Document supplied via ``--capabilities``.
+
+    Fields:
+
+    * ``ok`` — ``True`` when the document loaded and validated against
+      the §21.6.B schema and the §21.6.C resource floor for the
+      requested profile. ``False`` otherwise.
+    * ``reason_kind`` — a stable, machine-readable vocabulary string
+      identifying the failure mode (one of
+      :data:`CAPABILITIES_REASON_KINDS`). Empty string when ``ok``.
+    * ``reason`` — a human-readable diagnostic (empty string when ``ok``).
+    * ``field`` — the dotted field path that failed (per
+      :class:`ContractValidationError.field`), or empty string when
+      ``ok`` or when the failure is not field-specific (e.g. missing
+      file).
+    * ``capabilities`` — the loaded :class:`HostCapabilities` when
+      ``ok``; ``None`` otherwise. Carried for the future shell layer /
+      adapter-selection (WO-4+). NOT consumed by ``plan`` / ``preflight``
+      in this slice.
+    * ``cap_path`` — the path that was validated (echoed for the
+      result shape; ``None`` only when the method is called without a
+      path, which is the backward-compat path).
+    """
+
+    ok: bool
+    reason_kind: str = ""
+    reason: str = ""
+    field: str = ""
+    capabilities: Optional["HostCapabilities"] = None  # type: ignore[name-defined]
+    cap_path: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "reason_kind": self.reason_kind,
+            "reason": self.reason,
+            "field": self.field,
+            "capabilities": (
+                self.capabilities.to_dict()
+                if self.capabilities is not None
+                else None
+            ),
+            "cap_path": self.cap_path,
+        }
+
+
+class CapabilitiesValidationError(InstallerError):
+    """Raised when a supplied Host Capability Document fails §21.6.B
+    contract or §21.6.C resource-floor validation.
+
+    Carries a :attr:`reason_kind` (one of
+    :data:`CAPABILITIES_REASON_KINDS`) so the CLI layer can map the
+    failure to a deterministic, user-visible message + exit code
+    (:data:`EXIT_CAPABILITIES_INVALID`).
+    """
+
+    exit_code = EXIT_CAPABILITIES_INVALID
+
+    def __init__(
+        self,
+        reason_kind: str,
+        reason: str,
+        field: str = "",
+        cap_path: Optional[str] = None,
+    ) -> None:
+        msg = "[{k}] {r}".format(k=reason_kind, r=reason)
+        if field:
+            msg = "[{k}] field={f} {r}".format(k=reason_kind, f=field, r=reason)
+        if cap_path:
+            msg = "{m} (cap_path={p})".format(m=msg, p=cap_path)
+        super().__init__(msg)
+        self.reason_kind = reason_kind
+        self.reason = reason
+        self.field = field
+        self.cap_path = cap_path
 
 
 class ProfileSwitchRejectedError(InstallerError):
@@ -428,9 +583,186 @@ class InstallerBackend:
         repo_root: Optional[Path] = None,
         *,
         dry_run: bool = True,
+        cap_path: Optional[str] = None,
     ) -> None:
         self.repo_root = Path(repo_root) if repo_root is not None else Path.cwd()
         self.dry_run = dry_run
+        # WO-3 (§21.6.G item 3): optional path to a Host Capability
+        # Document YAML supplied via ``--capabilities``. When not
+        # ``None``, :meth:`validate_capabilities_document` loads +
+        # validates it via the canonical §21.6.B / §21.6.C contract
+        # BEFORE any plan/preflight/execute action. When ``None`` (the
+        # flag was omitted), the backend behaves identically to the
+        # pre-WO-3 surface (backward compatibility preserved).
+        self.cap_path = cap_path
+
+    # -- WO-3: capabilities validation ---------------------------------
+
+    def validate_capabilities_document(
+        self,
+        cap_path: Optional[str] = None,
+        *,
+        profile: Optional[str] = None,
+    ) -> "CapabilitiesValidationResult":
+        """Load + validate a Host Capability Document via the canonical
+        §21.6.B / §21.6.C contract (WO-3, §21.6.G item 3).
+
+        Uses the authoritative loader
+        (:func:`aee.deploy.loader.load_host_capabilities`) and the
+        authoritative validators
+        (:func:`aee.deploy.contract.validate_capabilities` +
+        :func:`aee.deploy.contract.validate_resource_floor`). This is
+        the binding between the installer backend (§21.3) and the
+        Provider-Neutral Deployment Contract (§21.6.A–§21.6.F).
+
+        When ``cap_path`` is ``None`` (and :attr:`self.cap_path` is
+        ``None``), returns an ``ok=True`` result with
+        ``capabilities=None`` — this is the backward-compat path (the
+        flag was omitted; no validation is performed).
+
+        When ``cap_path`` is supplied (either via the argument or via
+        :attr:`self.cap_path`), the method:
+
+        1. Checks the file exists (``os.path.exists``).
+        2. Reads the file (``Path.read_text``).
+        3. Loads the YAML via the canonical loader.
+        4. Validates the §21.6.B schema via
+           :func:`validate_capabilities`.
+        5. When ``profile`` is supplied, validates the §21.6.C resource
+           floor via :func:`validate_resource_floor`.
+
+        Each failure mode maps to a stable ``reason_kind`` (one of
+        :data:`CAPABILITIES_REASON_KINDS`) so the CLI layer and tests
+        can assert deterministically.
+
+        This method is read-only: it does NOT mutate the backend, does
+        NOT write to disk, and does NOT alter the plan/preflight path.
+        The validated :class:`HostCapabilities` is carried on the
+        result for the future shell layer / adapter-selection (WO-4+);
+        it is NOT passed into ``plan`` / ``preflight`` in this slice.
+
+        Args:
+            cap_path: path to the Host Capability Document YAML. When
+                ``None``, falls back to :attr:`self.cap_path`. When
+                both are ``None``, returns the backward-compat
+                ``ok=True`` result.
+            profile: when supplied, the §21.6.C resource floor is
+                validated for this profile. When ``None``, the resource
+                floor check is skipped (only §21.6.B schema validation
+                runs).
+
+        Returns:
+            :class:`CapabilitiesValidationResult` — never raises for
+            contract / file / parse failures (those are encoded in the
+            result). The only exception path is a defensive
+            ``unknown_error`` envelope for unexpected exceptions.
+        """
+        import os
+
+        path = cap_path if cap_path is not None else self.cap_path
+        if path is None:
+            # Backward-compat path: no --capabilities flag supplied.
+            # No loading, no validation, no extra I/O. Behave
+            # identically to the pre-WO-3 surface.
+            return CapabilitiesValidationResult(
+                ok=True,
+                reason_kind="",
+                reason="",
+                field="",
+                capabilities=None,
+                cap_path=None,
+            )
+
+        # 1. Missing file.
+        if not os.path.exists(path):
+            return CapabilitiesValidationResult(
+                ok=False,
+                reason_kind="missing_file",
+                reason="capabilities file not found: {p}".format(p=path),
+                field="",
+                capabilities=None,
+                cap_path=path,
+            )
+
+        # 2. Unreadable file (permissions / not a regular file).
+        try:
+            Path(path).read_text(encoding="utf-8")
+        except OSError as exc:
+            return CapabilitiesValidationResult(
+                ok=False,
+                reason_kind="unreadable_file",
+                reason="capabilities file unreadable: {e}".format(e=exc),
+                field="",
+                capabilities=None,
+                cap_path=path,
+            )
+
+        # 3. Malformed YAML (loader parse failure).
+        from aee.deploy.loader import load_host_capabilities
+        try:
+            cap = load_host_capabilities(path)
+        except ValueError as exc:
+            return CapabilitiesValidationResult(
+                ok=False,
+                reason_kind="malformed_yaml",
+                reason="capabilities YAML parse failed: {e}".format(e=exc),
+                field="",
+                capabilities=None,
+                cap_path=path,
+            )
+        except Exception as exc:  # defensive: loader should raise ValueError
+            return CapabilitiesValidationResult(
+                ok=False,
+                reason_kind="unknown_error",
+                reason="capabilities loader raised unexpected {cls}: {e}".format(
+                    cls=type(exc).__name__, e=exc,
+                ),
+                field="",
+                capabilities=None,
+                cap_path=path,
+            )
+
+        # 4. §21.6.B schema validation.
+        from aee.deploy.contract import (
+            ContractValidationError,
+            validate_capabilities,
+            validate_resource_floor,
+        )
+        try:
+            validate_capabilities(cap)
+        except ContractValidationError as exc:
+            return CapabilitiesValidationResult(
+                ok=False,
+                reason_kind="contract_violation",
+                reason=str(exc),
+                field=getattr(exc, "field", ""),
+                capabilities=None,
+                cap_path=path,
+            )
+
+        # 5. §21.6.C resource-floor validation (when profile supplied).
+        if profile is not None:
+            try:
+                validate_resource_floor(cap, profile)
+            except ContractValidationError as exc:
+                return CapabilitiesValidationResult(
+                    ok=False,
+                    reason_kind="resource_floor",
+                    reason=str(exc),
+                    field=getattr(exc, "field", ""),
+                    capabilities=None,
+                    cap_path=path,
+                )
+
+        # Success.
+        return CapabilitiesValidationResult(
+            ok=True,
+            reason_kind="",
+            reason="",
+            field="",
+            capabilities=cap,
+            cap_path=path,
+        )
 
     # -- plan -----------------------------------------------------------
 
