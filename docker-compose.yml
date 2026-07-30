@@ -1,0 +1,205 @@
+# AEE Runtime Bridge — docker-compose.yml (Master Plan §21.5, §21.6.E).
+#
+# One image, four profiles, one service per profile. Each service uses
+# the existing Dockerfile + docker-entrypoint.sh (§21.5). Profile is
+# selected at run time via the entrypoint's --profile flag, matching
+# `docker run aee:X.Y.Z --profile {full,mini,edge,developer}`.
+#
+# The entrypoint parses --profile, sets AEE_PROFILE / AEE_DB_READ_ONLY /
+# AEE_DB_PATH env vars, then execs the remaining args as a command. We
+# pass `uvicorn app:app --host 0.0.0.0 --port 8787` as the command so
+# the bridge actually starts inside the container. Binding to 0.0.0.0
+# is required for the host port mapping to reach the app.
+#
+# Usage:
+#   docker compose --profile full up
+#   docker compose --profile mini up
+#   docker compose --profile edge up
+#   docker compose --profile developer up
+#
+# Required environment (provide via .env or export):
+#   BRIDGE_API_KEY          — CLI/CI client key
+#   GPT_BRIDGE_API_KEY     — ChatGPT Custom GPT Action key
+#   HERMES_BASE_URL        — upstream Hermes gateway URL
+#   HERMES_API_KEY         — upstream Hermes API key
+#
+# See .env.example for the full variable list. Never bake secrets into
+# the image; .env is excluded by .dockerignore and mounted at runtime.
+#
+# Resource floors per §21.6.C:
+#   full:        2 CPU, 4096 MB mem, 2048 MB disk
+#   mini:        1 CPU, 1024 MB mem, 1024 MB disk
+#   edge:        1 CPU, 1024 MB mem,  512 MB disk
+#   developer:   1 CPU, 1024 MB mem,  512 MB disk
+
+# ---------------------------------------------------------------------------
+# Named volumes — persist the dispatcher DB across container restarts.
+# The bridge stores its SQLite DB at <bridge_root>/data/dispatcher.db
+# (dispatcher/db.py:21). In the container, bridge_root = /app, so the DB
+# lives at /app/data/dispatcher.db. The .dockerignore excludes data/ from
+# the image, so the volume mount is the only way the DB survives.
+# ---------------------------------------------------------------------------
+volumes:
+  aee-data-full:
+    name: aee-data-full
+  aee-data-mini:
+    name: aee-data-mini
+  aee-data-edge:
+    name: aee-data-edge
+  # developer profile uses a tempdir DB (/tmp/aee-dev.db per §21.5) — no
+  # persistent volume needed.
+
+# ---------------------------------------------------------------------------
+# Networks — isolated bridge network so the four profile services can
+# coexist without port conflicts on the host. Each service binds a
+# distinct host port.
+# ---------------------------------------------------------------------------
+networks:
+  aee-bridge:
+    name: aee-bridge
+
+# ---------------------------------------------------------------------------
+# x-service-base anchor — shared service fields. All four profile
+# services derive from this anchor; only profile-specific fields
+# (container_name, command, environment, ports, volumes, resource
+# limits) differ.
+# ---------------------------------------------------------------------------
+x-service-base: &service-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: aee:2.0.0-rc1.gamma
+  env_file:
+    - .env
+  restart: unless-stopped
+  healthcheck:
+    test:
+      - "CMD"
+      - "python3"
+      - "-c"
+      - "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8787/health',timeout=5); sys.exit(0 if r.status==200 else 1)"
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 15s
+  networks:
+    - aee-bridge
+
+# ---------------------------------------------------------------------------
+# Services — one per profile (§21.A item 5 acceptance criteria).
+# ---------------------------------------------------------------------------
+
+services:
+  # ---------------------------------------------------------------------------
+  # profile=full — the reference profile. 2 CPU, 4 GB RAM (§21.6.C).
+  # ---------------------------------------------------------------------------
+  bridge-full:
+    <<: *service-base
+    container_name: aee-bridge-full
+    command:
+      - "--profile"
+      - "full"
+      - "uvicorn"
+      - "app:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8787"
+    environment:
+      AEE_PROFILE: "full"
+    ports:
+      - "8787:8787"
+    volumes:
+      - aee-data-full:/app/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4096M
+
+  # ---------------------------------------------------------------------------
+  # profile=mini — bridge + dispatcher DB + tunnel, no worker. 1 CPU, 1 GB.
+  # ---------------------------------------------------------------------------
+  bridge-mini:
+    <<: *service-base
+    container_name: aee-bridge-mini
+    command:
+      - "--profile"
+      - "mini"
+      - "uvicorn"
+      - "app:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8787"
+    environment:
+      AEE_PROFILE: "mini"
+    ports:
+      - "8788:8787"
+    volumes:
+      - aee-data-mini:/app/data
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+
+  # ---------------------------------------------------------------------------
+  # profile=edge — bridge + read-only DB replica. 1 CPU, 1 GB.
+  # §21.5 line 7630: --profile edge → AEE_DB_READ_ONLY=1
+  # ---------------------------------------------------------------------------
+  bridge-edge:
+    <<: *service-base
+    container_name: aee-bridge-edge
+    command:
+      - "--profile"
+      - "edge"
+      - "uvicorn"
+      - "app:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8787"
+    environment:
+      AEE_PROFILE: "edge"
+      AEE_DB_READ_ONLY: "1"
+    ports:
+      - "8789:8787"
+    volumes:
+      - aee-data-edge:/app/data
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+
+  # ---------------------------------------------------------------------------
+  # profile=developer — tempdir DB, sandboxed, no production DB. 1 CPU, 1 GB.
+  # §21.5 line 7630: --profile developer → tempdir DB
+  # The docker-entrypoint.sh sets AEE_DB_PATH=/tmp/aee-dev.db automatically;
+  # we also set it here for explicitness. No persistent volume: developer
+  # profile is ephemeral by design.
+  # ---------------------------------------------------------------------------
+  bridge-developer:
+    <<: *service-base
+    container_name: aee-bridge-developer
+    command:
+      - "--profile"
+      - "developer"
+      - "uvicorn"
+      - "app:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8787"
+    environment:
+      AEE_PROFILE: "developer"
+      AEE_DB_PATH: "/tmp/aee-dev.db"
+    ports:
+      - "8790:8787"
+    # No volume mount — developer profile uses a tempdir DB.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
