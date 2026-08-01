@@ -1336,6 +1336,141 @@ class TaskManager:
                 task_id, status, exc,
             )
 
+    def update_hermes_run_id(
+        self, task_id: str, run_id: str,
+    ) -> None:
+        """Overwrite the ``hermes_run_id`` column on the tasks row.
+
+        Lifecycle reconciliation fix (2026-08-01): ``complete()`` and
+        ``fail()`` do NOT update ``hermes_run_id`` — the placeholder
+        (``claude-cli-pending-*``) stamped by ``start()`` survives the
+        terminal transition. This helper performs a minimal SQL UPDATE
+        so the real CLI run_id is persisted and queryable via
+        ``find_by_hermes_run_id``.
+
+        Best-effort: if the row does not exist or the UPDATE affects
+        zero rows, the call is silently ignored (the executor path's
+        terminal status is already set by ``complete()`` / ``fail()``;
+        the run_id is a secondary lookup key, not a correctness field).
+        """
+        try:
+            with transaction() as conn:
+                conn.execute(
+                    "UPDATE tasks SET hermes_run_id=? "
+                    "WHERE task_id=?",
+                    (run_id, task_id),
+                )
+        except Exception:
+            pass
+
+    def reconcile_executor_completion(
+        self,
+        task_id: str,
+        *,
+        run_id: Optional[str] = None,
+        status: str = "completed",
+        output_text: Optional[str] = None,
+        error_message: Optional[str] = None,
+        exit_code: Optional[int] = None,
+    ) -> Task:
+        """Force-reconcile a dispatcher task to a terminal status after
+        an executor (claude-code-cli) finishes.
+
+        Lifecycle reconciliation fix (2026-08-01): the watcher may
+        have already transitioned the task to ``timeout`` using a
+        placeholder ``hermes_run_id`` (``claude-cli-pending-*``). The
+        normal ``complete()`` / ``fail()`` methods reject the
+        transition because ``timeout -> completed`` and
+        ``timeout -> failed`` are not in ``LEGAL_TRANSITIONS`` (timeout
+        is terminal). This method bypasses ``is_legal_transition`` via
+        a direct SQL UPDATE — it is the **sole** caller with
+        authority to override a watcher-set timeout for executor runs.
+
+        Preconditions:
+          * ``task_id`` must exist.
+          * ``status`` must be one of ``completed`` / ``failed``.
+          * The caller must be the executor path that has just
+            received the real CLI result.
+
+        Side effects:
+          * Updates ``status``, ``finished_at``, ``duration_sec``,
+            ``hermes_run_id`` (if ``run_id`` provided),
+            ``error_message`` (if ``status='failed'``).
+          * Emits a ``STATUS`` event with ``reconciled: True`` so
+            the override is observable in the event log.
+          * Mirrors the terminal status into ``executor_runs``.
+
+        Returns the updated ``Task``.
+        """
+        ts = ids.now_iso()
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT status, started_at FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise TaskNotFound(task_id)
+        if status not in ("completed", "failed"):
+            raise ValueError(
+                f"reconcile_executor_completion: status must be "
+                f"'completed' or 'failed', got {status!r}"
+            )
+        old_status = row["status"]
+        duration = _compute_duration(row["started_at"], ts)
+        _err = (error_message or "")[:500]
+        with transaction() as conn2:
+            if status == "completed":
+                if run_id:
+                    conn2.execute(
+                        "UPDATE tasks SET status='completed', progress_pct=100, "
+                        "finished_at=?, duration_sec=?, hermes_run_id=?, "
+                        "error_message=NULL WHERE task_id=?",
+                        (ts, duration, run_id, task_id),
+                    )
+                else:
+                    conn2.execute(
+                        "UPDATE tasks SET status='completed', progress_pct=100, "
+                        "finished_at=?, duration_sec=?, error_message=NULL "
+                        "WHERE task_id=?",
+                        (ts, duration, task_id),
+                    )
+            else:
+                if run_id:
+                    conn2.execute(
+                        "UPDATE tasks SET status='failed', finished_at=?, "
+                        "duration_sec=?, hermes_run_id=?, error_message=? "
+                        "WHERE task_id=?",
+                        (ts, duration, run_id, _err, task_id),
+                    )
+                else:
+                    conn2.execute(
+                        "UPDATE tasks SET status='failed', finished_at=?, "
+                        "duration_sec=?, error_message=? WHERE task_id=?",
+                        (ts, duration, _err, task_id),
+                    )
+        _append_log(
+            task_id, "INFO",
+            f"reconciled: {old_status} -> {status}"
+            + (f" run_id={run_id}" if run_id else ""),
+        )
+        self._emit_event(task_id, EventKind.STATUS, {
+            "from": old_status,
+            "to": status,
+            "reconciled": True,
+            **({"run_id": run_id} if run_id else {}),
+        })
+        if status == "completed":
+            self._sync_executor_runs_status(
+                task_id, status="completed", exit_code=exit_code or 0,
+            )
+        else:
+            self._sync_executor_runs_status(
+                task_id, status="failed",
+                exit_code=exit_code if exit_code is not None else 1,
+                error=_err,
+            )
+        return self.get_or_raise(task_id)
+
     def fail(self, task_id: str, error_message: str) -> Task:
         ts = ids.now_iso()
         conn = get_conn()

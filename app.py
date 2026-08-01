@@ -1706,6 +1706,68 @@ def _persist_hermes_run_mapping(
         )
 
 
+def _derive_repo_path_from_artifacts(
+    expected_artifacts: Optional[List[str]],
+    explicit_repo_path: Optional[str],
+    default_repo_path: str,
+    allowlist: List[str],
+) -> str:
+    """Derive the executor working directory so artifacts align with verification.
+
+    Root cause of the path mismatch bug: when the caller omits
+    ``repo_path`` the executor defaulted to ``/home/ubuntu/Abacus``
+    regardless of where the declared ``expected_artifacts`` live. The
+    Claude CLI subprocess then wrote durable artifacts under its cwd
+    (``/home/ubuntu/Abacus``) while ``verify_artifacts`` stat-ed the
+    absolute paths the caller declared — which lived under a different
+    repo (e.g. ``/home/ubuntu/hermes-runtime-bridge``). The artifacts
+    were created but at a different location than verification
+    expected, so every run reported ``completed`` with empty
+    ``artifact_paths`` and ``exists=False``.
+
+    Fix: when the caller does NOT pass ``repo_path`` but DOES pass
+    ``expected_artifacts``, derive the working directory from the
+    common parent of the declared artifact paths. The derived path is
+    only accepted if it falls inside the configured repo allow-list;
+    otherwise we fall back to the explicit/default repo_path so the
+    existing allow-list rejection still fires for genuinely
+    out-of-bounds paths.
+
+    This is a path-resolution alignment fix only — no business logic
+    change. The executor, verifier, and persistence layer all continue
+    to use absolute paths; we just ensure the cwd they share is the
+    one where those absolute paths actually live.
+    """
+    if explicit_repo_path:
+        return explicit_repo_path
+    if not expected_artifacts:
+        return default_repo_path
+    # Compute the common parent of all declared absolute artifact paths.
+    parents: List[str] = []
+    for p in expected_artifacts:
+        if not isinstance(p, str) or not p.startswith("/"):
+            continue
+        parents.append(os.path.dirname(os.path.abspath(p)))
+    if not parents:
+        return default_repo_path
+    common = os.path.commonpath(parents) if len(parents) > 1 else parents[0]
+    # If commonpath returns a non-dir-ish empty string (shouldn't happen
+    # for absolute paths under the same root), bail to the default.
+    if not common or common == "/":
+        return default_repo_path
+    # Only accept the derived path if it is inside the allow-list. This
+    # preserves the existing security gate: a caller cannot use
+    # expected_artifacts to escape the allow-list any more than they
+    # could with an explicit repo_path.
+    if any(
+        common == p or common.startswith(p.rstrip("/") + "/")
+        for p in allowlist
+        if isinstance(p, str)
+    ):
+        return common
+    return default_repo_path
+
+
 def _persist_executor_run(envelope: Dict[str, Any]) -> None:
     """Persist a POST /runs/executor response envelope to executor_runs.
 
@@ -1831,11 +1893,21 @@ async def create_executor_run(
             },
         )
 
-    # repo_path: default to the Abacus repo (a real git worktree) so
-    # git_evidence is meaningful even when the caller omits it. Enforce
-    # the configured allow-list; reject escapes.
-    repo_path = body.repo_path or "/home/ubuntu/Abacus"
+    # repo_path resolution: align the executor's working directory with
+    # the declared artifact paths so durable artifacts are created AND
+    # validated against the same repository. When the caller omits
+    # ``repo_path`` but declares ``expected_artifacts``, derive the cwd
+    # from the common parent of those artifact paths (gated by the
+    # configured allow-list). This fixes the path-mismatch bug where the
+    # executor wrote artifacts under ``/home/ubuntu/Abacus`` while
+    # verification stat-ed absolute paths under a different repo.
     allowlist = [p for p in (cfg.get("repo_allowlist") or []) if isinstance(p, str)]
+    repo_path = _derive_repo_path_from_artifacts(
+        expected_artifacts=body.expected_artifacts,
+        explicit_repo_path=body.repo_path,
+        default_repo_path="/home/ubuntu/Abacus",
+        allowlist=allowlist,
+    )
     if not any(
         repo_path == p or repo_path.startswith(p.rstrip("/") + "/")
         for p in allowlist
@@ -1908,6 +1980,29 @@ async def create_executor_run(
             f"selected={selected!r}: {type(exc).__name__}: {exc}",
             file=_sys.stderr,
         )
+    # ----------------------------------------------------------------
+    # Claude Code CLI queue lifecycle (fix for reports/claude_cli_queue_
+    # diagnosis.md §7 Fix 1): the dispatcher tasks row was created in
+    # ``queued`` state but the claude-code-cli code path never
+    # transitioned it through ``manager.start()`` / ``manager.complete()``
+    # / ``manager.fail()`` in sync with executor execution. The task was
+    # orphaned in ``queued`` until the reaper timed it out at
+    # ``stale_queued_sec=300``. We now mirror the same lifecycle used by
+    # the Hermes dispatch path (``POST /runs`` line 1246):
+    #   1. ``manager.start(task_id, run_id)`` — queued → running,
+    #      fired AFTER the create succeeds but BEFORE the CLI runs.
+    #   2. ``manager.complete(task_id, output_text=…)`` or
+    #      ``manager.fail(task_id, error_message=…)`` — running →
+    #      terminal, fired AFTER the CLI result is known.
+    # The lifecycle calls are best-effort: a failure is logged and
+    # swallowed so the dispatch still returns the executor's evidence
+    # envelope rather than 500'ing — matching the create() guard
+    # contract above. ``result.run_id`` is not known until AFTER
+    # ``runner.run()`` returns; we use a placeholder run id for the
+    # ``start()`` call (the CLI run_id is recorded in
+    # ``executor_runs`` by ``_persist_executor_run`` below, and
+    # ``manager.start()`` stamps it onto ``hermes_run_id`` /
+    # ``runtime_run_id`` for the watcher's poll path).
 
     if selected == "claude-code-cli":
         from aee.runtimes.executor_cli import ClaudeCodeCliRunner
@@ -1922,6 +2017,24 @@ async def create_executor_run(
             )
         else:
             runner = ClaudeCodeCliRunner.from_config(cfg)
+        # Claude Code CLI queue lifecycle — queued → running transition
+        # (Fix 1, see block-level comment above). The placeholder run id
+        # is overwritten by ``_persist_executor_run`` below; the manager
+        # uses it to stamp ``hermes_run_id`` / ``runtime_run_id`` so the
+        # watcher's poll path can attribute the task back to this run.
+        _cli_lifecycle_run_id = f"claude-cli-pending-{executor_task_id or 'none'}"
+        if executor_task_id:
+            try:
+                from dispatcher.manager import TaskManager as _TM_lifecycle
+                _TM_lifecycle().start(executor_task_id, _cli_lifecycle_run_id)
+            except Exception as _lifecycle_exc:  # pragma: no cover - defensive
+                import sys as _sys
+                print(
+                    f"[executor_run_lifecycle] manager.start failed for "
+                    f"task_id={executor_task_id!r}: "
+                    f"{type(_lifecycle_exc).__name__}: {_lifecycle_exc}",
+                    file=_sys.stderr,
+                )
         result = await runner.run(
             prompt=body.prompt,
             cwd=repo_path,
@@ -1966,6 +2079,91 @@ async def create_executor_run(
             error=result.error,
         )
         _persist_executor_run(envelope)
+        # Claude Code CLI queue lifecycle — running → terminal
+        # transition (Fix 1, see block-level comment above). After the
+        # CLI result is known we mirror the outcome into the dispatcher
+        # task so the ``tasks`` row reaches the same terminal status as
+        # the executor envelope (``completed`` / ``failed`` / ``timeout``
+        # / ``cancelled``). The watcher's completion gate then observes
+        # the true terminal state instead of finding a stale ``queued``
+        # row for the reaper to time out.
+        #
+        # Lifecycle reconciliation fix (2026-08-01): the watcher may
+        # have already transitioned the task to ``timeout`` because
+        # the placeholder ``hermes_run_id`` (``claude-cli-pending-*``)
+        # was polled before the watcher skip-fix was deployed. We use
+        # ``reconcile_executor_completion()`` which:
+        #   (a) persists the real ``result.run_id`` onto the tasks
+        #       row (overwriting the placeholder), and
+        #   (b) force-transitions to ``completed`` / ``failed``
+        #       even if the watcher already set ``timeout`` (bypasses
+        #       ``is_legal_transition`` — the executor path is the
+        #       sole authority for executor-run terminal status).
+        # The normal ``manager.complete()`` / ``manager.fail()`` path
+        # is still attempted first for the common case where the
+        # watcher has NOT preempted (status is still ``running``);
+        # if that raises ``IllegalTransition`` (status is ``timeout``),
+        # we fall through to ``reconcile_executor_completion``.
+        if executor_task_id:
+            try:
+                from dispatcher.manager import TaskManager as _TM_terminal
+                _tm_terminal = _TM_terminal()
+                if result.status == "completed":
+                    try:
+                        _tm_terminal.complete(
+                            executor_task_id,
+                            output_text=result.stdout,
+                        )
+                        # Happy path: complete() succeeded but does
+                        # NOT update hermes_run_id. Overwrite the
+                        # placeholder with the real CLI run_id so
+                        # find_by_hermes_run_id lookups work.
+                        _tm_terminal.update_hermes_run_id(
+                            executor_task_id, result.run_id,
+                        )
+                    except Exception:
+                        # Watcher may have already set timeout;
+                        # force-reconcile to completed with the real
+                        # run_id.
+                        _tm_terminal.reconcile_executor_completion(
+                            executor_task_id,
+                            run_id=result.run_id,
+                            status="completed",
+                            output_text=result.stdout,
+                            exit_code=result.exit_code,
+                        )
+                else:
+                    _cli_err = (
+                        f"claude-code-cli: {result.status} "
+                        f"exit={result.exit_code}"
+                    )
+                    try:
+                        _tm_terminal.fail(
+                            executor_task_id,
+                            _cli_err,
+                        )
+                        _tm_terminal.update_hermes_run_id(
+                            executor_task_id, result.run_id,
+                        )
+                    except Exception:
+                        # Watcher may have already set timeout;
+                        # force-reconcile to failed with the real
+                        # run_id.
+                        _tm_terminal.reconcile_executor_completion(
+                            executor_task_id,
+                            run_id=result.run_id,
+                            status="failed",
+                            error_message=_cli_err,
+                            exit_code=result.exit_code,
+                        )
+            except Exception as _terminal_exc:  # pragma: no cover - defensive
+                import sys as _sys
+                print(
+                    f"[executor_run_lifecycle] manager.complete/fail "
+                    f"failed for task_id={executor_task_id!r}: "
+                    f"{type(_terminal_exc).__name__}: {_terminal_exc}",
+                    file=_sys.stderr,
+                )
         return envelope
 
     # selected == "hermes" — delegate to the existing Hermes adapter

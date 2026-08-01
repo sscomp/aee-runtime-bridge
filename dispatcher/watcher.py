@@ -205,6 +205,22 @@ class Watcher:
             external_id = t.external_run_id or t.hermes_run_id
             if not external_id:
                 continue
+            # Lifecycle reconciliation fix (2026-08-01): skip
+            # polling for executor-run placeholder IDs. The
+            # claude-code-cli path stamps a placeholder
+            # ``claude-cli-pending-{task_id}`` onto
+            # ``hermes_run_id`` before the CLI runs (the real
+            # ``run_id`` is only known after ``runner.run()``
+            # returns). The watcher's poll path was treating this
+            # placeholder as a real Hermes run id, polling the
+            # Hermes gateway, getting "no longer tracks", and
+            # marking the task ``timeout`` ~136ms after start —
+            # before the CLI finishes. The executor path's own
+            # ``manager.complete()`` / ``manager.fail()`` calls
+            # are the sole terminal-transition authority for
+            # executor runs; the watcher must NOT preempt them.
+            if external_id.startswith("claude-cli-pending-"):
+                continue
             try:
                 await self._poll_one(t, external_id)
             except Exception as exc:  # noqa: BLE001
