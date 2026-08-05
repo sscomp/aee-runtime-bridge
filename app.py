@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -104,6 +105,10 @@ CLIENT_BRIDGE_KEYS: frozenset[str] = frozenset(
 # Per-key source label (used by the GPT -> MiniMax-M3 routing layer).
 # See `dispatcher/routing.py` for the policy.
 CLIENT_KEY_SOURCES: dict[str, str] = build_source_map(dict(os.environ))
+
+logger = logging.getLogger("hermes-runtime-bridge")
+logging.basicConfig(level=logging.INFO)
+_GPT_KEY_PREVIEW = os.getenv("GPT_BRIDGE_API_KEY", "")[:8]
 
 # -----------------------------------------------------------------------------
 # MiniMax-M3 routing (configured 2026-07-09; per /home/ubuntu/Abacus/MiniMax-M3-routellm.md)
@@ -210,6 +215,39 @@ app = FastAPI(
         "AEE-2 mounts `/jobs` and `/workers` for runtime-neutral worker claim."
     ),
     lifespan=_lifespan,
+)
+
+# ---------------------------------------------------------------------------
+# Debug middleware: log all POST requests with full headers for ChatGPT debugging
+# ---------------------------------------------------------------------------
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class PostDebugMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if request.method == "POST":
+            body = await request.body()
+            auth = request.headers.get("authorization", "MISSING")
+            auth_preview = auth[:30] + "..." if len(auth) > 30 else auth
+            ct = request.headers.get("content-type", "MISSING")
+            logger.info(f"POST_DEBUG: {request.url.path} | auth=[{auth_preview}] | content-type=[{ct}] | body_len={len(body)} | body_preview={body[:200]}")
+            request._body = body
+        response = await call_next(request)
+        return response
+
+app.add_middleware(PostDebugMiddleware)
+
+# ---------------------------------------------------------------------------
+# CORS middleware — ChatGPT sends OPTIONS preflight before POST;
+# without CORS headers the preflight gets 405 and ChatGPT aborts.
+# ---------------------------------------------------------------------------
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
@@ -483,12 +521,26 @@ def require_auth(authorization: Optional[str]) -> str:
             status_code=500,
             detail="Bridge client keys are not configured (set BRIDGE_API_KEY / GPT_BRIDGE_API_KEY / CLAUDE_BRIDGE_API_KEY / CURSOR_BRIDGE_API_KEY / MCP_BRIDGE_API_KEY in .env)",
         )
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not authorization:
+        logger.warning("AUTH FAIL: no Authorization header")
+        raise HTTPException(status_code=401, detail="Unauthorized: missing Authorization header")
+    # Log the raw header for debugging ChatGPT auth issues (mask the key)
+    raw_preview = authorization[:20] + "..." if len(authorization) > 20 else authorization
+    logger.info(f"AUTH: raw header starts with [{raw_preview}], len={len(authorization)}")
+    if not authorization.startswith("Bearer "):
+        logger.warning(f"AUTH FAIL: header does not start with 'Bearer ', got [{raw_preview}]")
+        raise HTTPException(status_code=401, detail="Unauthorized: expected Bearer scheme")
     presented = authorization[len("Bearer "):].strip()
+    # Handle double-Bearer: "Bearer Bearer gpt_..."
+    if presented.startswith("Bearer "):
+        presented = presented[len("Bearer "):].strip()
+        logger.info(f"AUTH: stripped double Bearer, key starts with [{presented[:8]}...]")
     if presented not in CLIENT_BRIDGE_KEYS:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return identify_source(presented, CLIENT_KEY_SOURCES)
+        logger.warning(f"AUTH FAIL: key [{presented[:8]}...] not in known keys (gpt key starts with [{_GPT_KEY_PREVIEW}])")
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid API key")
+    source = identify_source(presented, CLIENT_KEY_SOURCES)
+    logger.info(f"AUTH OK: source={source}")
+    return source
 
 
 def hermes_headers() -> Dict[str, str]:
@@ -613,6 +665,441 @@ async def health() -> Dict[str, Any]:
         "reaper": reaper_summary,
         "safety": safety_summary,
         "notifier": notifier_summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Routes — ChatGPT-compatible OpenAPI schema
+# ---------------------------------------------------------------------------
+# ChatGPT Custom GPT Action has a strict schema parser that chokes on:
+#   1. OpenAPI 3.1 anyOf + null (FastAPI default)
+#   2. Missing servers field
+#   3. Too many endpoints (58 → ChatGPT wants ~2-5)
+# This endpoint returns a minimal 3.0.0 schema with only the 2 operations
+# ChatGPT needs: create_run and get_run. Nullable fields use type + nullable
+# instead of anyOf.
+
+import os as _os  # noqa: E402
+
+_PUBLIC_BASE_URL = _os.getenv("BRIDGE_PUBLIC_URL", "https://hermes-runtime.biaobecue.com")
+
+
+@app.get("/openapi-chatgpt.json")
+async def openapi_chatgpt() -> Dict[str, Any]:
+    """ChatGPT Custom GPT Action compatible OpenAPI 3.0 schema.
+
+    Only exposes /runs (POST) and /runs/{run_id} (GET) — the two operations
+    ChatGPT needs to dispatch and poll tasks. Uses OpenAPI 3.0.0 with
+    `nullable: true` instead of 3.1 `anyOf + null`, includes `servers`,
+    and strips all AEE-2/internal endpoints.
+    """
+    return {
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Hermes M2 Task Dispatcher",
+            "description": (
+                "Dispatch tasks to Hermes M2 (autonomous agent on Abacus.ai). "
+                "Create a run with an instruction, then poll for the result. "
+                "Each task gets a persistent TASK-YYYYMMDD-NNNN id."
+            ),
+            "version": "1.0.0",
+        },
+        "servers": [
+            {"url": _PUBLIC_BASE_URL, "description": "Hermes Runtime Bridge"}
+        ],
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                }
+            },
+            "schemas": {}
+        },
+        "security": [{"bearerAuth": []}],
+        "paths": {
+            "/health": {
+                "get": {
+                    "summary": "Health Check",
+                    "description": "Check the health status of the Hermes Runtime Bridge.",
+                    "operationId": "aeeHealth",
+                    "responses": {
+                        "200": {
+                            "description": "Health status",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "service": {"type": "string"},
+                                            "version": {"type": "string"},
+                                            "phase": {"type": "string"},
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                    },
+                }
+            },
+            "/runs": {
+                "get": {
+                    "summary": "List Runs",
+                    "description": "List recent runs with optional status filter.",
+                    "operationId": "aeeListRuns",
+                    "parameters": [
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "required": False,
+                            "description": "Max results (1-100, default 20)",
+                            "schema": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+                        },
+                        {
+                            "name": "status",
+                            "in": "query",
+                            "required": False,
+                            "description": "Filter by status: running / completed / failed / timeout",
+                            "schema": {"type": "string"},
+                        },
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "List of runs",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "run_id": {"type": "string"},
+                                                "status": {"type": "string"},
+                                                "task_id": {"type": "string"},
+                                                "created_at": {"type": "string"},
+                                            },
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                    },
+                },
+                "post": {
+                    "summary": "Create Run",
+                    "description": (
+                        "Dispatch a task to Hermes M2. The `input` field is the "
+                        "instruction for the agent. Returns a run_id and task_id "
+                        "for polling."
+                    ),
+                    "operationId": "aeeCreateRun",
+                    "x-openai-isConsequential": False,
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["input"],
+                                    "properties": {
+                                        "input": {
+                                            "type": "string",
+                                            "description": "Instruction to execute on Hermes M2."
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Run created",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "run_id": {"type": "string"},
+                                            "status": {"type": "string"},
+                                            "task_id": {"type": "string"},
+                                            "poll_url": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            },
+                        },
+                    },
+                }
+            },
+            "/executors": {
+                "get": {
+                    "summary": "List Executors",
+                    "description": "List available executors registered with the bridge.",
+                    "operationId": "aeeListExecutors",
+                    "responses": {
+                        "200": {
+                            "description": "List of executors",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "name": {"type": "string"},
+                                                "status": {"type": "string"},
+                                            },
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                    },
+                }
+            },
+            "/runs/executor": {
+                "post": {
+                    "summary": "Create Executor Run",
+                    "description": "Dispatch a task to a specific executor backend.",
+                    "operationId": "aeeCreateExecutorRun",
+                    "x-openai-isConsequential": False,
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["input"],
+                                    "properties": {
+                                        "input": {
+                                            "type": "string",
+                                            "description": "Instruction to execute.",
+                                            "minLength": 1,
+                                        },
+                                        "executor": {
+                                            "type": "string",
+                                            "description": "Executor name (e.g. 'hermes').",
+                                        },
+                                        "session_id": {
+                                            "type": "string",
+                                        },
+                                        "timeout_seconds": {
+                                            "type": "integer",
+                                            "default": 900,
+                                        },
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Executor run created",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "run_id": {"type": "string"},
+                                            "status": {"type": "string"},
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                    },
+                }
+            },
+            "/runs/{run_id}": {
+                "get": {
+                    "summary": "Get Run Status",
+                    "description": (
+                        "Poll the status of a run. Returns current status, "
+                        "progress, and result when complete."
+                    ),
+                    "operationId": "aeeGetRun",
+                    "parameters": [
+                        {
+                            "name": "run_id",
+                            "in": "path",
+                            "required": True,
+                            "description": "The run_id returned by createRun",
+                            "schema": {"type": "string"},
+                        },
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Run status",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["run_id", "status"],
+                                        "properties": {
+                                            "run_id": {"type": "string"},
+                                            "status": {
+                                                "type": "string",
+                                                "description": "started / running / completed / failed / timeout",
+                                            },
+                                            "progress_pct": {
+                                                "type": "integer",
+                                                "default": 0,
+                                            },
+                                            "progress_step": {
+                                                "type": "string",
+                                            },
+                                            "task_id": {
+                                                "type": "string",
+                                            },
+                                            "result": {
+                                                "type": "string",
+                                                "description": "The agent's final output text (when completed).",
+                                            },
+                                            "error_message": {
+                                                "type": "string",
+                                            },
+                                            "duration_sec": {
+                                                "type": "number",
+                                            },
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                        "404": {
+                            "description": "Run not found",
+                        },
+                    },
+                }
+            },
+            "/runs/{run_id}/summary": {
+                "get": {
+                    "summary": "Get Run Summary",
+                    "description": "Get a flat summary of a run (no nested objects).",
+                    "operationId": "aeeGetRunSummary",
+                    "parameters": [
+                        {
+                            "name": "run_id",
+                            "in": "path",
+                            "required": True,
+                            "description": "The run_id returned by aeeCreateRun",
+                            "schema": {"type": "string"},
+                        },
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Run summary",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "run_id": {"type": "string"},
+                                            "status": {"type": "string"},
+                                            "task_id": {"type": "string"},
+                                            "progress_pct": {"type": "integer"},
+                                            "result": {"type": "string"},
+                                            "error_message": {"type": "string"},
+                                            "duration_sec": {"type": "number"},
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                        "404": {"description": "Run not found"},
+                    },
+                }
+            },
+            "/runs/{run_id}/stop": {
+                "post": {
+                    "summary": "Stop Run",
+                    "description": "Stop a running or queued run.",
+                    "operationId": "aeeStopRun",
+                    "x-openai-isConsequential": False,
+                    "parameters": [
+                        {
+                            "name": "run_id",
+                            "in": "path",
+                            "required": True,
+                            "description": "The run_id to stop",
+                            "schema": {"type": "string"},
+                        },
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Run stopped",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "run_id": {"type": "string"},
+                                            "status": {"type": "string"},
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                        "404": {"description": "Run not found"},
+                    },
+                }
+            },
+            "/tasks/{task_id}": {
+                "get": {
+                    "summary": "Get Task Status",
+                    "description": "Poll task status by TASK-YYYYMMDD-NNNN id.",
+                    "operationId": "aeeGetTask",
+                    "parameters": [
+                        {
+                            "name": "task_id",
+                            "in": "path",
+                            "required": True,
+                            "description": "Task id (TASK-YYYYMMDD-NNNN)",
+                            "schema": {"type": "string"},
+                        },
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Task status",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["task_id", "status"],
+                                        "properties": {
+                                            "task_id": {"type": "string"},
+                                            "status": {
+                                                "type": "string",
+                                                "description": "queued / running / completed / failed / timeout",
+                                            },
+                                            "progress_pct": {
+                                                "type": "integer",
+                                                "default": 0,
+                                            },
+                                            "title": {
+                                                "type": "string",
+                                            },
+                                            "error_message": {
+                                                "type": "string",
+                                            },
+                                            "result_path": {
+                                                "type": "string",
+                                            },
+                                            "warning_count": {
+                                                "type": "integer",
+                                                "default": 0,
+                                            },
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                        "404": {"description": "Task not found"},
+                    },
+                }
+            },
+        },
     }
 
 
@@ -907,7 +1394,7 @@ async def list_runs_endpoint(
     }
 
 
-@app.post("/runs", response_model=CreateRunResponse)
+@app.post("/runs", response_model=CreateRunResponse, response_model_exclude_none=True)
 async def create_run(
     body: CreateRunRequest,
     authorization: Optional[str] = Header(None),
@@ -1285,6 +1772,24 @@ async def create_run(
             "profile": resolved_profile,
         },
     )
+
+    # ChatGPT Custom GPT Action parser chokes on nested objects that are
+    # not declared in the imported OpenAPI schema ("Failed to Parse JSON —
+    # extra {} or nesting"). The user's imported YAML schema does not
+    # declare `safety` or `routing` in CreateRunResponse, so we strip them
+    # entirely for GPT-source requests (not even null) to keep ChatGPT
+    # happy. CLI/other sources still get the full debug envelope.
+    if source == "gpt":
+        return {
+            "run_id": run_id,
+            "status": submit_result.status or "started",
+            "session_id": session_id,
+            "poll_url": f"/runs/{run_id}",
+            "requires_review": False,
+            "task_id": task_id,
+            "task_poll_url": f"/tasks/{task_id}",
+            "progress_pct": 5,
+        }
 
     return CreateRunResponse(
         run_id=run_id,
@@ -2431,6 +2936,53 @@ def _collect_task_evidence(task_id: str) -> Optional[Dict[str, Any]]:
         if p and p not in artifact_paths:
             artifact_paths.append(p)
 
+    # WO-RUNTIME-ARTIFACT-REGISTRATION-MINIMAL-FIX: when the caller
+    # did NOT declare ``expected_artifacts`` (so
+    # ``manager._verify_expected_delivery`` had nothing to scan in
+    # ``input_text`` and left ``delivery_json`` NULL + the
+    # ``artifacts`` table empty) the task may STILL have produced a
+    # durable artifact — the agent's ``output_text`` typically names
+    # the file it wrote using an absolute path. The two prior
+    # evidence sources above (``artifacts`` table rows + delivery_json
+    # augmentation) cover the explicit-declaration path; this third
+    # source covers the implicit-output path so the final result
+    # mapping registers the artifact the agent actually delivered.
+    #
+    # This is intentionally a MINIMAL extension of the existing
+    # ``_collect_task_evidence`` helper — same regex shape as
+    # ``manager._verify_expected_delivery``'s input scan, same
+    # ``verify_artifacts`` stat+sha path the claude-code-cli executor
+    # uses. Read-only: never creates files, never invokes the
+    # dispatcher, never touches the executor / queue / lifecycle.
+    # Only paths that actually exist on disk are registered (a
+    # ``write`` that failed to land is NOT an artifact). The shape
+    # of each appended ``artifact_verification`` entry mirrors the
+    # claude-code-cli / ``verify_artifacts`` contract exactly.
+    if output_text:
+        import re as _re
+        from aee.runtimes.executor_envelope import verify_artifacts as _verify
+        out_seen: set = set()
+        out_candidates: List[str] = []
+        for m in _re.finditer(
+            r"(?:^|[\s,;\"'`])(/[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,8})",
+            output_text,
+        ):
+            p = m.group(1)
+            if p in out_seen or p in artifact_paths:
+                continue
+            out_seen.add(p)
+            out_candidates.append(p)
+        if out_candidates:
+            out_verified = _verify(out_candidates)
+            for entry in out_verified:
+                if not entry.get("exists"):
+                    continue
+                p = entry["path"]
+                if p in artifact_paths:
+                    continue
+                artifact_paths.append(p)
+                artifact_verification.append(entry)
+
     # Telegram notification blob -> telegram_result shape that the
     # executor_runs envelope carries for the claude-code-cli path.
     telegram_result: Optional[Dict[str, Any]] = None
@@ -2569,6 +3121,37 @@ def _merge_task_evidence_into_envelope(
     return merged
 
 
+def _flatten_for_gpt(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a run envelope for ChatGPT Custom GPT Action compatibility.
+
+    ChatGPT's Action parser reports "Failed to Parse JSON — extra {} or
+    nesting" when the response contains nested objects that the imported
+    OpenAPI schema does not declare inline (even with additionalProperties).
+    This helper strips all dict/list-of-dict values and converts them to
+    JSON strings, leaving only top-level scalars (str, int, float, bool,
+    None) and flat lists of scalars (list[str]).
+    """
+    flat: Dict[str, Any] = {}
+    for key, value in envelope.items():
+        if value is None:
+            continue  # exclude None — ChatGPT doesn't like null either
+        if isinstance(value, dict):
+            # Convert nested dict to a compact JSON string
+            flat[key] = json.dumps(value, ensure_ascii=False, default=str)
+        elif isinstance(value, list) and value and isinstance(value[0], dict):
+            # List of dicts → JSON string
+            flat[key] = json.dumps(value, ensure_ascii=False, default=str)
+        elif isinstance(value, list):
+            # Flat list of scalars — keep as-is
+            flat[key] = value
+        elif isinstance(value, (str, int, float, bool)):
+            flat[key] = value
+        else:
+            # Fallback: stringify anything else
+            flat[key] = str(value)
+    return flat
+
+
 @app.get("/runs/{run_id}")
 async def get_run(
     run_id: str,
@@ -2592,8 +3175,13 @@ async def get_run(
 
     Malformed run_id (empty, contains slashes, control chars,
     exceeds 200 chars) returns a deterministic JSON 400.
+
+    ChatGPT compatibility: when the request is from a GPT source,
+    the response is flattened to top-level scalar fields only (no
+    nested objects) to avoid ChatGPT's "Failed to Parse JSON — extra
+    {} or nesting" parser error.
     """
-    require_auth(authorization)
+    source = require_auth(authorization)
 
     # Malformed run_id — deterministic 400. We still go through
     # FastAPI's HTTPException so the response shape matches the
@@ -2660,6 +3248,8 @@ async def get_run(
         # pre-reconciliation guess.
         from dispatcher.observability import derive_observability
         envelope.update(derive_observability(envelope))
+        if source == "gpt":
+            return _flatten_for_gpt(envelope)
         return envelope
 
     # 2) Dispatcher task table (legacy POST /runs runs that did not
@@ -2731,6 +3321,8 @@ async def get_run(
             "output_text": out.get("output_text"),
         }
         envelope.update(derive_observability(obs_source))
+        if source == "gpt":
+            return _flatten_for_gpt(envelope)
         return envelope
 
     # 3) No persisted record. Deterministic 404 — do NOT call the

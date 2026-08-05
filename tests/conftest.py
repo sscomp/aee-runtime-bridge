@@ -1,4 +1,5 @@
-"""pytest conftest for ``tests/`` — live-bridge probe + skip policy.
+"""pytest conftest for ``tests/`` — live-bridge probe + skip policy
++ Telegram notification test isolation guard.
 
 This conftest is loaded automatically by pytest when it discovers
 ``tests/``. Its job is to make the legacy ``tests/`` suite safer in
@@ -27,6 +28,36 @@ Hard rules
 * The skip policy is opt-in via ``LIVE_DB_REQUIRED = True`` on
   the test class, so a future test author has to explicitly
   declare the dependency.
+
+Telegram Notification Test Isolation Guard (TASK-20260805-0029 fix)
+-------------------------------------------------------------------
+
+An autouse fixture (``_guard_hermes_send_subprocess``) installs a
+fail-on-call sentinel on ``subprocess.run`` for every pytest test
+session. If ANY test triggers ``subprocess.run(["hermes", "send",
+...])``, the sentinel raises ``AssertionError`` immediately —
+preventing real Telegram messages from being sent during test
+runs. The sentinel ONLY intercepts the ``hermes send`` argv shape;
+all other subprocess calls (``git rev-parse``, ``claude -p ...``,
+etc.) fall through to the real ``subprocess.run`` so tests that
+legitimately use subprocess for non-notification purposes are not
+affected.
+
+Tests that intentionally need to mock the notification gate at a
+higher level (e.g. ``test_aee_v3_telegram_gate.py`` which
+monkey-patches ``subprocess.run`` itself) can opt out by setting
+the ``DISABLE_HERMES_SEND_GUARD`` marker on the test function or
+class::
+
+    @pytest.mark.disable_hermes_send_guard
+    def test_my_custom_notification_mock(): ...
+
+The guard is a **safety net**, not a replacement for per-test
+mocking. Tests should still mock ``notify_terminal_with_fallback``
+or ``subprocess.run`` as needed; the guard exists to catch cases
+where a test forgets to mock (incident root cause: 4 test files
+in TASK-20260805-0029 did not mock, sending real Telegram messages
+to the production chat).
 """
 from __future__ import annotations
 
@@ -109,3 +140,73 @@ def pytest_collection_modifyitems(config, items):
         cls = getattr(item, "cls", None)
         if cls is not None and getattr(cls, "LIVE_DB_REQUIRED", False):
             item.add_marker(skip_marker)
+
+
+# ---------------------------------------------------------------------------
+# Telegram Notification Test Isolation Guard (TASK-20260805-0029 fix)
+# ---------------------------------------------------------------------------
+#
+# The following autouse fixture installs a fail-on-call sentinel on
+# ``subprocess.run`` that raises ``AssertionError`` if any test triggers
+# a ``hermes send`` subprocess call. This is the safety net that
+# prevents real Telegram messages from being sent during pytest runs.
+#
+# Tests that intentionally mock ``subprocess.run`` at a higher level
+# (e.g. ``test_aee_v3_telegram_gate.py``) can opt out with:
+#
+#     @pytest.mark.disable_hermes_send_guard
+#
+# The sentinel ONLY intercepts ``hermes send`` argv; all other
+# subprocess calls fall through to the real ``subprocess.run``.
+
+@pytest.fixture(autouse=True)
+def _guard_hermes_send_subprocess(request):
+    """Autouse fixture: block ``subprocess.run(["hermes", "send", ...])``
+    during tests to prevent real Telegram notifications.
+
+    The guard wraps ``subprocess.run`` with a sentinel that checks
+    ``argv[0] == "hermes" and argv[1] == "send"``. If matched, it
+    raises ``AssertionError`` immediately. All other subprocess calls
+    pass through to the real implementation.
+
+    Opt out with ``@pytest.mark.disable_hermes_send_guard`` for tests
+    that provide their own ``subprocess.run`` mock.
+    """
+    # Check for opt-out marker on the test function or its class.
+    item = getattr(request, "_pyfuncitem", None) or request
+    has_optout = (
+        request.node.get_closest_marker("disable_hermes_send_guard")
+        if hasattr(request, "node")
+        else False
+    )
+    if has_optout:
+        yield
+        return
+
+    import subprocess as _sp
+
+    _real_run = _sp.run
+    _violations: list = []
+
+    def _guarded_run(argv, *args, **kwargs):
+        # Normalize argv: can be a list/tuple or a string.
+        if isinstance(argv, str):
+            parts = argv.split()
+        else:
+            parts = list(argv) if argv else []
+        if len(parts) >= 2 and parts[0] == "hermes" and parts[1] == "send":
+            _violations.append(list(parts))
+            raise AssertionError(
+                f"BLOCKED: subprocess.run invoked 'hermes send' during "
+                f"test (argv={parts!r}); this would send a real Telegram "
+                f"message. Mock dispatcher.notifier.notify_terminal_with_fallback "
+                f"or subprocess.run in the test. To intentionally bypass "
+                f"this guard, use @pytest.mark.disable_hermes_send_guard."
+            )
+        return _real_run(argv, *args, **kwargs)
+
+    _sp.run = _guarded_run
+    try:
+        yield
+    finally:
+        _sp.run = _real_run
