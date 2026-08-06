@@ -1376,6 +1376,17 @@ async def list_runs_endpoint(
         env = dict(row)
         env.setdefault("source", "executor_runs")
         env["is_terminal"] = env.get("status") in terminal_statuses
+        # Merge task-side evidence (artifacts, output, telegram) into
+        # Hermes lifecycle-sync stubs so list consumers see the real
+        # artifacts the run produced, not an empty stub. This mirrors
+        # the merge already applied by GET /runs/{run_id}. Fully
+        # populated executor_runs rows short-circuit inside the
+        # helper and are returned byte-for-byte unchanged.
+        env = _merge_task_evidence_into_envelope(env)
+        # Convenience field: artifact_count derived from the (possibly
+        # merged) artifact_paths list so callers don't have to compute
+        # len(artifact_paths) themselves.
+        env["artifact_count"] = len(env.get("artifact_paths") or [])
         # Merge the observability fields into the envelope. The
         # canonical run fields (run_id, status, progress, etc.) are
         # preserved; observability fields are added alongside.
@@ -3239,6 +3250,13 @@ async def get_run(
         # into the envelope. Fully populated rows short-circuit
         # inside the helper and are returned byte-for-byte unchanged.
         envelope = _merge_task_evidence_into_envelope(envelope)
+        # Convenience field: artifact_count derived from the (possibly
+        # merged) artifact_paths list. This was missing from the full
+        # GET /runs/{run_id} response — only the summary endpoint had
+        # it. GPT-source callers that check `artifact_count` to decide
+        # whether to read `artifact_verification` got a missing field
+        # and treated it as "no artifacts".
+        envelope["artifact_count"] = len(envelope.get("artifact_paths") or [])
         # P1 observability: derive the canonical observability
         # envelope from the **persisted post-reconciliation** row
         # (work-order §4). The reconciliation above may have updated
