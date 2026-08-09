@@ -440,53 +440,84 @@ def run_install(options: InstallCliOptions) -> InstallCliResult:
             notes=notes,
         )
 
-    # 5. Pre-flight OK. If ``--execute`` was requested, record it and
-    #    surface the §21.3 execute-refused note. The exit code is
-    #    ``EXIT_EXECUTE_NOT_AUTHORIZED`` (6) so an operator can
-    #    distinguish "I asked for execute and it was refused" from
-    #    "I didn't ask for execute" (which is exit 0). When
-    #    ``--execute`` was NOT requested, exit 0.
+    # 5. Pre-flight OK. If ``--execute`` was requested, drive the
+    #    BootstrapRunner (stages 02-07) for real. The runner creates the
+    #    venv, installs locked deps, runs the doctor health check, runs
+    #    the smoke test, and writes the AGENT_READY marker. No credential
+    #    provisioning happens here — the runner threads os.environ to
+    #    stages; secrets the operator already provisioned are read at
+    #    runtime. When ``--execute`` was NOT requested, exit 0 (dry-run).
     if options.execute:
-        execute_note = (
-            "Phase 4B: --execute received but the §21.3 shell-level "
-            "execution path is not authorized in this slice; plan + "
-            "read-only pre-flight only. Use the future install.sh "
-            "shell wrapper (W6/W7) to actually perform the install."
+        from aee.installer.runner import BootstrapRunner
+
+        repo_root = (
+            Path(options.repo_root) if options.repo_root is not None
+            else Path.cwd()
         )
-        if options.resume:
-            execute_note += (
-                " --resume also received; recorded for the future "
-                "shell layer (no stage-marker replay in this slice)."
+        runner = BootstrapRunner(
+            repo_root=repo_root,
+            profile=canonical,
+            dry_run=False,
+        )
+        run_result = runner.run()
+
+        if run_result.ok and run_result.agent_ready:
+            execute_notes = [
+                "Bootstrap hardening: --execute drove stages 02-07; "
+                "AGENT_READY marker written. run_id={rid}, duration={d:.1f}s.".format(
+                    rid=run_result.run_id, d=run_result.duration_seconds
+                )
+            ]
+            for s in run_result.stages:
+                execute_notes.append(
+                    "  {stage}: {outcome} — {msg}".format(
+                        stage=s.stage.value,
+                        outcome=s.outcome.value,
+                        msg=s.message,
+                    )
+                )
+            return InstallCliResult(
+                exit_code=EXIT_OK,
+                profile=canonical,
+                execute_requested=True,
+                resume=options.resume,
+                from_ref=options.from_ref,
+                rollback_to=options.rollback_to,
+                capabilities=options.capabilities,
+                plan=plan,
+                preflight=preflight,
+                executed=True,
+                error="",
+                notes=tuple(execute_notes),
             )
-        if options.from_ref is not None:
-            execute_note += (
-                " --from {ref} recorded; no git operations performed.".format(
-                    ref=options.from_ref
+        else:
+            failing = (
+                run_result.failing_stage.value
+                if run_result.failing_stage
+                else "unknown"
+            )
+            execute_note = (
+                "Bootstrap hardening: --execute drove stages 02-07 but "
+                "stage {f} failed. run_id={rid}, duration={d:.1f}s.".format(
+                    f=failing,
+                    rid=run_result.run_id,
+                    d=run_result.duration_seconds,
                 )
             )
-        if options.rollback_to is not None:
-            execute_note += (
-                " --rollback-to {ref} recorded; no git operations "
-                "performed.".format(ref=options.rollback_to)
+            return InstallCliResult(
+                exit_code=EXIT_PRE_FLIGHT_FAILED,
+                profile=canonical,
+                execute_requested=True,
+                resume=options.resume,
+                from_ref=options.from_ref,
+                rollback_to=options.rollback_to,
+                capabilities=options.capabilities,
+                plan=plan,
+                preflight=preflight,
+                executed=False,
+                error="bootstrap stage {f} failed".format(f=failing),
+                notes=(execute_note,),
             )
-        if options.capabilities is not None:
-            execute_note += _capabilities_validated_note(
-                options.capabilities, cap_result
-            )
-        return InstallCliResult(
-            exit_code=EXIT_EXECUTE_NOT_AUTHORIZED,
-            profile=canonical,
-            execute_requested=True,
-            resume=options.resume,
-            from_ref=options.from_ref,
-            rollback_to=options.rollback_to,
-            capabilities=options.capabilities,
-            plan=plan,
-            preflight=preflight,
-            executed=False,
-            error="",
-            notes=(execute_note,),
-        )
 
     # 6. Dry-run success. Audit-only notes for --resume / --from /
     #    --rollback-to so an operator can see the flags were received.

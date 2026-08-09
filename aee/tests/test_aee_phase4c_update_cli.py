@@ -797,9 +797,10 @@ class BackwardCompatTests(unittest.TestCase):
         # Prepare exit codes: 0, 4, 5, 6, 7, 8. Any means routing works.
         self.assertIn(rc, (0, 4, 5, 6, 7, 8))
 
-    def test_install_execute_still_returns_6(self) -> None:
+    def test_install_execute_drives_runner(self) -> None:
         rc, out, err = _run_cli(["install", "--execute"])
-        self.assertEqual(rc, EXIT_EXECUTE_NOT_AUTHORIZED)
+        # --execute drives the runner; exit 0 (success) or 4 (stage failure).
+        self.assertIn(rc, (EXIT_OK, EXIT_PRE_FLIGHT_FAILED))
 
 
 # ---------------------------------------------------------------------------#

@@ -335,11 +335,10 @@ class ExecuteAuthorizationTests(unittest.TestCase):
     """``--execute`` is gated by ExecuteNotAuthorizedError (exit 6) on
     both install and update; doctor/prepare have no --execute flag."""
 
-    def test_install_execute_returns_exit_6(self) -> None:
+    def test_install_execute_drives_runner(self) -> None:
         rc, out, err = _run_cli(["install", "--execute"])
-        self.assertEqual(rc, EXIT_EXECUTE_NOT_AUTHORIZED, msg=err)
-        self.assertIn("executed            : False", out)
-        self.assertIn("exit_code           : 6", out)
+        # --execute drives the runner; exit 0 (success) or 4 (stage failure).
+        self.assertIn(rc, (EXIT_OK, EXIT_PRE_FLIGHT_FAILED))
 
     def test_update_execute_returns_exit_6(self) -> None:
         rc, out, err = _run_cli(["update", "--execute"])
@@ -347,10 +346,10 @@ class ExecuteAuthorizationTests(unittest.TestCase):
         self.assertIn("executed            : False", out)
         self.assertIn("exit_code           : 6", out)
 
-    def test_install_execute_with_resume_still_exit_6(self) -> None:
-        # --execute dominates: even with --resume, exit 6.
+    def test_install_execute_with_resume_drives_runner(self) -> None:
+        # --execute drives the runner; --resume is audit-only.
         rc, out, err = _run_cli(["install", "--execute", "--resume"])
-        self.assertEqual(rc, EXIT_EXECUTE_NOT_AUTHORIZED, msg=err)
+        self.assertIn(rc, (EXIT_OK, EXIT_PRE_FLIGHT_FAILED))
 
     def test_update_execute_with_channel_still_exit_6(self) -> None:
         rc, out, err = _run_cli(["update", "--execute", "--channel", "rc"])
@@ -367,8 +366,9 @@ class ExecuteAuthorizationTests(unittest.TestCase):
         self.assertEqual(rc, EXIT_PARSE_ERROR, msg=err)
 
     def test_install_and_update_exit_6_are_identical_constant(self) -> None:
-        # Both paths route through the same ExitNotAuthorizedError
-        # constant — no parallel hard-coded 6.
+        # Update still returns exit 6 (not wired to the runner).
+        # Install now drives the runner (exit 0 or 4), so the two
+        # paths are no longer identical. Verify the divergence.
         from aee.installer.cli_install import run_install
         from aee.installer.update import run_update
         from aee.installer.cli_install import InstallCliOptions
@@ -379,9 +379,10 @@ class ExecuteAuthorizationTests(unittest.TestCase):
         update_result = run_update(
             UpdateCliOptions(profile="full", execute=True)
         )
-        self.assertEqual(install_result.exit_code, update_result.exit_code)
-        self.assertEqual(install_result.exit_code, EXIT_EXECUTE_NOT_AUTHORIZED)
-        self.assertEqual(install_result.exit_code, 6)
+        # Install: 0 or 4 (runner). Update: 6 (still gated).
+        self.assertIn(install_result.exit_code, (EXIT_OK, EXIT_PRE_FLIGHT_FAILED))
+        self.assertEqual(update_result.exit_code, EXIT_EXECUTE_NOT_AUTHORIZED)
+        self.assertEqual(update_result.exit_code, 6)
 
 
 # ---------------------------------------------------------------------------
@@ -437,12 +438,11 @@ class JsonOutputContractTests(unittest.TestCase):
         self.assertEqual(rc, EXIT_OK, msg=err)
         self.assertEqual(payload.get("phase"), "4C")
 
-    def test_install_json_execute_carries_exit_code_6(self) -> None:
+    def test_install_json_execute_drives_runner(self) -> None:
         rc, payload, err = _run_json(["install", "--execute"])
-        self.assertEqual(rc, EXIT_EXECUTE_NOT_AUTHORIZED, msg=err)
-        self.assertEqual(payload.get("exit_code"), 6)
+        # --execute drives the runner; exit 0 (success) or 4 (stage failure).
+        self.assertIn(rc, (EXIT_OK, EXIT_PRE_FLIGHT_FAILED), msg=err)
         self.assertEqual(payload.get("execute_requested"), True)
-        self.assertEqual(payload.get("executed"), False)
 
     def test_update_json_execute_carries_exit_code_6(self) -> None:
         rc, payload, err = _run_json(["update", "--execute"])

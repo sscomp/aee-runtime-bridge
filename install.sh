@@ -177,19 +177,31 @@ if [ "$show_help" -eq 1 ]; then
     exit 0
 fi
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------\
 # Refuse --execute in this slice (workorder §6: no production side effects).
 # The Python backend's ExecuteNotAuthorizedError maps to exit code 6.
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------\
+# Bootstrap hardening: --execute now drives the full stage chain via
+# the Python CLI. The Python backend's BootstrapRunner executes stages
+# 02-07 (clone, runtime_setup, health_check, smoke_test, agent_ready).
+# Stages 00 (detect) and 01 (deps) are shell-owned and run above.
 if [ "$execute" -eq 1 ]; then
-    cat >&2 <<'EOF'
-install.sh: --execute is not authorized in this slice.
-The shell-level execution path (system user creation, environment file
-writes, supervisord reload, smoke test invocation) is a separately
-authorizable follow-up per Master Plan §21.3. Use --dry-run (the
-default) for plan + read-only pre-flight.
-EOF
-    exit 6
+    # Forward --execute to the Python CLI so the BootstrapRunner drives
+    # the stage chain. The CLI exits 0 on success (AGENT_READY written)
+    # or non-zero on stage failure.
+    cli_args=(install)
+    if [ -n "$profile" ]; then
+        cli_args+=(--profile "$profile")
+    fi
+    if [ "$json_output" -eq 1 ]; then
+        cli_args+=(--json)
+    fi
+    cli_args+=(--execute)
+    set +e
+    "$python_bin" -m aee.cli "${cli_args[@]}"
+    cli_exit=$?
+    set -e
+    exit "$cli_exit"
 fi
 
 # ---------------------------------------------------------------------------

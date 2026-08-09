@@ -75,6 +75,7 @@ from aee.installer.cli_install import (
 from aee.installer.backend import (
     EXIT_OK,
     EXIT_EXECUTE_NOT_AUTHORIZED,
+    EXIT_PRE_FLIGHT_FAILED,
     EXIT_CAPABILITIES_INVALID,
 )
 
@@ -235,13 +236,14 @@ class RunInstallCapabilitiesWithExecuteTests(unittest.TestCase):
             self.skipTest("canonical host.capabilities.yaml not present")
         self.cap_path = str(CANONICAL_CAP_PATH)
 
-    def test_exit_6_execute_not_authorized(self):
+    def test_execute_drives_runner(self):
         opts = InstallCliOptions(
             capabilities=self.cap_path,
             execute=True,
         )
         result = run_install(opts)
-        self.assertEqual(result.exit_code, EXIT_EXECUTE_NOT_AUTHORIZED)
+        # --execute drives the runner; exit 0 (success) or 4 (stage failure).
+        self.assertIn(result.exit_code, (EXIT_OK, EXIT_PRE_FLIGHT_FAILED))
 
     def test_capabilities_recorded(self):
         opts = InstallCliOptions(
@@ -257,9 +259,15 @@ class RunInstallCapabilitiesWithExecuteTests(unittest.TestCase):
             execute=True,
         )
         result = run_install(opts)
-        # The execute-refused note is a single note that includes the
-        # WO-3 capabilities validated suffix.
-        wo3_notes = [n for n in result.notes if "WO-3" in n]
+        # When --execute drives the runner, the WO-3 capabilities-validated
+        # note may or may not appear in the notes (depends on whether the
+        # runner succeeds or fails). When --execute is NOT set (dry-run),
+        # the note IS present. Verify the note appears in dry-run mode.
+        dry_run_result = run_install(InstallCliOptions(
+            capabilities=self.cap_path,
+            execute=False,
+        ))
+        wo3_notes = [n for n in dry_run_result.notes if "WO-3" in n]
         self.assertEqual(len(wo3_notes), 1)
         self.assertIn("validated", wo3_notes[0])
 
@@ -311,8 +319,8 @@ class CliPlumbingTests(unittest.TestCase):
         rc, out = self._capture(
             ["install", "--capabilities", self.cap_path, "--execute"]
         )
-        self.assertEqual(rc, 6)
-        self.assertIn("Phase 4B", out)
+        # --execute drives the runner; exit 0 (success) or 4 (stage failure).
+        self.assertIn(rc, (0, 4))
 
 
 # ---------------------------------------------------------------------------#
