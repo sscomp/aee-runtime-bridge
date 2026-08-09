@@ -1,0 +1,8 @@
+# Dev/test dependencies — superset of runtime deps
+# Includes everything needed to run the legacy tests/ suite
+-r requirements.in
+
+pytest
+pytest-asyncio
+PyYAML
+openapi-spec-validator

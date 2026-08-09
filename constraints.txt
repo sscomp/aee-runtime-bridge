@@ -1,0 +1,14 @@
+# Version upper bounds for runtime deps
+# Prevents breaking changes from future major/minor bumps.
+# Editable without touching requirements.in or regenerating from scratch.
+fastapi<0.140
+pydantic<3
+uvicorn<0.60
+httpx<0.29
+python-dotenv<2
+
+# Dev deps upper bounds
+pytest<10
+pytest-asyncio<2
+PyYAML<7
+openapi-spec-validator<1

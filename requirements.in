@@ -1,0 +1,8 @@
+# Runtime dependencies for hermes-runtime-bridge
+# No version pins here — the lockfile (requirements.lock) is the source of truth.
+# Upper bounds are managed in constraints.txt.
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+pydantic
