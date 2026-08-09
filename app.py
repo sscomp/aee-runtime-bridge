@@ -1856,46 +1856,32 @@ from aee.runtimes.executor_api import ExecutorRunRequest  # noqa: E402
 
 
 def _attempt_telegram(subject: str, text: str) -> Dict[str, Any]:
-    """Best-effort Telegram notification for an executor run.
+    """Observability stub for executor-run Telegram notifications.
 
-    Uses bridge-env ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID`` only.
-    Never raises; returns a truthful ``telegram_result`` dict:
-    ``{success, message_id, recipient}`` on success, or
-    ``{success: False, skipped: <reason>}`` when creds are absent /
-    the send fails. The separate report-time Telegram send (§9) uses
-    ``hermes send`` directly and is not this function's concern.
+    **Notification ownership decision (production-readiness finalization):**
+    The dispatcher's task-level notifier (``notify_terminal_with_fallback``
+    in ``dispatcher/notifier.py``) is the single authoritative notification
+    path for ALL terminal transitions, including executor runs. It uses
+    ``hermes send`` (gateway credentials) and enforces exactly-once via
+    ``notification_state.py``. This function previously sent a separate
+    Telegram message via the Bot API using bridge-env credentials
+    (``TELEGRAM_BOT_TOKEN``), creating a duplicate-send risk if those
+    env vars were ever populated. It is now a **no-op stub** that records
+    the delegation decision for the ``telegram_result_json`` observability
+    field without making any HTTP call or sending any message.
+
+    Returns a truthful ``telegram_result`` dict:
+    ``{success: False, skipped: "delegated to scheduler-level notifier"}``
+    so the executor envelope's ``telegram_result`` field is populated
+    for auditability. The actual notification is sent by
+    ``TaskManager._notify_terminal`` → ``notify_terminal_with_fallback``
+    when ``manager.complete()`` / ``manager.fail()`` is called in the
+    terminal-transition block below.
     """
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat_id:
-        return {
-            "success": False,
-            "skipped": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not configured in bridge env",
-        }
-    import json as _json
-    import urllib.error as _urlerr
-    import urllib.parse as _urlparse
-    import urllib.request as _urlreq
-    payload = _urlparse.urlencode({
-        "chat_id": chat_id,
-        "text": f"{subject}\n\n{text}",
-        "disable_web_page_preview": "true",
-    }).encode("utf-8")
-    req = _urlreq.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data=payload,
-        method="POST",
-    )
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    try:
-        with _urlreq.urlopen(req, timeout=10) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-        if not data.get("ok"):
-            return {"success": False, "skipped": f"telegram not ok: {data!r}"}
-        msg_id = (data.get("result") or {}).get("message_id")
-        return {"success": True, "message_id": msg_id, "recipient": chat_id}
-    except (_urlerr.URLError, _urlerr.HTTPError, OSError, ValueError) as exc:
-        return {"success": False, "skipped": f"{type(exc).__name__}: {exc}"}
+    return {
+        "success": False,
+        "skipped": "delegated to scheduler-level notifier (notify_terminal_with_fallback)",
+    }
 
 
 @app.get("/executors")

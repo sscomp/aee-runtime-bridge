@@ -464,12 +464,125 @@ def init_executor_runs(conn: sqlite3.Connection) -> None:
 
     Kept for symmetry with ``dispatcher.db._init_schema``; callers
     that already hold a connection can call ``ensure_schema`` directly.
+
+    Also runs the stale-run reconciliation on init so orphaned
+    ``status='running'`` rows left by failed task-creation races
+    (see ``reconcile_stale_runs``) are cleaned up automatically on
+    bridge restart.
     """
     global _initialized
     with _init_lock:
         if not _initialized:
             ensure_schema(conn)
+            reconcile_stale_runs(conn)
             _initialized = True
+
+
+# ---------------------------------------------------------------------------
+# Stale-run reconciliation (production-readiness minimal finalization).
+# ---------------------------------------------------------------------------
+# When ``_seed_run()`` in ``aee/runtimes/executor_cli.py`` creates an
+# ``executor_runs`` row BEFORE the dispatcher task is created (P1.1
+# heartbeat seeding), a task-creation failure (e.g. HERMES_API_KEY
+# outage) orphans the row: it has ``task_id=None``, ``status='running'``,
+# and no lifecycle code path will ever transition it to terminal.
+# Without reconciliation these stale rows accumulate indefinitely and
+# misleadingly appear as active running/stalled on monitoring dashboards.
+#
+# ``reconcile_stale_runs`` transitions orphaned rows to ``cancelled``
+# (preserving audit history — no DELETE) so dead historical records
+# cannot misleadingly appear as active. The audit trail (created_at,
+# stdout_summary, etc.) is preserved; only status + completed_at
+# change. The function is idempotent and safe to call repeatedly.
+
+_STALE_ORPHAN_MAX_AGE_SEC = 3600  # 1 hour — well beyond any legitimate dispatch
+
+
+def reconcile_stale_runs(
+    conn: sqlite3.Connection,
+    *,
+    max_age_sec: int = _STALE_ORPHAN_MAX_AGE_SEC,
+    now: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Transition orphaned executor_runs to ``cancelled`` (audit-preserving).
+
+    Targets rows that are:
+      * ``status='running'`` (or ``'queued'`` / ``'started'``)
+      * ``task_id IS NULL`` (never linked to a dispatcher task)
+      * older than ``max_age_sec`` (default 1 hour)
+
+    Each matched row is UPDATEd in-place:
+      * ``status``       → ``'cancelled'``
+      * ``completed_at``  → ``created_at`` (preserves original timestamp)
+      * ``updated_at``    → now
+      * ``error``         → ``'reconcile_stale_runs: orphaned executor_run with task_id=NULL'``
+
+    No rows are deleted — the full audit history is preserved. The
+    function is idempotent: re-running on a reconciled DB finds zero
+    matches (all orphans are already ``cancelled``).
+
+    Returns a summary dict with ``scanned``, ``reconciled``, and
+    ``run_ids`` (the list of reconciled run_ids) for observability.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    if now is None:
+        now = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Select orphaned non-terminal rows
+    orphan_statuses = ("running", "queued", "started")
+    placeholders = ",".join("?" * len(orphan_statuses))
+    rows = conn.execute(
+        f"""
+        SELECT run_id, created_at, status
+          FROM executor_runs
+         WHERE status IN ({placeholders})
+           AND task_id IS NULL
+        """,
+        orphan_statuses,
+    ).fetchall()
+
+    # Age filter — only reconcile rows older than max_age_sec
+    now_ts = _dt.fromisoformat(now.replace("Z", "+00:00")).timestamp()
+    to_reconcile = []
+    for r in rows:
+        created_raw = r["created_at"]
+        if not created_raw:
+            # No timestamp — reconcile it (safer than leaving it)
+            to_reconcile.append(r["run_id"])
+            continue
+        try:
+            created_ts = _dt.fromisoformat(
+                created_raw.replace("Z", "+00:00")
+            ).timestamp()
+        except (ValueError, TypeError):
+            to_reconcile.append(r["run_id"])
+            continue
+        age = now_ts - created_ts
+        if age >= max_age_sec:
+            to_reconcile.append(r["run_id"])
+
+    for rid in to_reconcile:
+        conn.execute(
+            """
+            UPDATE executor_runs
+               SET status = 'cancelled',
+                   completed_at = created_at,
+                   updated_at = ?,
+                   error = 'reconcile_stale_runs: orphaned executor_run with task_id=NULL'
+             WHERE run_id = ? AND task_id IS NULL
+            """,
+            (now, rid),
+        )
+
+    if to_reconcile:
+        conn.commit()
+
+    return {
+        "scanned": len(rows),
+        "reconciled": len(to_reconcile),
+        "run_ids": to_reconcile,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -642,19 +755,6 @@ def update_heartbeat(
     return get_run(conn, run_id)
 
 
-def init_executor_runs(conn: sqlite3.Connection) -> None:
-    """Module-level init guard for ``ensure_schema``.
-
-    Kept for symmetry with ``dispatcher.db._init_schema``; callers
-    that already hold a connection can call ``ensure_schema`` directly.
-    """
-    global _initialized
-    with _init_lock:
-        if not _initialized:
-            ensure_schema(conn)
-            _initialized = True
-
-
 __all__ = [
     "ensure_schema",
     "upsert_run",
@@ -670,6 +770,8 @@ __all__ = [
     "update_heartbeat",
     # P2.1 background completion sync (TASK-AEE-P2-BRIDGE-HERMES-COMPLETION-SYNC).
     "list_non_terminal_runs",
+    # Stale-run reconciliation (production-readiness minimal finalization).
+    "reconcile_stale_runs",
 ]
 
 
