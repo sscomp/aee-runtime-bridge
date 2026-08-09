@@ -79,6 +79,17 @@ class ExecutorRunWatcher:
         self.tick_sec = tick_sec if tick_sec is not None else DEFAULT_EXECUTOR_WATCHER_TICK_SEC
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # Periodic stale-run reconciliation: call reconcile_stale_runs
+        # every N ticks to clean up orphaned executor_runs (task_id=NULL,
+        # status=running, age > 1h) created after bridge startup. Same
+        # idempotent function called by init_executor_runs on startup;
+        # calling it periodically ensures post-start orphans are cleaned
+        # up without requiring a bridge restart.
+        # Default: 360 ticks (~30 min at 5s/tick). Overridable via env var.
+        self._tick_count = 0
+        self._reconcile_every_n_ticks = max(
+            1, int(os.getenv("EXECUTOR_RECONCILE_EVERY_N_TICKS", "360"))
+        )
 
     async def start(self) -> None:
         if self._task is not None:
@@ -123,13 +134,28 @@ class ExecutorRunWatcher:
         # imports at module load time.
         from app import _reconcile_hermes_run_once
         from dispatcher.db import get_conn
-        from dispatcher.executor_runs import list_non_terminal_runs
+        from dispatcher.executor_runs import list_non_terminal_runs, reconcile_stale_runs
 
         try:
             conn = get_conn()
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("executor_watcher: DB unavailable: %s", exc)
             return
+
+        # Periodic stale-run reconciliation (every N ticks). Calls the
+        # same idempotent reconcile_stale_runs used by init_executor_runs
+        # on bridge startup. Bounded: single SELECT + bounded UPDATE,
+        # non-destructive (no DELETE), audit-preserving. Fresh orphans
+        # (< 1h old) and rows with task_id are never matched.
+        self._tick_count += 1
+        if self._tick_count % self._reconcile_every_n_ticks == 0:
+            try:
+                reconcile_stale_runs(conn)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "executor_watcher: periodic reconcile_stale_runs failed: %s",
+                    exc,
+                )
 
         try:
             rows = list_non_terminal_runs(
