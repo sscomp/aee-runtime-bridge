@@ -519,3 +519,48 @@ All 15 sections (§1–§15) are preserved as historical record. The timeline, d
 *Generated: 2026-08-09T04:40:00Z by M2 (Hermes Agent)*
 *Mode: READ ONLY — Zero mutations performed*
 *Refreshed: 2026-08-10 by M2 (Hermes Agent, glm-5.2 via ollama-cloud)*
+---
+
+## Appendix B: Closure Finalization (2026-08-19)
+
+**Addendum Date:** 2026-08-19 (Asia/Taipei)
+**Addendum Author:** M2 (Hermes Agent, glm-5.2, ollama-cloud)
+**Task ID:** TASK-20260818-0007 (closure documentation finalization)
+**Current HEAD:** `f6f75e96f0276ced54c78c890d0d9161b4f673a3`
+
+### Superseding Certification
+
+This audit documents the FIRST 7-day soak attempt (P0-1 shadow run, 2026-07-29 to 2026-08-05), which FAILED. A subsequent certification (SOAK-2026-08-09, 2026-08-09 to 2026-08-16) PASSED all 10 health dimensions across 7 days. The superseding evidence is:
+
+- `reports/7_day_soak_certification_final.md` — Final PASS verdict (SOAK-2026-08-09)
+- `reports/7_day_soak_final_tracking_20260818.md` — Comprehensive Day 1-7 tracking matrix
+- `reports/7_day_soak_certification_start.md` — Baseline capture (window start)
+
+### Claude Code CLI Stale-Run Resolution
+
+The stale claude-code-cli runs referenced in §6 of this audit have been formally closed:
+
+- Core stale-run reconciliation committed as `6d7a646` (2026-08-09)
+- Periodic reconciliation hook committed as `e1fc46b` (2026-08-09)
+- Independent review: PASS (TASK-20260809-0005)
+- Natural cadence verification: all 6 orphans auto-reconciled
+- Controlled activation verified: periodic hook loaded and running
+
+### Soak Tooling Caveat Resolution
+
+The `--day=N` argument-parsing bug in `scripts/soak_checkpoint.py` (identified during SOAK-2026-08-09, affected report file naming only) was fixed, independently reviewed, and committed as `f6f75e9` (2026-08-18). 35/35 targeted tests PASS.
+
+### Conclusion Status Update
+
+| Conclusion | Audit Verdict (§12) | Current Status | Evidence |
+|------------|---------------------|----------------|----------|
+| Final Verdict: FAIL | FAIL | **SUPERSEDED** — subsequent SOAK-2026-08-09 PASSED | `reports/7_day_soak_certification_final.md` |
+| Days 2-7 missing | Critical gap | **SUPERSEDED** — SOAK-2026-08-09 produced all 7 daily checkpoints | Final tracking audit |
+| Final report missing | Not produced | **SUPERSEDED** — final report exists and verdict is PASS | `reports/7_day_soak_certification_final.md` |
+
+**The original FAIL verdict remains a valid historical record of the first soak attempt. This addendum does not alter any original content — it documents the subsequent successful certification that supersedes it.**
+
+---
+
+*Closure addendum appended 2026-08-19 by M2 (Hermes Agent, glm-5.2, ollama-cloud)*
+*Mode: Append-only — zero modifications to original content or Appendix A*

@@ -322,3 +322,37 @@ All 12 sections (§1–§12) are preserved as historical record. The compatibili
 
 *Review completed 2026-08-05T18:31Z. Read-only. No files modified beyond this report.*
 *Refreshed: 2026-08-10 by M2 (Hermes Agent, glm-5.2 via ollama-cloud)*
+---
+
+## Appendix B: Closure Finalization (2026-08-19)
+
+**Addendum Date:** 2026-08-19 (Asia/Taipei)
+**Addendum Author:** M2 (Hermes Agent, glm-5.2, ollama-cloud)
+**Task ID:** TASK-20260818-0007 (closure documentation finalization)
+**Current HEAD:** `f6f75e96f0276ced54c78c890d0d9161b4f673a3`
+
+### Operational Status Confirmation
+
+The ChatGPT Custom GPT Action dispatcher has been operational since 2026-08-05, successfully dispatching dozens of tasks through the bridge. The `/openapi-chatgpt.json` endpoint (app.py:687-1103) continues to serve a dedicated ChatGPT-compatible schema separate from the full OpenAPI 1.2.0 specification.
+
+### P0 Item Disposition
+
+The 2 P0 items identified in §3 of this review are accepted as intentional compatibility state per operator directive:
+
+1. **P0-1 (OpenAPI version string):** The `openapi: 3.1.0` version string in `/openapi-chatgpt.json` (app.py:697) is accepted. The schema is structurally 3.0-compatible. ChatGPT's parser imports it successfully. No change recommended.
+2. **P0-2 (`/runs/executor` requestBody mismatch):** The schema declares `required: ["input"]` while the runtime `ExecutorRunRequest` requires `prompt`. This is accepted as intentional — the `/runs` endpoint (not `/runs/executor`) is the primary ChatGPT dispatch path and works correctly.
+
+The P0 severity labels in the original review are superseded by operational evidence and operator directive. The technical analysis in §1-§12 remains valid as a schema compatibility assessment.
+
+### ChatGPT Compatibility Fixes Already Committed
+
+ChatGPT compatibility fixes (CORS middleware, `_flatten_for_gpt()` response flattener, auth logging, `/openapi-chatgpt.json` endpoint) were committed in `dfb0d02` (2026-08-07). These fixes addressed the 3 failure modes (A: schema import, B: POST response nested objects, C: GET polling nested objects) documented in prior case studies.
+
+### No Action Required for Closure
+
+The `/openapi-chatgpt.json` endpoint should NOT be modified for formal schema conformity. The current operational state is the intended final state for project closure.
+
+---
+
+*Closure addendum appended 2026-08-19 by M2 (Hermes Agent, glm-5.2, ollama-cloud)*
+*Mode: Append-only — zero modifications to original content or Appendix A*
