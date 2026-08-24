@@ -136,6 +136,12 @@ _ALLOWED_ENV_VARS = frozenset(
         "CLAUDE_CODE_OAUTH_TOKEN",  # intentionally allowed; the worker is
                                     # a Claude Code session, not the bridge
         "CLAUDECODE",  # set when the parent is itself a Claude session
+        # 1M context window budget — the worker must inherit this so
+        # ``claude -p`` raises its auto-compact ceiling above the 200k
+        # default. Without it the value is stripped here and the child
+        # always sees an empty var (root cause of the TASK-20260824-0039
+        # 1M-activation failure; see memory aee-1m-context-env-allowlist-gate).
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
         # Anthropic routing
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_DEFAULT_Sonnet_MODEL",
