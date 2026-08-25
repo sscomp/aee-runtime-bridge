@@ -876,3 +876,331 @@ _LEGACY_NOTIFIER_BY_STATUS = {
     "timeout": notify_timeout,
     "cancelled": notify_cancelled,
 }
+
+
+# --------------------------------------------------------------------------- #
+# AEE Telegram Terminal Notification — generic in-process transport
+# (TASK-20260825-0009). Additive; does NOT alter the v3 hermes gate above.
+# --------------------------------------------------------------------------- #
+#
+# On hosts without the Hermes CLI (``hermes send``) installed — e.g. the
+# TLE-Box / dsh-headless deployment — the v3 gate's primary path
+# (``notify_terminal_hermes_gateway``) fails with ``FileNotFoundError:
+# hermes binary not found`` and the legacy fallback (``notify_<status>``)
+# is disabled when ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID`` are
+# absent from the bridge env. The result is
+# ``method="failed", sent=False`` and no Telegram is delivered for
+# terminal executor runs.
+#
+# This block adds the smallest generic terminal notifier that reuses the
+# existing ``_send_telegram`` ``urllib`` transport (no Hermes CLI, no
+# model call) and captures the Telegram ``message_id`` so the v3
+# completion-state contract can confirm delivery. It is wired in as a
+# best-effort *second chance* from ``TaskManager._notify_terminal`` (see
+# ``dispatcher/manager.py``) ONLY when the v3 gate did not confirm
+# (``sent=False`` OR ``message_id is None``), and from
+# ``reconcile_executor_completion`` (idempotently). It NEVER alters the
+# task's terminal status and NEVER prints/stores token or chat-id
+# values — only ``credential_presence`` booleans.
+
+
+def _send_telegram_with_message_id(
+    bot_token: str, chat_id: str, text: str
+) -> "tuple[bool, Optional[int], Optional[str]]":
+    """Send a Telegram message via the in-process ``urllib`` transport
+    and return ``(sent, message_id, error)``.
+
+    Identical HTTP behaviour to ``_send_telegram`` (same URL, same
+    ``application/x-www-form-urlencoded`` POST, same 10s timeout, same
+    ``parse_mode=HTML``) but parses the Telegram Bot API ``sendMessage``
+    response so the caller can record the canonical ``message_id``
+    (the v3 contract's delivery-confirmation token). ``_send_telegram``
+    is left unchanged for backward compatibility with the legacy
+    ``notify_<status>`` path.
+
+    Returns:
+        ``(True, message_id, None)`` on a confirmed send;
+        ``(False, None, error_str)`` on any failure (HTTP error,
+        non-``ok`` response, missing ``result.message_id``, decode
+        error, or unexpected exception). Never raises.
+    """
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not data.get("ok"):
+            err = (
+                "telegram send: not ok: "
+                + str(data.get("description") or data)[:300]
+            )
+            log.warning("telegram send: not ok: %s", data)
+            return (False, None, err)
+        result = data.get("result") or {}
+        message_id = result.get("message_id")
+        if message_id is None:
+            return (
+                False,
+                None,
+                "telegram send: ok but result.message_id missing",
+            )
+        return (True, int(message_id), None)
+    except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+        log.warning("telegram send failed: %s: %s", type(exc).__name__, exc)
+        return (False, None, f"{type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 — never raise from the transport
+        log.warning("telegram send unexpected: %s: %s", type(exc).__name__, exc)
+        return (False, None, f"{type(exc).__name__}: {exc}")
+
+
+def telegram_credential_presence() -> Dict[str, bool]:
+    """Return Telegram credential **presence booleans only**.
+
+    Reads ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID`` (via
+    ``_telegram_config``) and returns
+    ``{"bot_token": bool, "chat_id": bool, "enabled": bool}``. The
+    values are NEVER returned — only booleans — so callers in
+    observability / envelope paths (e.g. ``app.py:_attempt_telegram``)
+    can surface credential presence without reading token values
+    directly. Never raises.
+    """
+    try:
+        cfg = _telegram_config()
+        return {
+            "bot_token": bool(cfg.get("bot_token", "")),
+            "chat_id": bool(cfg.get("chat_id", "")),
+            "enabled": bool(cfg.get("enabled", False)),
+        }
+    except Exception:  # noqa: BLE001 — presence-only, never raise
+        return {"bot_token": False, "chat_id": False, "enabled": False}
+
+
+def _derive_executor_from_title(title: str) -> str:
+    """Best-effort executor label from a task title, secret-free.
+
+    DSH / claude-code-cli executor runs are created with titles like
+    ``dsh-headless:TASK-...`` / ``executor-run:claude-code-cli``. The
+    label is the substring before the first ``':'``; unknown shapes
+    collapse to ``"unknown"``. Never raises.
+    """
+    try:
+        if title and ":" in title:
+            head = title.split(":", 1)[0].strip()
+            if head:
+                return head
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
+
+
+def notify_terminal_inprocess(
+    task_id: str,
+    status: str,
+    *,
+    chat_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Generic in-process terminal Telegram notifier (no Hermes CLI).
+
+    Reuses ``_telegram_config`` (credential **presence** only),
+    ``_format_alert`` (concise secret-free body), ``_within_rate_limit``
+    (sliding-window rate limit), and ``_send_telegram_with_message_id``
+    (the ``urllib`` transport with ``message_id`` capture). Sends one
+    best-effort Telegram message for the terminal transition ``status``
+    of task ``task_id``.
+
+    Credential handling (security boundary):
+      * Reads ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID`` from the
+        bridge env via ``_telegram_config()`` IN-PROCESS ONLY.
+      * The returned dict exposes ``credential_presence`` as
+        ``{"bot_token": bool, "chat_id": bool}`` — booleans only,
+        NEVER the values.
+      * If either credential is absent, returns ``sent=False`` with
+        ``method="inprocess_urllib"`` and a precise ``last_error``
+        naming the missing env vars (by NAME, not value). No network
+        call is made.
+
+    Returns a dict with the same key shape as
+    ``notify_terminal_hermes_gateway`` plus ``credential_presence``:
+      ``{sent, method, recipient, message_id, ts_utc, ts_taipei,
+         attempts, last_error, credential_presence}``.
+
+    Defensive: this function MUST NOT raise. Any formatter / transport
+    exception is caught and returned as ``sent=False`` with
+    ``last_error`` populated. It NEVER alters the task's terminal
+    status (the caller owns the state machine).
+    """
+    ts_utc = _now_iso_utc()
+    ts_taipei = _now_iso_taipei()
+    cfg = _telegram_config()
+    token = cfg.get("bot_token", "")
+    resolved_chat_id = (
+        chat_id
+        or cfg.get("chat_id", "")
+        or os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        or None
+    )
+    credential_presence = {
+        "bot_token": bool(token),
+        "chat_id": bool(resolved_chat_id),
+    }
+
+    if not token or not resolved_chat_id:
+        missing = []
+        if not token:
+            missing.append("TELEGRAM_BOT_TOKEN")
+        if not resolved_chat_id:
+            missing.append("TELEGRAM_CHAT_ID")
+        last_error = (
+            "credentials absent (presence: bot_token=%s, chat_id=%s); "
+            "provision %s in bridge .env and restart"
+        ) % (
+            credential_presence["bot_token"],
+            credential_presence["chat_id"],
+            " + ".join(missing),
+        )
+        result = {
+            "sent": False,
+            "method": "inprocess_urllib",
+            "recipient": None,
+            "message_id": None,
+            "ts_utc": ts_utc,
+            "ts_taipei": ts_taipei,
+            "attempts": 1,
+            "last_error": last_error,
+            "credential_presence": credential_presence,
+        }
+        _append_notification_audit({
+            "task_id": task_id,
+            "status": status,
+            "sent": False,
+            "method": "inprocess_urllib",
+            "recipient": None,
+            "message_id": None,
+            "ts_utc": ts_utc,
+            "ts_taipei": ts_taipei,
+            "last_error": last_error,
+            "attempts": 1,
+            "credential_presence": credential_presence,
+        })
+        return result
+
+    # Credentials present — build a concise, secret-free body reusing
+    # the legacy formatter, then append executor + timestamps.
+    executor = "unknown"
+    try:
+        body = _format_alert(task_id, status)
+    except Exception as exc:  # noqa: BLE001 — never raise from the formatter
+        body = None
+        log.warning(
+            "notifier.notify_terminal_inprocess: _format_alert raised "
+            "task_id=%s status=%s err=%s",
+            task_id, status, exc,
+        )
+    if not body:
+        body = f"task {task_id} {status}"
+    # Re-derive the executor label from the task title for the concise
+    # contract (best-effort; collapses to "unknown" if the task row is
+    # missing or unreadable).
+    try:
+        from dispatcher.manager import TaskManager as _TM
+        _t = _TM().get(task_id)
+        if _t is not None:
+            executor = _derive_executor_from_title(_t.title or "")
+    except Exception:  # noqa: BLE001 — executor label is best-effort
+        executor = "unknown"
+    # Always append executor + UTC/Asia-Taipei so the notification
+    # contract holds even for the fallback body.
+    body = (
+        f"{body}\n"
+        f"Executor: <code>{executor}</code>\n"
+        f"UTC: {ts_utc}\n"
+        f"Taipei: {ts_taipei}"
+    )
+
+    # Rate limit (reuses the same sliding window as the legacy path).
+    if not _within_rate_limit(cfg["rate_limit_per_hour"]):
+        last_error = (
+            "rate_limited (rate_limit_per_hour=%s)" % cfg["rate_limit_per_hour"]
+        )
+        _append_local_log(
+            json.dumps({
+                "ts": ts_utc, "event": "rate_limited",
+                "task_id": task_id, "status": status,
+                "method": "inprocess_urllib",
+            })
+        )
+        result = {
+            "sent": False,
+            "method": "inprocess_urllib_rate_limited",
+            "recipient": "redacted",
+            "message_id": None,
+            "ts_utc": ts_utc,
+            "ts_taipei": ts_taipei,
+            "attempts": 1,
+            "last_error": last_error,
+            "credential_presence": credential_presence,
+        }
+        _append_notification_audit({
+            "task_id": task_id,
+            "status": status,
+            "sent": False,
+            "method": "inprocess_urllib_rate_limited",
+            "recipient": "redacted",
+            "message_id": None,
+            "ts_utc": ts_utc,
+            "ts_taipei": ts_taipei,
+            "last_error": last_error,
+            "attempts": 1,
+            "credential_presence": credential_presence,
+        })
+        return result
+
+    _append_local_log(
+        json.dumps({
+            "ts": ts_utc, "event": "alert",
+            "task_id": task_id, "status": status,
+            "method": "inprocess_urllib", "text_len": len(body),
+        })
+    )
+
+    sent, message_id, send_err = _send_telegram_with_message_id(
+        token, resolved_chat_id, body,
+    )
+    if sent:
+        _SEND_HISTORY.append(time.time())
+
+    last_error = send_err if not sent else None
+    result = {
+        "sent": bool(sent),
+        "method": "inprocess_urllib",
+        # Security boundary (TASK-20260825-0009): never store the
+        # chat-id value — only the ``credential_presence`` boolean.
+        "recipient": "redacted" if sent else None,
+        "message_id": message_id,
+        "ts_utc": ts_utc,
+        "ts_taipei": ts_taipei,
+        "attempts": 1,
+        "last_error": last_error,
+        "credential_presence": credential_presence,
+    }
+    _append_notification_audit({
+        "task_id": task_id,
+        "status": status,
+        "sent": bool(sent),
+        "method": "inprocess_urllib",
+        "recipient": result.get("recipient"),
+        "message_id": message_id,
+        "ts_utc": ts_utc,
+        "ts_taipei": ts_taipei,
+        "last_error": last_error,
+        "attempts": 1,
+        "credential_presence": credential_presence,
+    })
+    return result

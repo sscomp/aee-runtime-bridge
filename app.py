@@ -1870,27 +1870,52 @@ def _attempt_telegram(subject: str, text: str) -> Dict[str, Any]:
 
     **Notification ownership decision (production-readiness finalization):**
     The dispatcher's task-level notifier (``notify_terminal_with_fallback``
-    in ``dispatcher/notifier.py``) is the single authoritative notification
-    path for ALL terminal transitions, including executor runs. It uses
-    ``hermes send`` (gateway credentials) and enforces exactly-once via
-    ``notification_state.py``. This function previously sent a separate
-    Telegram message via the Bot API using bridge-env credentials
-    (``TELEGRAM_BOT_TOKEN``), creating a duplicate-send risk if those
-    env vars were ever populated. It is now a **no-op stub** that records
-    the delegation decision for the ``telegram_result_json`` observability
-    field without making any HTTP call or sending any message.
+    in ``dispatcher/notifier.py``, with the generic
+    ``notify_terminal_inprocess`` second chance added by
+    TASK-20260825-0009) is the single authoritative notification path
+    for ALL terminal transitions, including executor runs. It enforces
+    exactly-once via ``notification_state.py`` and persists the real
+    delivery outcome into ``task_outputs.notification_json``. This
+    function previously sent a separate Telegram message via the Bot
+    API using bridge-env credentials (``TELEGRAM_BOT_TOKEN``),
+    creating a duplicate-send risk if those env vars were ever
+    populated. It is now a **no-op stub** that records the delegation
+    decision for the ``telegram_result_json`` observability field
+    without making any HTTP call or sending any message.
 
-    Returns a truthful ``telegram_result`` dict:
-    ``{success: False, skipped: "delegated to scheduler-level notifier"}``
-    so the executor envelope's ``telegram_result`` field is populated
-    for auditability. The actual notification is sent by
-    ``TaskManager._notify_terminal`` → ``notify_terminal_with_fallback``
-    when ``manager.complete()`` / ``manager.fail()`` is called in the
+    TASK-20260825-0009: the stub is enriched with
+    ``credential_presence`` booleans (via
+    ``dispatcher.notifier.telegram_credential_presence``) so the
+    ``executor_runs.telegram_result_json`` field is an honest, useful
+    diagnostic — it tells the operator *why* no inline Telegram was
+    sent (delegated) and whether the bridge-env credentials that the
+    authoritative path needs are present. **Only booleans are
+    surfaced; no token / chat-id values are read or stored here.**
+    There is no ``os.getenv`` of ``TELEGRAM_BOT_TOKEN`` and no
+    ``api.telegram.org`` URL in this function body.
+
+    Returns a truthful ``telegram_result`` dict with
+    ``success: False`` (it does not send), a ``delegated: True`` flag,
+    a ``skipped`` reason, and ``credential_presence`` booleans. The
+    actual notification is sent by ``TaskManager._notify_terminal``
+    → ``notify_terminal_with_fallback`` (+ ``notify_terminal_inprocess``
+    second chance) when ``manager.complete()`` / ``manager.fail()`` /
+    ``reconcile_executor_completion()`` is called in the
     terminal-transition block below.
     """
+    try:
+        from dispatcher.notifier import telegram_credential_presence
+        presence = telegram_credential_presence()
+    except Exception:  # noqa: BLE001 — observability only, never raise
+        presence = {"bot_token": False, "chat_id": False, "enabled": False}
     return {
         "success": False,
-        "skipped": "delegated to scheduler-level notifier (notify_terminal_with_fallback)",
+        "delegated": True,
+        "skipped": "delegated to scheduler-level notifier (notify_terminal_with_fallback + notify_terminal_inprocess)",
+        "credential_presence": {
+            "bot_token": bool(presence.get("bot_token", False)),
+            "chat_id": bool(presence.get("chat_id", False)),
+        },
     }
 
 

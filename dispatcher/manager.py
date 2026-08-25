@@ -1469,6 +1469,56 @@ class TaskManager:
                 exit_code=exit_code if exit_code is not None else 1,
                 error=_err,
             )
+        # AEE Telegram Terminal Notification (TASK-20260825-0009):
+        # fire the terminal notification idempotently. The watcher may
+        # have already transitioned this task to ``timeout`` (preempting
+        # the placeholder ``claude-cli-pending-*`` / ``dsh-headless-pending-*``
+        # id), so the executor path's ``complete()`` / ``fail()`` raised
+        # ``IllegalTransition`` BEFORE reaching ``_notify_terminal`` —
+        # meaning no notification was attempted for the real terminal
+        # outcome. This closes that gap by firing ``_notify_terminal``
+        # once for the corrected verdict, with an idempotency guard so
+        # the operator never receives a duplicate Telegram for the same
+        # terminal run:
+        #   * empty prior blob           → fire (first attempt).
+        #   * prior confirmed delivery   → SKIP (sent=True + message_id;
+        #     a real Telegram was already delivered — never duplicate).
+        #   * prior attempt for the SAME status → SKIP (same verdict
+        #     already attempted, e.g. a double reconcile).
+        #   * prior attempt for a DIFFERENT status (e.g. watcher
+        #     ``timeout`` that did NOT deliver) → fire the corrected
+        #     verdict (completed/failed). This is NOT a duplicate
+        #     delivery because the prior attempt did not deliver.
+        # Best-effort: ``_notify_terminal`` never raises and never
+        # alters the just-set terminal status.
+        try:
+            prior = conn.execute(
+                "SELECT notification_json FROM task_outputs WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            prior_blob = prior["notification_json"] if prior is not None else None
+            should_fire = True
+            if prior_blob:
+                try:
+                    prior_decoded = json.loads(prior_blob)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    prior_decoded = None
+                if isinstance(prior_decoded, dict):
+                    already_delivered = (
+                        prior_decoded.get("sent") is True
+                        and prior_decoded.get("message_id") is not None
+                    )
+                    same_status = prior_decoded.get("status") == status
+                    if already_delivered or same_status:
+                        should_fire = False
+            if should_fire:
+                self._notify_terminal(task_id, status)
+        except Exception as exc:  # noqa: BLE001 — never raise from the notify path
+            log.warning(
+                "reconcile_executor_completion: notification fire failed "
+                "task_id=%s status=%s err=%s",
+                task_id, status, exc,
+            )
         return self.get_or_raise(task_id)
 
     def fail(self, task_id: str, error_message: str) -> Task:
@@ -1740,13 +1790,63 @@ class TaskManager:
         Returns the gate's result dict (always non-None).
         """
         try:
-            from dispatcher.notifier import notify_terminal_with_fallback
+            from dispatcher.notifier import (
+                notify_terminal_inprocess,
+                notify_terminal_with_fallback,
+            )
             notif = notify_terminal_with_fallback(task_id, status)
+            # AEE Telegram Terminal Notification (TASK-20260825-0009):
+            # best-effort in-process second chance. On hosts without the
+            # Hermes CLI (e.g. the dsh-headless / TLE-Box deployment)
+            # the v3 hermes gate fails with ``hermes binary not found``
+            # and the legacy urllib fallback is disabled when
+            # ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID`` are absent
+            # from the bridge env. Retry ONCE with the generic
+            # ``notify_terminal_inprocess`` (reuses the ``urllib``
+            # transport, captures ``message_id``, no Hermes CLI, no
+            # model call). Override the persisted record ONLY when the
+            # in-process path confirms delivery (``sent=True`` AND a
+            # non-None ``message_id``); otherwise keep the original
+            # record and attach ``credential_presence`` for diagnostics.
+            # This NEVER alters the task's terminal status — it only
+            # decides which notification *record* is persisted.
+            if not (notif.get("sent") and notif.get("message_id") is not None):
+                try:
+                    inproc = notify_terminal_inprocess(task_id, status)
+                except Exception as exc2:  # noqa: BLE001 — never raise
+                    inproc = {
+                        "sent": False,
+                        "method": "inprocess_urllib",
+                        "last_error": f"inprocess exception: {exc2}",
+                    }
+                if inproc.get("sent") and inproc.get("message_id") is not None:
+                    notif = inproc
+                else:
+                    # Attach credential presence to the original failed
+                    # record so the operator can see WHY no Telegram was
+                    # delivered (presence booleans only — no values).
+                    if isinstance(notif, dict) and "credential_presence" not in notif:
+                        cred = inproc.get("credential_presence") if isinstance(
+                            inproc, dict
+                        ) else None
+                        if cred is not None:
+                            notif = dict(notif)
+                            notif["credential_presence"] = cred
+            # Stamp the terminal status into the persisted blob so the
+            # reconcile idempotency guard can distinguish a prior attempt
+            # for the SAME verdict from a corrected verdict (e.g. watcher
+            # ``timeout`` vs executor ``completed``). Additive: existing
+            # readers (``compute_completion_state``) only look at
+            # ``sent`` / ``message_id``.
+            if isinstance(notif, dict):
+                notif = dict(notif)
+                notif.setdefault("status", status)
             notif_blob = json.dumps(notif, default=str, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001 — never raise from the gate
             notif = {
                 "sent": False,
                 "method": "failed",
+                "status": status,
                 "last_error": f"gate exception: {exc}",
             }
             notif_blob = json.dumps(notif, default=str, ensure_ascii=False)
