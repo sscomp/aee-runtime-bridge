@@ -41,6 +41,7 @@ log = logging.getLogger("dispatcher.watcher")
 from dispatcher.manager import TaskManager, TaskNotFound
 from dispatcher.progress import next_pct_hint
 from dispatcher.reaper import ReaperConfig, reap_once, stale_count as reaper_stale_count
+from dispatcher.executor_identity import is_executor_placeholder
 from config import load as config_load
 
 
@@ -205,21 +206,27 @@ class Watcher:
             external_id = t.external_run_id or t.hermes_run_id
             if not external_id:
                 continue
-            # Lifecycle reconciliation fix (2026-08-01): skip
-            # polling for executor-run placeholder IDs. The
-            # claude-code-cli path stamps a placeholder
-            # ``claude-cli-pending-{task_id}`` onto
-            # ``hermes_run_id`` before the CLI runs (the real
-            # ``run_id`` is only known after ``runner.run()``
-            # returns). The watcher's poll path was treating this
-            # placeholder as a real Hermes run id, polling the
-            # Hermes gateway, getting "no longer tracks", and
-            # marking the task ``timeout`` ~136ms after start —
-            # before the CLI finishes. The executor path's own
+            # Lifecycle reconciliation fix (2026-08-01, extended
+            # 2026-08-25 for TASK-20260825-0027): skip polling for
+            # executor-run placeholder IDs. The claude-code-cli
+            # path stamps a placeholder ``claude-cli-pending-{task_id}``
+            # onto ``hermes_run_id`` before the CLI runs; the
+            # dsh-headless bridge stamps a parallel
+            # ``dsh-headless-pending-{task_id}`` placeholder. The
+            # watcher's poll path was treating these placeholders
+            # as real Hermes run ids, polling the Hermes gateway,
+            # getting "no longer tracks", and marking the task
+            # ``timeout`` ~136ms after start — before the executor
+            # finishes. The executor path's own
             # ``manager.complete()`` / ``manager.fail()`` calls
-            # are the sole terminal-transition authority for
-            # executor runs; the watcher must NOT preempt them.
-            if external_id.startswith("claude-cli-pending-"):
+            # (or ``reconcile_executor_completion``) are the sole
+            # terminal-transition authority for executor runs; the
+            # watcher must NOT preempt them. Recognition of
+            # placeholder IDs is centralised in
+            # ``dispatcher.executor_identity`` so adding a new
+            # executor is a one-line edit there rather than a new
+            # ``startswith`` check inline.
+            if is_executor_placeholder(external_id):
                 continue
             try:
                 await self._poll_one(t, external_id)

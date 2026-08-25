@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from dispatcher.manager import TaskManager, IllegalTransition
+from dispatcher.executor_identity import is_non_hermes_executor
 
 log = logging.getLogger("dispatcher.reaper")
 
@@ -115,6 +116,51 @@ def _last_progress_ts(manager: TaskManager, task_id: str) -> Optional[float]:
     return None
 
 
+def _executor_owns_queued_task(manager: TaskManager, task_id: str) -> bool:
+    """Return True iff ``task_id`` has a non-terminal ``executor_runs``
+    row owned by a non-Hermes executor.
+
+    The dispatcher reaper skips queued tasks under this condition
+    because the executor path (``POST /runs/executor`` with
+    ``executor=dsh-headless`` or ``executor=claude-code-cli``) is the
+    sole authority for the task's terminal transition. Reaping the
+    task before the executor has finished races against the
+    executor's own ``manager.complete()`` / ``manager.fail()`` /
+    ``reconcile_executor_completion`` call and produces the
+    TASK-20260825-0027 symptom (a healthy run reported as
+    ``timeout`` because task-side metadata lagged executor-side
+    progress).
+
+    Bounded: one SELECT against ``executor_runs`` keyed by
+    ``task_id``. Returns False on any DB error (fail-safe: the
+    normal queued-age reap still applies, so a malformed row never
+    silently preserves a genuinely stale queued task — it just
+    preserves the legacy behaviour for that row).
+    """
+    try:
+        from dispatcher.db import get_conn
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT selected_executor, status FROM executor_runs "
+            "WHERE task_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — fail-safe, never raise from the reaper
+        return False
+    if row is None:
+        return False
+    selected = row["selected_executor"]
+    status = row["status"]
+    # Only skip for non-terminal executor rows. A terminal
+    # ``executor_runs`` row paired with a ``tasks.status='queued'``
+    # is a divergence that the manager's reconcile path owns — the
+    # reaper should NOT skip it; the queued-age reap still applies.
+    if status in {"completed", "failed", "timeout", "cancelled"}:
+        return False
+    return is_non_hermes_executor(selected)
+
+
 def reap_once(manager: TaskManager, cfg: ReaperConfig) -> ReapResult:
     """Scan all in-flight tasks and reap any that are stale.
 
@@ -141,6 +187,38 @@ def reap_once(manager: TaskManager, cfg: ReaperConfig) -> ReapResult:
             if created is not None and (now - created) < cfg.grace_period_sec:
                 result.skipped.append((t.task_id, "in grace period"))
                 continue
+            # TASK-20260825-0027 lifecycle identity fix (2026-08-25):
+            # the dispatcher reaper previously reaped ANY queued task
+            # that exceeded ``stale_queued_sec`` (default 300s),
+            # regardless of whether an executor had already taken
+            # ownership via ``executor_runs``. The DSH headless
+            # bridge path (``POST /runs/executor`` with
+            # ``executor=dsh-headless``) creates a dispatcher task in
+            # ``queued`` and then the executor drives the lifecycle
+            # through its own dispatch loop — which can take longer
+            # than 300s to advance the task to ``running`` for
+            # genuinely long-running dispatches. Reaping the task
+            # while the executor is still in flight produced the
+            # observed symptom: a healthy DSH run was reported as
+            # ``timeout`` with ``Hermes run: —`` and
+            # ``Executor: unknown`` solely because the task-side
+            # metadata lagged the executor-side progress.
+            #
+            # Skip the reaper for queued tasks whose
+            # ``executor_runs`` row is owned by a non-Hermes
+            # executor (DSH, claude-code-cli). The executor is the
+            # sole authority for the terminal transition; the
+            # reaper must not race against it. Genuinely stale
+            # non-executor queued tasks (e.g. an orphaned
+            # ``selected_executor='hermes'`` task that lost its
+            # upstream) still fall through to the queued-age check
+            # below — the skip is bounded to executor-owned rows.
+            if t.status == "queued":
+                if _executor_owns_queued_task(manager, t.task_id):
+                    result.skipped.append(
+                        (t.task_id, "executor-owned queued task (executor drives lifecycle)")
+                    )
+                    continue
             # Total age cap
             if created is not None and (now - created) > cfg.max_total_age_sec:
                 total_age = now - created

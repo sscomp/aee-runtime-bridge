@@ -141,6 +141,7 @@ class ClaudeCodeCliRunner:
         bare: bool = False,
         cancel_grace_seconds: float = 5.0,
         extra_cli_args: Optional[List[str]] = None,
+        default_cwd: Optional[str] = None,
     ) -> None:
         self._bare = bare
         self._provider = ClaudeCodeProvider(
@@ -150,17 +151,41 @@ class ClaudeCodeCliRunner:
             bare=bare,
             cancel_grace_seconds=cancel_grace_seconds,
             extra_cli_args=extra_cli_args,
+            default_cwd=default_cwd,
         )
 
     @classmethod
     def from_config(cls, cfg: Dict[str, Any]) -> "ClaudeCodeCliRunner":
         extra = cfg.get("extra_cli_args") or []
+        # Resolve the executor's default cwd. Order of precedence:
+        #   1. ``cfg["default_cwd"]`` — explicit JSON value
+        #   2. ``$AEE_EXECUTOR_DEFAULT_CWD`` — env override (TLE-Box
+        #      uses this to point ``claude -p`` at ``/workspace`` when
+        #      the config/executor.json defaults to a path that does
+        #      not exist on this host, e.g. /home/ubuntu/Abacus)
+        #   3. ``os.getcwd()`` — bridge process cwd
+        #   4. ``"/workspace"`` — TLE-Box / A2 deploy default
+        # We pick the first one whose ``os.path.isdir`` is true, so
+        # a non-existent legacy default like ``/home/ubuntu/Abacus``
+        # is silently skipped instead of raising a ``ProviderError``
+        # at submit time.
+        default_cwd = cfg.get("default_cwd") or os.environ.get(
+            "AEE_EXECUTOR_DEFAULT_CWD"
+        )
+        if not default_cwd or not os.path.isdir(default_cwd):
+            for cand in (os.getcwd(), "/workspace"):
+                if os.path.isdir(cand):
+                    default_cwd = cand
+                    break
+            else:
+                default_cwd = default_cwd or os.getcwd()
         return cls(
             binary=str(cfg.get("claude_cli_binary") or "/home/ubuntu/.local/bin/claude"),
             max_turns=int(cfg.get("max_turns") or 80),
             output_format=str(cfg.get("output_format") or "text"),
             bare=bool(cfg.get("bare", False)),
             extra_cli_args=[str(a) for a in extra] if extra else None,
+            default_cwd=default_cwd,
         )
 
     @property

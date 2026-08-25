@@ -14,6 +14,7 @@ exposes the shape so the rest of the code can type-hint against it.
 """
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -86,26 +87,48 @@ adapter_registry = AdapterRegistry()
 def bootstrap_defaults(force: bool = False) -> None:
     """Register the default set of adapters.
 
-    In production this wires the real HermesAdapter; the function
-    is safe to call more than once (subsequent calls are no-ops
-    unless `force=True`).
+    Selection of the *primary* adapter is driven by the
+    ``AEE_BACKEND`` environment variable:
 
-    AEE-7.1: also registers the ``ClaudeCodeRuntimeAdapter`` shim
-    so a task with ``adapter_name="claude_code"`` routes through
-    the ``ExecutionOrchestrator`` instead of the legacy
-    ``adapter_registry`` 404 path. The shim is best-effort —
-    if the AEE-7 orchestrator cannot be imported, the
-    hermes-only fallback is preserved.
+    * ``AEE_BACKEND=claude_cli`` — register :class:`ClaudeCliAdapter`
+      first. The bridge is then a thin shell over the local
+      ``claude -p`` CLI. This is the deployment mode used on the
+      TLE-Box / A2 host that has no Hermes M2 runtime.
+    * ``AEE_BACKEND=hermes`` (default) — keep the original
+      :class:`HermesAdapter` as the primary adapter.
+
+    In *both* modes :class:`HermesAdapter` is registered (so any
+    caller that explicitly asks for ``adapter_name="hermes"`` is
+    honoured) and the AEE-7 ``claude_code`` shim is registered (so
+    the manifest-gated Claude Code path keeps working).
+
+    The function is safe to call more than once (subsequent calls
+    are no-ops unless ``force=True``).
     """
     from aee.adapters.hermes_adapter import HermesAdapter  # local import
+    from aee.adapters.claude_cli import ClaudeCliAdapter  # local import
 
-    existing = "hermes" in adapter_registry.names()
-    if existing and not force:
-        # Even when we are not forcing, still make sure the
-        # claude_code shim is registered (idempotent).
+    backend = (os.getenv("AEE_BACKEND") or "hermes").strip().lower()
+
+    primary_name: str
+    if backend == "claude_cli":
+        primary_name = "claude_cli"
+    else:
+        primary_name = "hermes"
+
+    if not force and primary_name in adapter_registry.names():
         _register_aee7_defaults()
         return
-    adapter_registry.register(HermesAdapter(), replace=True)
+
+    if primary_name == "claude_cli":
+        adapter_registry.register(ClaudeCliAdapter(), replace=True)
+    else:
+        adapter_registry.register(HermesAdapter(), replace=True)
+    # Always also register Hermes, so an explicit ``adapter_name="hermes"``
+    # request still works (e.g. for a side-by-side rollout or
+    # manual override).
+    if "hermes" not in adapter_registry.names():
+        adapter_registry.register(HermesAdapter(), replace=True)
     _register_aee7_defaults()
 
 

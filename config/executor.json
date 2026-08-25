@@ -15,7 +15,7 @@
     "deepseek-harness": "dsh-headless",
     "deepseek_harness": "dsh-headless"
   },
-  "claude_cli_binary": "/home/ubuntu/.local/bin/claude",
+  "claude_cli_binary": "/home/box/.local/bin/claude",
   "default_executor": "dsh-headless",
   "default_timeout_sec": 120,
   "max_timeout_sec": 7200,

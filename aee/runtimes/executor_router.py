@@ -44,10 +44,10 @@ from typing import Any, Dict, Iterable, Optional, Sequence
 
 # --- Constants ---------------------------------------------------------
 
-ALLOWED_EXECUTORS = frozenset({"hermes", "claude_code"})
+ALLOWED_EXECUTORS = frozenset({"hermes", "claude_code", "claude_cli"})
 
 DEFAULT_REPO_ALLOWLIST = (
-    "/home/ubuntu/Abacus",
+    "/workspace",
 )
 
 # Shell-metacharacter markers we never allow in a test_command.
@@ -179,6 +179,18 @@ def select_executor(
         return RoutingDecision(
             requested_executor="claude_code",
             selected_executor="claude_code",
+            selection_source="metadata",
+        )
+    if requested == "claude_cli":
+        if "claude_cli" not in available:
+            raise ExecutorUnavailable(
+                "metadata.executor='claude_cli' but the "
+                "'claude_cli' adapter is not registered; "
+                f"known={sorted(available)}"
+            )
+        return RoutingDecision(
+            requested_executor="claude_cli",
+            selected_executor="claude_cli",
             selection_source="metadata",
         )
     # Should be unreachable because validate_metadata has

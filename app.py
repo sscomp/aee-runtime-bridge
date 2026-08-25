@@ -1113,6 +1113,95 @@ async def openapi_chatgpt() -> Dict[str, Any]:
     }
 
 
+@app.get("/openapi-aee-a2.json")
+async def openapi_aee_a2() -> "FileResponse":  # noqa: F821
+    """ChatGPT Custom GPT Action schema for the A2 deployment.
+
+    Serves ``openapi-aee-a2.json`` (52 KB) from the repo root. The
+    schema's ``servers[0].url`` is ``https://aee-a2.biaobecue.com`` so a
+    GPT that imports this URL into its Action UI is wired to the
+    TLE-Box / A2 deployment without further editing.
+
+    The file is regenerated from ``openapi.yaml`` by
+    ``scripts/generate_gpt_action.py`` whenever the OpenAPI surface
+    changes; this endpoint always reflects the on-disk copy.
+    """
+    from fastapi.responses import FileResponse
+    import pathlib
+    path = pathlib.Path(__file__).parent / "openapi-aee-a2.json"
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="openapi-aee-a2.json not generated; run scripts/generate_gpt_action.py",
+        )
+    return FileResponse(
+        path,
+        media_type="application/json",
+        # ``no-store`` is intentional: Custom GPT "Update schema"
+        # imports must always pull the current version, otherwise an
+        # operator who edits the JSON file will see the previous
+        # schema stuck behind a CDN cache and conclude the file
+        # "didn't change". 60s ``max-age=60`` was too lax — the
+        # Cloudflare Tunnel cache layers were serving the older file
+        # even after a fresh edit on disk.
+        headers={
+            "Cache-Control": "no-store, must-revalidate",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@app.get("/openapi-aee-a2-chatgpt.json")
+async def openapi_aee_a2_chatgpt() -> "FileResponse":  # noqa: F821
+    """ChatGPT-strict schema for the A2 deployment.
+
+    Like ``/openapi-aee-a2.json`` but rewritten to satisfy ChatGPT's
+    Custom GPT Action parser quirks:
+
+    * Every operation ``description`` is <= 300 characters
+      (the parser hard-rejects longer ones).
+    * No ``$ref`` to ``components.schemas.*`` — every response and
+      request body is written inline, so the parser does not see an
+      "unknown component" warning that gets demoted to an empty
+      schema.
+    * 8 paths only (well under ChatGPT's soft cap).
+    * Mirrors the working ``/openapi-chatgpt.json`` template that
+      ships with the upstream Abacus deployment
+      (``https://hermes-runtime.biaocue.com/openapi-chatgpt.json``).
+    """
+    from fastapi.responses import FileResponse
+    import pathlib
+    path = pathlib.Path(__file__).parent / "openapi-aee-a2-chatgpt.json"
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="openapi-aee-a2-chatgpt.json not found in repo root",
+        )
+    return FileResponse(
+        path,
+        media_type="application/json",
+        # ``no-store`` is intentional: Custom GPT "Update schema"
+        # imports must always pull the current version, otherwise an
+        # operator who edits the JSON file will see the previous
+        # schema stuck behind a CDN cache and conclude the file
+        # "didn't change". 60s ``max-age=60`` was too lax — the
+        # Cloudflare Tunnel cache layers were serving the older file
+        # even after a fresh edit on disk.
+        headers={
+            "Cache-Control": "no-store, must-revalidate",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@app.get("/openapi-aee-a2.schema-url")
+async def openapi_aee_a2_url() -> Dict[str, str]:
+    """Convenience endpoint: returns the absolute URL a ChatGPT operator
+    can paste into the Custom GPT Action "Import from URL" field.
+    """
+    return {"url": f"{_PUBLIC_BASE_URL}/openapi-aee-a2.json"}
+
+
 # ---------------------------------------------------------------------------
 # Routes — /runs (existing, dispatcher-backed)
 # ---------------------------------------------------------------------------
@@ -1622,6 +1711,30 @@ async def create_run(
     from aee.core.registry import adapter_registry
     from aee.adapters.base import RuntimeError as AdapterRuntimeError
 
+    # TLE-Box / A2 deployment: when the caller's task was created
+    # without an explicit ``metadata.executor`` (e.g. ChatGPT Custom
+    # GPT Action that did not pass the override) fall back to whatever
+    # ``AEE_BACKEND`` points to. The A2 host is configured with
+    # ``AEE_BACKEND=claude_cli`` (see ``.env``), so a "plain"
+    # ``POST /runs`` body now dispatches to the local Claude CLI
+    # instead of returning a 502 trying to reach the (absent) Hermes
+    # M2 backend. Abacus / production hosts that set
+    # ``AEE_BACKEND=hermes`` (or omit it) keep the legacy default.
+    #
+    # IMPORTANT: the dispatcher's Task row is created with
+    # ``runtime_type='hermes'`` / ``adapter_name='hermes'`` as column
+    # defaults (see ``dispatcher/models.py``); those are persisted
+    # values and are NOT a routing decision. The actual routing
+    # decision lives on the AEEJob below (``job.adapter_name``) — the
+    # ``adapter_registry.get(job.adapter_name)`` call at the dispatch
+    # site reads it, NOT the Task row. So we set
+    # ``job.adapter_name = _default_runtime`` unconditionally here;
+    # the ``body.metadata`` branch below will overwrite it when the
+    # caller asks for a specific executor.
+    _default_runtime = _os.getenv("AEE_BACKEND", "hermes").strip().lower()
+    if _default_runtime not in ("hermes", "claude_cli", "claude_code"):
+        _default_runtime = "hermes"
+
     job = AEEJob(
         title=task.title,
         type=task.type,
@@ -1631,8 +1744,8 @@ async def create_run(
         session_id=session_id,
         client_source=source,
         model_name=effective_model_name,
-        runtime_type=task.runtime_type or "hermes",
-        adapter_name=task.adapter_name or "hermes",
+        runtime_type=_default_runtime,
+        adapter_name=_default_runtime,
     )
     # ----- TASK-M2: executor router. Validate the optional
     # ``metadata`` and, when present, override the ``adapter_name``
@@ -2565,7 +2678,7 @@ async def create_executor_run(
 
         if body.max_turns is not None:
             runner = ClaudeCodeCliRunner(
-                binary=str(cfg.get("claude_cli_binary") or "/home/ubuntu/.local/bin/claude"),
+                binary=str(cfg.get("claude_cli_binary") or "/home/box/.local/bin/claude"),
                 max_turns=int(body.max_turns),
                 output_format=str(cfg.get("output_format") or "text"),
                 bare=bool(cfg.get("bare", False)),
@@ -3061,7 +3174,7 @@ async def create_executor_run(
     # selected == "hermes" — delegate to the existing Hermes adapter
     # (registered in ``adapter_registry``). Tests stub the adapter; in
     # production this submits to Hermes 8642. Hermes is async, so the
-
+    # envelope returns a queued state with the upstream run_id; the
     # per-run evidence fields are null/skipped (Hermes does not produce
     # local artifacts / git evidence / a per-run Telegram on submit).
     from aee.adapters.base import RuntimeError as AdapterRuntimeError  # noqa: F811
