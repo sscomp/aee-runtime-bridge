@@ -47,6 +47,8 @@ import os
 import sqlite3
 import sys
 import threading
+import uuid
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -79,6 +81,44 @@ CREATE TABLE IF NOT EXISTS executor_runs (
 CREATE INDEX IF NOT EXISTS idx_executor_runs_status ON executor_runs(status);
 CREATE INDEX IF NOT EXISTS idx_executor_runs_created_at ON executor_runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_executor_runs_selected ON executor_runs(selected_executor);
+
+-- AEE Harness v2 P0 (W-2 Durable Evidence Store): append-only per-step
+-- evidence table. One row per persisted state-machine step result, keyed
+-- by (run_id, step, generation, attempt) so a retry of the SAME step under
+-- the SAME attempt/generation updates in place (idempotent), while a new
+-- attempt or a new rescue `generation` appends a fresh row (audit
+-- preserved). This is the "append-only per step" contract from the ADR:
+-- prior completed steps are never erased by a later step's failure.
+-- Additive + idempotent: CREATE TABLE IF NOT EXISTS, same pattern as the
+-- `executor_runs` table above; existing tables/columns are untouched.
+-- `task_id` is NULLable to mirror `executor_runs.task_id` (orphan runs
+-- with task_id=NULL can still emit step evidence).
+CREATE TABLE IF NOT EXISTS executor_run_steps (
+  step_id             TEXT PRIMARY KEY,
+  task_id             TEXT,
+  run_id              TEXT NOT NULL,
+  step                TEXT NOT NULL,
+  action_type         TEXT NOT NULL,
+  owner               TEXT NOT NULL,
+  status              TEXT NOT NULL,
+  generation          INTEGER NOT NULL DEFAULT 1,
+  attempt             INTEGER NOT NULL DEFAULT 1,
+  turns_used          INTEGER,
+  evidence_hash       TEXT,
+  summary             TEXT NOT NULL DEFAULT '',
+  result_json         TEXT,
+  error               TEXT,
+  artifact_refs_json  TEXT NOT NULL DEFAULT '[]',
+  started_at          TEXT,
+  finished_at         TEXT,
+  recorded_at         TEXT NOT NULL,
+  UNIQUE(run_id, step, generation, attempt)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_steps_task
+  ON executor_run_steps(task_id, generation, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_run_steps_run
+  ON executor_run_steps(run_id, generation, recorded_at);
 """
 
 # ---------------------------------------------------------------------------
@@ -755,6 +795,343 @@ def update_heartbeat(
     return get_run(conn, run_id)
 
 
+# ---------------------------------------------------------------------------
+# AEE Harness v2 P0 — Durable step-evidence store (W-2 primitive).
+# ---------------------------------------------------------------------------
+# Append-only per-step evidence for the v2 state machine. Each state
+# (PLAN/INSPECT/DECIDE/PATCH/TEST/VERIFY/PACKAGE/NOTIFY) persists its
+# structured result here immediately upon completion, BEFORE the next
+# state runs, so a later step's failure never erases prior completed
+# steps (the ADR's core invariant). The store is keyed by
+# (run_id, step, generation, attempt):
+#   * retry of the SAME step under the SAME attempt/generation →
+#     ON CONFLICT DO UPDATE (idempotent in-place replace);
+#   * a new attempt or a new rescue `generation` → appends a new row
+#     (audit history preserved, never erased).
+# This slice implements ONLY the persistence primitive + read helper.
+# No state-machine, no call site in the executor path is wired to it
+# yet — that is W-3 (P1). Backward-compatible: the table is additive
+# (`CREATE TABLE IF NOT EXISTS` in ``_SCHEMA``); existing runs/tasks
+# have zero step-evidence rows and behave exactly as before.
+#
+# Vocabulary: `action_type` is the bounded-action class (inspect/decide/
+# patch/test/verify/package/notify, plus plan). It is NOT validated here
+# — any generic string is accepted — so the primitive stays decoupled
+# from the W-1 bounded-run contract enforcer that will later restrict it.
+
+# Canonical bounded-action classes (ADR "Bounded Run Contract" + state
+# machine). Generic strings are also accepted; these are the documented
+# set, exposed for callers/tests that want to reference them by name.
+ACTION_TYPE_PLAN = "plan"
+ACTION_TYPE_INSPECT = "inspect"
+ACTION_TYPE_DECIDE = "decide"
+ACTION_TYPE_PATCH = "patch"
+ACTION_TYPE_TEST = "test"
+ACTION_TYPE_VERIFY = "verify"
+ACTION_TYPE_PACKAGE = "package"
+ACTION_TYPE_NOTIFY = "notify"
+ACTION_TYPES = (
+    ACTION_TYPE_PLAN,
+    ACTION_TYPE_INSPECT,
+    ACTION_TYPE_DECIDE,
+    ACTION_TYPE_PATCH,
+    ACTION_TYPE_TEST,
+    ACTION_TYPE_VERIFY,
+    ACTION_TYPE_PACKAGE,
+    ACTION_TYPE_NOTIFY,
+)
+
+# Step-evidence owner: who produced the step (ADR state-machine [LLM] vs
+# [Runtime] ownership).
+STEP_OWNER_LLM = "llm"
+STEP_OWNER_RUNTIME = "runtime"
+STEP_OWNERS = (STEP_OWNER_LLM, STEP_OWNER_RUNTIME)
+
+# Canonical step-evidence statuses. `partial` is first-class per the ADR
+# (near-complete / budget-exhausted work is marked partial, not failed).
+# Not validated here — kept permissive for this primitive slice.
+STEP_STATUS_RUNNING = "running"
+STEP_STATUS_COMPLETED = "completed"
+STEP_STATUS_FAILED = "failed"
+STEP_STATUS_SKIPPED = "skipped"
+STEP_STATUS_PARTIAL = "partial"
+STEP_STATUSES = (
+    STEP_STATUS_RUNNING,
+    STEP_STATUS_COMPLETED,
+    STEP_STATUS_FAILED,
+    STEP_STATUS_SKIPPED,
+    STEP_STATUS_PARTIAL,
+)
+
+
+@dataclass(frozen=True)
+class StepEvidence:
+    """A single persisted state-machine step result (frozen, append-only).
+
+    Backward-compatible structured representation of one bounded action's
+    evidence. Fields mirror the ADR's "Each record carries" list
+    (``task_id``, ``run_id``, ``step``, ``owner``, ``status``,
+    ``started_at``, ``finished_at``, ``turns_used``, ``evidence_hash``)
+    plus the actionable payload (``action_type``, ``generation``,
+    ``attempt``, ``summary``, ``result``, ``error``, ``artifact_refs``).
+
+    Fields:
+        task_id: Owning task (NULLable for orphan runs, mirroring
+            ``executor_runs.task_id``).
+        run_id: The concrete executor run this step belongs to.
+        step: State-machine step name (plan/inspect/decide/patch/test/
+            verify/package/notify).
+        action_type: Bounded-action class (one of ``ACTION_TYPES`` or a
+            generic string).
+        owner: ``"llm"`` or ``"runtime"`` (ADR [LLM] vs [Runtime]).
+        status: One of ``STEP_STATUSES`` (permissive in this slice).
+        generation: Rescue generation counter (1 = original run; >1 =
+            a rescue run linked to the same task_id). Default 1.
+        attempt: Retry attempt within this step+generation. Default 1.
+        turns_used: LLM turns consumed (None for runtime-owned steps).
+        evidence_hash: Hex digest over the step's evidence payload
+            (caller-computed; None when not yet hashed).
+        summary: Short human-readable one-line summary.
+        result: Structured result payload (dict); JSON-encoded on write.
+        error: Error string for failed/partial steps (None otherwise).
+        artifact_refs: List of artifact ids / paths this step produced
+            or verified; JSON-encoded on write.
+        started_at / finished_at: ISO-8601 UTC timestamps (None allowed).
+        recorded_at: ISO-8601 UTC persistence timestamp (always set).
+        step_id: Repository-assigned id (None until persisted).
+    """
+    run_id: str
+    step: str
+    action_type: str
+    owner: str
+    status: str
+    task_id: Optional[str] = None
+    generation: int = 1
+    attempt: int = 1
+    turns_used: Optional[int] = None
+    evidence_hash: Optional[str] = None
+    summary: str = ""
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    artifact_refs: Optional[List[str]] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    recorded_at: str = field(default_factory=_now_iso)
+    step_id: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def append_step(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    step: str,
+    action_type: str,
+    owner: str,
+    status: str,
+    task_id: Optional[str] = None,
+    generation: int = 1,
+    attempt: int = 1,
+    turns_used: Optional[int] = None,
+    evidence_hash: Optional[str] = None,
+    summary: str = "",
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    artifact_refs: Optional[List[str]] = None,
+    started_at: Optional[str] = None,
+    finished_at: Optional[str] = None,
+    step_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Persist one step-evidence row (append-only, idempotent per attempt).
+
+    Idempotency: the composite key ``(run_id, step, generation, attempt)``
+    is UNIQUE. A retry with the same key does ``ON CONFLICT DO UPDATE`` —
+    it replaces the row's payload in place and preserves the original
+    ``step_id`` / insertion order. A new ``attempt`` or ``generation``
+    appends a new row, so the audit trail across retries/rescues is
+    preserved (never erased). This matches the ADR's "append-only per
+    step" across attempts/generations while being safe under retries.
+
+    Returns the canonical envelope dict (the same shape ``list_steps``
+    returns and ``StepEvidence.to_dict`` produces) so the caller can
+    persist + use the evidence with one call site.
+    """
+    now = _now_iso()
+    sid = step_id or f"step-{uuid.uuid4().hex[:16]}"
+    refs = list(artifact_refs or [])
+    envelope: Dict[str, Any] = {
+        "step_id": sid,
+        "task_id": task_id,
+        "run_id": run_id,
+        "step": step,
+        "action_type": action_type,
+        "owner": owner,
+        "status": status,
+        "generation": int(generation),
+        "attempt": int(attempt),
+        "turns_used": turns_used,
+        "evidence_hash": evidence_hash,
+        "summary": summary,
+        "result": result,
+        "error": error,
+        "artifact_refs": refs,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "recorded_at": now,
+    }
+    conn.execute(
+        """
+        INSERT INTO executor_run_steps (
+          step_id, task_id, run_id, step, action_type, owner, status,
+          generation, attempt, turns_used, evidence_hash, summary,
+          result_json, error, artifact_refs_json,
+          started_at, finished_at, recorded_at
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        ON CONFLICT(run_id, step, generation, attempt) DO UPDATE SET
+          status            = excluded.status,
+          action_type       = excluded.action_type,
+          owner             = excluded.owner,
+          task_id           = COALESCE(excluded.task_id, executor_run_steps.task_id),
+          turns_used        = excluded.turns_used,
+          evidence_hash     = excluded.evidence_hash,
+          summary           = excluded.summary,
+          result_json       = excluded.result_json,
+          error             = excluded.error,
+          artifact_refs_json = excluded.artifact_refs_json,
+          started_at        = COALESCE(excluded.started_at, executor_run_steps.started_at),
+          finished_at       = excluded.finished_at,
+          recorded_at       = excluded.recorded_at
+        """,
+        (
+            sid,
+            task_id,
+            run_id,
+            step,
+            action_type,
+            owner,
+            status,
+            int(generation),
+            int(attempt),
+            turns_used,
+            evidence_hash,
+            summary,
+            _encode_or_none(result),
+            error,
+            json.dumps(refs, ensure_ascii=False),
+            started_at,
+            finished_at,
+            now,
+        ),
+    )
+    conn.commit()
+    # Read back so the returned envelope reflects the persisted
+    # step_id / started_at (COALESCE may have preserved the originals).
+    row = conn.execute(
+        "SELECT * FROM executor_run_steps WHERE run_id = ? AND step = ? "
+        "AND generation = ? AND attempt = ?",
+        (run_id, step, int(generation), int(attempt)),
+    ).fetchone()
+    if row is not None:
+        return _row_to_step_dict(row)
+    return envelope
+
+
+def list_steps(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    step: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 1000,
+) -> List[Dict[str, Any]]:
+    """Return ordered step-evidence rows for a task and/or run.
+
+    At least one of ``task_id`` / ``run_id`` should be supplied (calling
+    with neither returns an empty list rather than scanning the whole
+    table — a bounded, deliberate no-op). Rows are ordered by
+    ``generation, attempt, recorded_at`` ASC so a caller resuming from
+    durable state reads steps in natural forward order; the order is
+    stable across calls (same data → same order).
+
+    Read-only: a single SELECT. Never launches an executor, mutates run
+    state, or writes. Returns canonical envelope dicts (same shape as
+    :func:`append_step` / ``StepEvidence.to_dict``).
+    """
+    if task_id is None and run_id is None:
+        return []
+    clauses: List[str] = []
+    params: List[Any] = []
+    if task_id is not None:
+        clauses.append("task_id = ?")
+        params.append(task_id)
+    if run_id is not None:
+        clauses.append("run_id = ?")
+        params.append(run_id)
+    if step is not None:
+        clauses.append("step = ?")
+        params.append(step)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    sql = (
+        "SELECT * FROM executor_run_steps WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY generation ASC, attempt ASC, recorded_at ASC, rowid ASC LIMIT ?"
+    )
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    return [_row_to_step_dict(r) for r in rows]
+
+
+def get_step(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    step: str,
+    generation: int = 1,
+    attempt: int = 1,
+) -> Optional[Dict[str, Any]]:
+    """Return one step-evidence row by its composite key, or ``None``.
+
+    Convenience read for "resume from the last durable state of step X":
+    the caller asks for the latest generation/attempt of a step. Read-only.
+    """
+    row = conn.execute(
+        "SELECT * FROM executor_run_steps WHERE run_id = ? AND step = ? "
+        "AND generation = ? AND attempt = ?",
+        (run_id, step, int(generation), int(attempt)),
+    ).fetchone()
+    return _row_to_step_dict(row) if row is not None else None
+
+
+def _row_to_step_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "step_id": row["step_id"],
+        "task_id": row["task_id"],
+        "run_id": row["run_id"],
+        "step": row["step"],
+        "action_type": row["action_type"],
+        "owner": row["owner"],
+        "status": row["status"],
+        "generation": int(row["generation"]),
+        "attempt": int(row["attempt"]),
+        "turns_used": row["turns_used"],
+        "evidence_hash": row["evidence_hash"],
+        "summary": row["summary"] or "",
+        "result": _decode_jsonl(row["result_json"], None),
+        "error": row["error"],
+        "artifact_refs": _decode_jsonl(row["artifact_refs_json"], []),
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "recorded_at": row["recorded_at"],
+    }
+
+
 __all__ = [
     "ensure_schema",
     "upsert_run",
@@ -772,6 +1149,29 @@ __all__ = [
     "list_non_terminal_runs",
     # Stale-run reconciliation (production-readiness minimal finalization).
     "reconcile_stale_runs",
+    # AEE Harness v2 P0 — durable step-evidence store (W-2 primitive).
+    "StepEvidence",
+    "append_step",
+    "list_steps",
+    "get_step",
+    "ACTION_TYPES",
+    "ACTION_TYPE_PLAN",
+    "ACTION_TYPE_INSPECT",
+    "ACTION_TYPE_DECIDE",
+    "ACTION_TYPE_PATCH",
+    "ACTION_TYPE_TEST",
+    "ACTION_TYPE_VERIFY",
+    "ACTION_TYPE_PACKAGE",
+    "ACTION_TYPE_NOTIFY",
+    "STEP_OWNERS",
+    "STEP_OWNER_LLM",
+    "STEP_OWNER_RUNTIME",
+    "STEP_STATUSES",
+    "STEP_STATUS_RUNNING",
+    "STEP_STATUS_COMPLETED",
+    "STEP_STATUS_FAILED",
+    "STEP_STATUS_SKIPPED",
+    "STEP_STATUS_PARTIAL",
 ]
 
 
