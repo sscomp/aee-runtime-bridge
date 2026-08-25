@@ -116,6 +116,31 @@ def _query_tasks_by_run_id(db_path: Path, run_id: str) -> dict | None:
         conn.close()
 
 
+@pytest.fixture(autouse=True)
+def _legacy_claude_repo_allowlist(monkeypatch):
+    """Configure the legacy claude-code-cli repo root via the additive
+    ``AEE_EXECUTOR_REPO_ALLOWLIST`` override (see
+    :func:`aee.runtimes.executor_config.load_executor_config`).
+
+    Commit B (``3b0a805``) retargeted the production
+    ``config/executor.json`` ``repo_allowlist`` to ``["/workspace","/tmp"]``
+    for the DSH/TLE-Box host — correct, since this host has no
+    ``/home/ubuntu/Abacus``. The legacy Claude executor tests in this
+    module target the original Abacus-AI repo root ``/home/ubuntu/Abacus``;
+    rather than broadening the production allowlist for a non-existent
+    root, they admit it through the additive env override merged into the
+    configured allowlist. This proves legacy Claude compatibility is
+    preserved through *configuration*, not by weakening repo confinement.
+
+    Scoped to this module only: the pre-existing failures in
+    ``test_run_tracking`` / ``test_completion_sync`` live in other modules
+    and are intentionally untouched. The regression class
+    :class:`TestRepoAllowlistCompatibility` explicitly manages this env
+    var per-test to prove the confinement invariants.
+    """
+    monkeypatch.setenv("AEE_EXECUTOR_REPO_ALLOWLIST", "/home/ubuntu/Abacus")
+
+
 # ---------------------------------------------------------------------------
 # Fix A: POST /runs writes executor_runs mapping row
 # ---------------------------------------------------------------------------
@@ -1310,3 +1335,74 @@ class TestHermesStubEvidenceMerge:
         assert data["source"] == "executor_runs+tasks_merge"
         assert data["artifact_paths"] == ["/home/ubuntu/Abacus/AEE_FAIL_REPORT.md"]
         assert "task failed" in data["stdout_summary"]
+
+
+# ---------------------------------------------------------------------------
+# TASK-20260825-0021: repo_allowlist compatibility regression
+# ---------------------------------------------------------------------------
+
+class TestRepoAllowlistCompatibility:
+    """Regression for the Commit-B ``repo_allowlist`` compatibility fix.
+
+    Proves three confinement invariants together:
+      1. DSH default ``/workspace`` is admitted with NO env override
+         (production ``config/executor.json`` allowlist unchanged).
+      2. The legacy Claude repo root ``/home/ubuntu/Abacus`` is admitted
+         WHEN configured via the additive ``AEE_EXECUTOR_REPO_ALLOWLIST``
+         override — legacy compatibility preserved through configuration,
+         not by broadening the production allowlist.
+      3. A path outside the configured allow-list is still rejected with
+         ``repo_path_not_allowed`` (confinement stays strict).
+    """
+
+    def test_dsh_workspace_path_allowed_by_default(self, monkeypatch, tmp_path):
+        """DSH default repo root /workspace is admitted with no override."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        fake_bin = write_fake_claude(tmp_path, stdout="ok", name="fake-claude-ws")
+        set_fake_binary(monkeypatch, fake_bin)
+        # Drop the autouse legacy override so the allowlist is exactly the
+        # production config/executor.json set (["/workspace","/tmp"]).
+        monkeypatch.delenv("AEE_EXECUTOR_REPO_ALLOWLIST", raising=False)
+        resp = post_executor(client, key, {
+            "executor": "claude-code-cli",
+            "prompt": "workspace default path",
+            "timeout_sec": 30,
+            "repo_path": "/workspace",
+        })
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+    def test_legacy_claude_path_allowed_via_env_override(self, monkeypatch, tmp_path):
+        """Legacy /home/ubuntu/Abacus is admitted via the additive override."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        fake_bin = write_fake_claude(
+            tmp_path, stdout="ok", name="fake-claude-legacy",
+        )
+        set_fake_binary(monkeypatch, fake_bin)
+        # The autouse fixture already sets this; set it explicitly so the
+        # invariant is self-documenting and robust against fixture changes.
+        monkeypatch.setenv("AEE_EXECUTOR_REPO_ALLOWLIST", "/home/ubuntu/Abacus")
+        resp = post_executor(client, key, {
+            "executor": "claude-code-cli",
+            "prompt": "legacy configured path",
+            "timeout_sec": 30,
+            "repo_path": "/home/ubuntu/Abacus",
+        })
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+    def test_path_outside_allowlist_rejected(self, monkeypatch, tmp_path):
+        """A path outside the configured allow-list is rejected (strict)."""
+        client, app_module, key = make_client(monkeypatch, tmp_path)
+        fake_bin = write_fake_claude(tmp_path, stdout="ok", name="fake-claude-outside")
+        set_fake_binary(monkeypatch, fake_bin)
+        # No legacy override: allowlist is exactly ["/workspace","/tmp"].
+        monkeypatch.delenv("AEE_EXECUTOR_REPO_ALLOWLIST", raising=False)
+        resp = post_executor(client, key, {
+            "executor": "claude-code-cli",
+            "prompt": "outside allowlist",
+            "timeout_sec": 30,
+            "repo_path": "/var/opt/aee-allowlist-outside-test",
+        })
+        assert resp.status_code == 400, f"{resp.status_code}: {resp.text}"
+        body = resp.json()
+        assert body["detail"]["code"] == "repo_path_not_allowed"
+        assert "/var/opt/aee-allowlist-outside-test" in body["detail"]["message"]

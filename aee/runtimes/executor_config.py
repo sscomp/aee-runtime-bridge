@@ -66,8 +66,8 @@ _DEFAULTS: Dict[str, Any] = {
 }
 
 # Env var -> config key for the scalar knobs an operator is most likely
-# to override at deploy time. Lists / dicts are file-only (no env parse)
-# to keep the override surface tiny and predictable.
+# to override at deploy time. Lists / dicts are file-only UNLESS we add
+# a dedicated parser (see ``AEE_EXECUTOR_REPO_ALLOWLIST`` below).
 _ENV_OVERRIDES = {
     "AEE_CLAUDE_CLI_BINARY": "claude_cli_binary",
     "AEE_EXECUTOR_DEFAULT": "default_executor",
@@ -76,6 +76,12 @@ _ENV_OVERRIDES = {
     "AEE_EXECUTOR_MAX_TURNS": "max_turns",
     "AEE_EXECUTOR_BARE": "bare",
     "AEE_EXECUTOR_OUTPUT_FORMAT": "output_format",
+    # TLE-Box / A2 default: comma-separated absolute paths appended to
+    # the JSON file's allowlist, so operators don't have to hand-edit
+    # ``config/executor.json`` on every host. Empty/whitespace tokens
+    # are skipped. Forward slashes only — Windows-style backslashes
+    # are NOT normalised (this bridge is Linux-only).
+    "AEE_EXECUTOR_REPO_ALLOWLIST": "repo_allowlist",
 }
 
 
@@ -97,7 +103,35 @@ def _coerce(key: str, raw: str) -> Any:
             return raw
     if key == "bare":
         return raw.strip().lower() in {"1", "true", "yes", "on"}
+    # ``repo_allowlist`` lives in env as a comma-separated list of
+    # absolute paths; we tokenise here so the caller can ``.extend()``
+    # the existing JSON allowlist (see ``load_executor_config``).
+    if key == "repo_allowlist":
+        return [tok.strip() for tok in raw.split(",") if tok.strip()]
     return raw
+
+
+def _merge_repo_allowlist(base: List[str], override: List[str]) -> List[str]:
+    """Combine two path lists, preserving order, dedup'ing case-sensitively.
+
+    The JSON file's entries come first (operator intent on the host that
+    controls the file), then the env var's entries (host-level override).
+    Order matters because the executor router validates ``repo_path``
+    by membership — not position.
+    """
+    seen: set = set()
+    out: List[str] = []
+    for src in (base, override):
+        if not isinstance(src, list):
+            continue
+        for p in src:
+            if not isinstance(p, str) or not p:
+                continue
+            if p in seen:
+                continue
+            seen.add(p)
+            out.append(p)
+    return out
 
 
 def load_executor_config() -> Dict[str, Any]:
@@ -114,7 +148,18 @@ def load_executor_config() -> Dict[str, Any]:
         pass
     for env_key, cfg_key in _ENV_OVERRIDES.items():
         if env_key in os.environ:
-            merged[cfg_key] = _coerce(cfg_key, os.environ[env_key])
+            coerced = _coerce(cfg_key, os.environ[env_key])
+            # ``repo_allowlist`` is additive — JSON entries win on
+            # tie, env var fills gaps for hosts that don't have the
+            # JSON-managed paths (e.g. TLE-Box doesn't have
+            # /home/ubuntu/Abacus, so the JSON list is empty for it).
+            if cfg_key == "repo_allowlist":
+                merged[cfg_key] = _merge_repo_allowlist(
+                    list(merged.get(cfg_key) or []),
+                    list(coerced or []),
+                )
+            else:
+                merged[cfg_key] = coerced
     # Extra CLI args (e.g. a scoped --allowedTools grant) are appended,
     # not replaced, so an operator can layer on a permission without
     # editing the file. Parsed shell-style into an argv list.
