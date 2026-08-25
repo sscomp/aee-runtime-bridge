@@ -23,13 +23,33 @@ from typing import Any, Dict, List, Optional
 
 # Canonical defaults mirrored into config/executor.json. Kept here so
 # the loader is robust even if the JSON file is deleted.
+#
+# P0 bridge (work order §4 + §18): ``dsh-headless`` is added to the
+# canonical executor vocabulary and accepted under every documented
+# alias (work order uses ``dsh-headless``; we also accept the
+# underscore / hyphen variants an operator might pass by accident).
+# ``default_executor`` is NOT switched — the production runtime
+# stays on ``claude-code-cli`` (or whichever the JSON file says) so
+# flipping the default is a deliberate, separate activation step
+# (work order §18 / §30). The acceptance of ``dsh-headless`` here
+# only widens ``POST /runs/executor``'s selector vocabulary; the
+# actual dispatch path is gated by ``adapter_registry.get(...)``
+# resolving the name — which still requires
+# ``register_dsh_headless()`` to have been called by the
+# bootstrap. See ``aee.core.registry.register_dsh_headless`` for
+# the explicit-opt-in contract.
 _DEFAULTS: Dict[str, Any] = {
-    "supported_executors": ["claude-code-cli", "hermes"],
+    "supported_executors": ["claude-code-cli", "hermes", "dsh-headless"],
     "executor_aliases": {
         "claude-code-cli": "claude-code-cli",
         "claude_code": "claude-code-cli",
         "claude-code": "claude-code-cli",
         "claudecode": "claude-code-cli",
+        "dsh-headless": "dsh-headless",
+        "dsh_headless": "dsh-headless",
+        "dsh": "dsh-headless",
+        "deepseek-harness": "dsh-headless",
+        "deepseek_harness": "dsh-headless",
     },
     "claude_cli_binary": "/home/ubuntu/.local/bin/claude",
     "default_executor": "claude-code-cli",

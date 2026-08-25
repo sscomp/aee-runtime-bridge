@@ -1,16 +1,22 @@
 {
   "supported_executors": [
     "claude-code-cli",
-    "hermes"
+    "hermes",
+    "dsh-headless"
   ],
   "executor_aliases": {
     "claude-code-cli": "claude-code-cli",
     "claude_code": "claude-code-cli",
     "claude-code": "claude-code-cli",
-    "claudecode": "claude-code-cli"
+    "claudecode": "claude-code-cli",
+    "dsh-headless": "dsh-headless",
+    "dsh_headless": "dsh-headless",
+    "dsh": "dsh-headless",
+    "deepseek-harness": "dsh-headless",
+    "deepseek_harness": "dsh-headless"
   },
   "claude_cli_binary": "/home/ubuntu/.local/bin/claude",
-  "default_executor": "claude-code-cli",
+  "default_executor": "dsh-headless",
   "default_timeout_sec": 120,
   "max_timeout_sec": 7200,
   "max_turns": 80,
@@ -23,7 +29,7 @@
     "--allowedTools=Write,Edit,Bash"
   ],
   "repo_allowlist": [
-    "/home/ubuntu",
+    "/workspace",
     "/tmp"
   ]
 }

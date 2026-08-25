@@ -23,6 +23,7 @@ from .base import (  # noqa: F401
 )
 from .hermes_adapter import HermesAdapter  # noqa: F401
 from .fake_adapter import FakeAdapter  # noqa: F401
+from .dsh_headless import DshHeadlessAdapter  # noqa: F401
 
 __all__ = [
     "RuntimeAdapter",
@@ -34,4 +35,5 @@ __all__ = [
     "UnknownExternalRunError",
     "HermesAdapter",
     "FakeAdapter",
+    "DshHeadlessAdapter",
 ]

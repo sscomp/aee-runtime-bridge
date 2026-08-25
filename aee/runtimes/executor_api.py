@@ -30,9 +30,10 @@ class ExecutorRunRequest(BaseModel):
         None,
         description=(
             "Executor to dispatch to. Accepted aliases: "
-            "`claude-code-cli`, `claude_code`, `claude-code`. "
-            "Canonical response value is `claude-code-cli`. "
-            "`hermes` selects the legacy Hermes provider. "
+            "`claude-code-cli`, `claude_code`, `claude-code`, "
+            "`hermes`, `dsh-headless`, `dsh_headless`, `dsh`, "
+            "`deepseek-harness`. Canonical response values: "
+            "`claude-code-cli`, `hermes`, `dsh-headless`. "
             "If omitted, the configured default executor is used."
         ),
     )
@@ -62,6 +63,22 @@ class ExecutorRunRequest(BaseModel):
         None,
         ge=1,
         description="Override the configured Claude Code CLI --max-turns.",
+    )
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=200,
+        description=(
+            "P0 bridge §8: optional caller-supplied idempotency token. "
+            "When set, the dispatcher reconciles an existing task with "
+            "the same ``idempotency_key`` before launching a new run, "
+            "so transient upstream errors (502 / 503 / 504 / 524 / "
+            "connection reset) do not create duplicate DSH executions. "
+            "Without ``idempotency_key`` the dispatcher still creates a "
+            "durable TASK-YYYYMMDD-NNNN row before submit, so an "
+            "uncertain CreateRun result can always be reconciled by "
+            "polling that task id; explicit keys just make the "
+            "reconciliation deterministic across retries."
+        ),
     )
 
     @field_validator("expected_artifacts")

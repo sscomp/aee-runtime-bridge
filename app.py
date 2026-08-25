@@ -173,6 +173,16 @@ async def _lifespan(app: FastAPI):
     # malformed file aborts startup with a clear error.
     from aee.runtimes.registry import bootstrap_default_runtimes
     bootstrap_default_runtimes(force=False)
+    # AEE DSH Default Executor Activation (work order §6):
+    # ``DshHeadlessAdapter`` is explicitly opt-in — it is NOT registered
+    # by ``bootstrap_defaults``. Register it here, immediately after the
+    # runtime/bootstrap initialization, so ``dsh-headless`` is present in
+    # ``adapter_registry`` for the whole process lifetime and the
+    # ``POST /runs/executor`` default route (when default_executor is
+    # ``dsh-headless``) resolves without the 503 ``not registered`` path.
+    # Idempotent: a no-op if already registered (e.g. a prior call).
+    from aee.core.registry import register_dsh_headless
+    register_dsh_headless()
     cfg_path = os.getenv("AEE_RUNTIME_CONFIG")
     if cfg_path:
         from aee.config import load_runtime_config, apply_runtime_config, RuntimeConfigError
@@ -2404,10 +2414,29 @@ async def create_executor_run(
     # executor wrote artifacts under ``/home/ubuntu/Abacus`` while
     # verification stat-ed absolute paths under a different repo.
     allowlist = [p for p in (cfg.get("repo_allowlist") or []) if isinstance(p, str)]
+    # The hard-coded ``/home/ubuntu/Abacus`` default below is the
+    # Abacus-AI host's working area; on TLE-Box (and any other host
+    # whose /home/ubuntu/Abacus does not exist) it makes every
+    # caller-omitted ``repo_path`` request 400 because the path is
+    # outside the (now-properly-loaded) allow-list. Prefer the
+    # operator-configured fallback (``$AEE_EXECUTOR_DEFAULT_CWD``,
+    # same env var used by ``ClaudeCodeCliRunner.from_config``),
+    # then ``/workspace`` (TLE-Box default). The legacy
+    # ``/home/ubuntu/Abacus`` path was removed 2026-08-25: this host
+    # does not have it and ClaudeCodeProvider would otherwise fail with
+    # ``cwd does not exist``.
+    _default_cwd = os.environ.get("AEE_EXECUTOR_DEFAULT_CWD")
+    if not _default_cwd or not os.path.isdir(_default_cwd):
+        for cand in ("/workspace",):
+            if os.path.isdir(cand):
+                _default_cwd = cand
+                break
+        else:
+            _default_cwd = "/workspace"
     repo_path = _derive_repo_path_from_artifacts(
         expected_artifacts=body.expected_artifacts,
         explicit_repo_path=body.repo_path,
-        default_repo_path="/home/ubuntu/Abacus",
+        default_repo_path=_default_cwd,
         allowlist=allowlist,
     )
     if not any(
@@ -2668,10 +2697,346 @@ async def create_executor_run(
                 )
         return envelope
 
+    # ------------------------------------------------------------------
+    # P0 bridge (work order §4 + §7 + §9 + §18): ``dsh-headless``
+    # dispatch. Wire a thin AEE deterministic wrapper around the
+    # ``DshHeadlessAdapter`` so GPT-A2 can call ``POST /runs/executor``
+    # with ``executor=dsh-headless`` and have AEE drive the local
+    # DeepSeek Harness headless CLI end-to-end. The dispatch flow
+    # mirrors the existing ``claude-code-cli`` branch above:
+    #
+    #   1. ``TaskManager.create(...)`` — durable task row first (the
+    #      caller already has ``executor_task_id`` by this point, see
+    #      the create block above). The task row is the idempotency
+    #      anchor for §8: a transient upstream error after submit
+    #      will NOT create a duplicate DSH execution because the
+    #      caller can reconcile by ``task_id`` (or ``idempotency_key``
+    #      if supplied).
+    #   2. ``adapter.submit(job)`` — awaits the one-shot headless
+    #      CLI to terminal status (headless is synchronous; ``submit``
+    #      waits for the child to exit). The external HTTP response
+    #      therefore returns ONLY after the DSH run has reached a
+    #      terminal state — that is the same pattern the claude-cli
+    #      branch uses, and it satisfies §7 because the
+    #      ``/runs/executor`` ACK is the same terminal submission
+    #      envelope the Claude branch returns (the upstream DSH
+    #      process is the thing waiting on the network round-trip
+    #      to Ollama Cloud; the bridge itself does NOT do an
+    #      additional sync wait on a separate process).
+    #   3. ``manager.complete()`` / ``manager.fail()`` — mirror the
+    #      terminal outcome into the dispatcher task row so the
+    #      watcher's completion gate sees the same terminal status.
+    #   4. ``build_executor_response(...)`` + ``_persist_executor_run``
+    #      — assemble the canonical envelope and persist it in
+    #      ``executor_runs`` (same shape the other branches return).
+    #
+    # §9 credential inheritance: the adapter's own
+    # ``_child_env`` allow-list forwards ``OLLAMA_API_KEY`` (and
+    # ``DEEPSEEK_API_KEY`` / ``DEEPSEEK_BASE_URL`` for forward
+    # compat) from the bridge's own environment to the DSH child
+    # process. We deliberately do NOT re-inject any value the
+    # bridge did not already have — if the operator did not export
+    # the credential before launching the bridge, DSH will surface
+    # ``MISSING_CREDENTIAL`` and we map that to a deterministic
+    # ``status=failed`` (``failure_kind=missing_credential``) below.
+    # §18 default executor: ``config/executor.json::default_executor``
+    # remains ``claude-code-cli``; ``dsh-headless`` is an explicit
+    # opt-in only. Calling this branch requires the caller to pass
+    # ``executor=dsh-headless`` (or one of its accepted aliases).
+    if selected == "dsh-headless":
+        # Defensive: ``DshHeadlessAdapter`` is explicitly opt-in — it
+        # is NOT registered by ``bootstrap_defaults``. If the caller
+        # asked for ``dsh-headless`` but the adapter was never
+        # registered (e.g. an operator who did not run the
+        # activation work order), surface a deterministic 503
+        # rather than silently falling back to another executor.
+        from aee.core.registry import adapter_registry as _registry_dsh
+        adapter = None
+        try:
+            adapter = _registry_dsh.get("dsh-headless")
+        except Exception:
+            adapter = None
+        if adapter is None:
+            # P0 bridge §22: do NOT silently fall back. The
+            # caller asked for ``dsh-headless``; we tell them
+            # why it cannot run and let them retry (after
+            # activating the adapter) without ever invoking
+            # Claude or any other executor.
+            _persist_ds = build_executor_response(
+                requested_executor=requested,
+                selected_executor=selected,
+                run_id="dsh-headless-unregistered",
+                status="failed",
+                routing=routing,
+                task_id=executor_task_id,
+                error=(
+                    "dsh-headless adapter is not registered; "
+                    "call register_dsh_headless() at process startup "
+                    "before serving /runs/executor with executor=dsh-headless"
+                ),
+                telegram_result={
+                    "success": False,
+                    "skipped": "dsh-headless adapter not registered",
+                },
+                runtime_identity=collect_runtime_identity(
+                    selected_executor=selected, cfg=cfg
+                ),
+            )
+            _persist_executor_run(_persist_ds)
+            return _persist_ds
+        from aee.adapters.base import RuntimeError as AdapterRuntimeError
+        from aee.core.job_models import Job as AEEJob
+        _job = AEEJob(
+            title=f"dsh-headless:{executor_task_id or 'unknown'}",
+            type="ops",
+            mode="normal",
+            input=body.prompt,
+            client_source=source,
+            adapter_name="dsh-headless",
+            runtime_type="dsh_headless",
+            expected_artifacts=body.expected_artifacts or [],
+            spec={
+                "task_id": executor_task_id,
+                "idempotency_key": body.idempotency_key,
+                "repo_path": repo_path,
+            },
+        )
+        # --- dsh-headless queue lifecycle mirror (claude-cli
+        # branch already proved this matters: see
+        # tests/test_claude_cli_queue_lifecycle.py). Mirror
+        # the queued -> running transition so the watcher's
+        # completion gate sees the right status; best-effort
+        # swallow on failure so a missing lifecycle row never
+        # blocks the dispatch.
+        if executor_task_id:
+            try:
+                from dispatcher.manager import (
+                    TaskManager as _TM_dsh_lifecycle,
+                    IllegalTransition,
+                )
+                try:
+                    _TM_dsh_lifecycle().start(
+                        executor_task_id, f"dsh-headless-pending-{executor_task_id}",
+                    )
+                except IllegalTransition:
+                    # watcher may have already advanced; harmless.
+                    pass
+            except Exception as _lifecycle_exc:  # pragma: no cover - defensive
+                import sys as _sys
+                print(
+                    f"[dsh_executor_lifecycle] manager.start failed for "
+                    f"task_id={executor_task_id!r}: "
+                    f"{type(_lifecycle_exc).__name__}: {_lifecycle_exc}",
+                    file=_sys.stderr,
+                )
+        # --- Actual DSH headless dispatch. ``adapter.submit``
+        # awaits the child to terminal status (headless is a
+        # one-shot CLI). The terminal ``RuntimeSubmitResult``
+        # becomes the basis for the envelope below. We catch
+        # transport-level ``RuntimeError`` (spawn / timeout)
+        # defensively; a real-DSH ``MISSING_CREDENTIAL`` lands as
+        # ``status=failed`` inside the adapter and is mapped
+        # to ``failure_kind=missing_credential`` in the envelope
+        # without raising.
+        try:
+            submit_result = await adapter.submit(_job)
+        except AdapterRuntimeError as exc:
+            _ds_envelope = build_executor_response(
+                requested_executor=requested,
+                selected_executor=selected,
+                run_id="dsh-headless-submit-failed",
+                status="failed",
+                routing=routing,
+                task_id=executor_task_id,
+                error=f"dsh-headless submit error: {exc}",
+                telegram_result={
+                    "success": False,
+                    "skipped": "dsh-headless submit failed; no notification sent",
+                },
+                runtime_identity=collect_runtime_identity(
+                    selected_executor=selected, cfg=cfg
+                ),
+            )
+            _persist_executor_run(_ds_envelope)
+            # Lifecycle: queued/running -> failed. Best-effort.
+            if executor_task_id:
+                try:
+                    from dispatcher.manager import TaskManager as _TM_dsh_fail
+                    _TM_dsh_fail().fail(
+                        executor_task_id,
+                        f"dsh-headless submit error: {exc}",
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            return _ds_envelope
+        # Map the adapter's terminal status to the canonical
+        # executor envelope. ``submit_result.raw`` carries the
+        # DSH subprocess argv / exit_code / credentials / any
+        # ``failure_kind`` the adapter computed (including
+        # ``missing_credential``).
+        raw_payload = submit_result.raw if isinstance(submit_result.raw, dict) else {}
+        raw_creds = raw_payload.get("credentials") or {}
+        raw_failure_kind = raw_payload.get("failure_kind")
+        raw_exit_code = raw_payload.get("exit_code")
+        raw_stderr_tail = raw_payload.get("stderr_tail") or ""
+        # DSH stdout lives on the adapter's ``raw.stdout_tail`` (or
+        # ``raw.output`` if the adapter packs it differently). The
+        # ``RuntimeSubmitResult`` Protocol only carries ``status`` +
+        # ``raw`` (see ``aee/adapters/base.py``) — the headless
+        # adapter stores the final assistant text under
+        # ``raw.stdout_tail``; we surface it as ``stdout_summary``.
+        dsh_stdout = (
+            raw_payload.get("stdout_tail")
+            or raw_payload.get("output")
+            or ""
+        )
+        stdout_summary = truncate_summary(
+            dsh_stdout,
+            int(cfg.get("stdout_summary_cap", 2000)),
+        )
+        stderr_summary = truncate_summary(
+            raw_stderr_tail,
+            int(cfg.get("stderr_summary_cap", 1000)),
+        )
+        # Artifact verification is always deterministic — AEE
+        # stats / sha256 the declared paths itself (§12) so we
+        # do NOT need a model call to confirm the artifact.
+        artifact_verification = verify_artifacts(
+            body.expected_artifacts,
+            compute_sha256=bool(cfg.get("artifact_sha256", True)),
+        )
+        git_evidence = collect_git_evidence(repo_path)
+        telegram_result = _attempt_telegram(
+            f"AEE dsh-headless run {submit_result.external_run_id}: "
+            f"{submit_result.status}",
+            (
+                f"executor={selected}\nstatus={submit_result.status}\n"
+                f"failure_kind={raw_failure_kind or '-'}\n"
+                f"exit_code={raw_exit_code if raw_exit_code is not None else '-'}"
+            ),
+        )
+        status_terminal = submit_result.status in (
+            "completed", "failed", "timeout", "cancelled",
+        )
+        progress = 1.0 if status_terminal else 0.0
+        # Build the routing metadata that surfaces the DSH
+        # credential state to the caller (per §9 — never the
+        # value, only ``VARIABLE: present|absent``).
+        routing_with_creds = dict(routing)
+        routing_with_creds["credentials"] = raw_creds
+        routing_with_creds["provider"] = "ollama-cloud"
+        # We do NOT trust ``body.model_name`` for DSH — the model
+        # is profile-controlled by DSH (per §2 + compatibility
+        # audit §2). When the operator wants a specific model
+        # they edit ``$DSH_HOME/settings.yaml``; we surface
+        # ``effective_model = None`` here so callers do not
+        # believe the model name they passed was used.
+        routing_with_creds["effective_model"] = None
+        # Build the error message (per §10): never the
+        # credential value, only the failure_kind + safe tail.
+        error_message: Optional[str] = None
+        if submit_result.status != "completed":
+            if raw_failure_kind == "missing_credential":
+                error_message = (
+                    "DSH reported a missing provider credential "
+                    "(OLLAMA_API_KEY absent or unset); see routing.credentials "
+                    "for VARIABLE_NAME presence."
+                )
+            elif submit_result.status == "timeout":
+                error_message = (
+                    f"dsh-headless timeout after "
+                    f"{raw_payload.get('timeout_seconds', 'unknown')}s"
+                )
+            elif raw_stderr_tail:
+                error_message = raw_stderr_tail
+            else:
+                error_message = (
+                    f"dsh-headless exit={raw_exit_code} "
+                    f"failure_kind={raw_failure_kind or 'unknown'}"
+                )
+        runtime_identity = collect_runtime_identity(
+            selected_executor=selected, cfg=cfg
+        )
+        envelope = build_executor_response(
+            requested_executor=requested,
+            selected_executor=selected,
+            run_id=submit_result.external_run_id,
+            status=submit_result.status or "failed",
+            routing=routing_with_creds,
+            task_id=executor_task_id,
+            progress=progress,
+            artifact_paths=body.expected_artifacts or [],
+            stdout_summary=stdout_summary,
+            stderr_summary=stderr_summary,
+            exit_code=raw_exit_code,
+            timeout_state=("timeout" if submit_result.status == "timeout" else None),
+            cancel_state=None,  # headless has no async cancel surface
+            git_evidence=git_evidence,
+            artifact_verification=artifact_verification,
+            telegram_result=telegram_result,
+            runtime_identity=runtime_identity,
+            error=error_message,
+        )
+        _persist_executor_run(envelope)
+        # Lifecycle mirror: running -> terminal. Mirror the
+        # claude-cli branch's reconciliation strategy so a
+        # watcher that already pre-empted (timeout) does not
+        # cause the dispatcher to throw ``IllegalTransition``.
+        if executor_task_id:
+            try:
+                from dispatcher.manager import (
+                    TaskManager as _TM_dsh_terminal,
+                    IllegalTransition,
+                )
+                _tm = _TM_dsh_terminal()
+                if submit_result.status == "completed":
+                    try:
+                        _tm.complete(
+                            executor_task_id,
+                            output_text=dsh_stdout or "",
+                        )
+                    except IllegalTransition:
+                        try:
+                            _tm.reconcile_executor_completion(
+                                executor_task_id,
+                                run_id=submit_result.external_run_id,
+                                status="completed",
+                                output_text=dsh_stdout or "",
+                                exit_code=raw_exit_code,
+                            )
+                        except Exception:  # pragma: no cover
+                            pass
+                else:
+                    try:
+                        _tm.fail(
+                            executor_task_id,
+                            error_message or "dsh-headless: failed",
+                        )
+                    except IllegalTransition:
+                        try:
+                            _tm.reconcile_executor_completion(
+                                executor_task_id,
+                                run_id=submit_result.external_run_id,
+                                status="failed",
+                                error_message=error_message or "dsh-headless: failed",
+                                exit_code=raw_exit_code,
+                            )
+                        except Exception:  # pragma: no cover
+                            pass
+            except Exception as _terminal_exc:  # pragma: no cover - defensive
+                import sys as _sys
+                print(
+                    f"[dsh_executor_lifecycle] manager.complete/fail failed for "
+                    f"task_id={executor_task_id!r}: "
+                    f"{type(_terminal_exc).__name__}: {_terminal_exc}",
+                    file=_sys.stderr,
+                )
+        return envelope
+
     # selected == "hermes" — delegate to the existing Hermes adapter
     # (registered in ``adapter_registry``). Tests stub the adapter; in
     # production this submits to Hermes 8642. Hermes is async, so the
-    # envelope returns a queued state with the upstream run_id; the
+
     # per-run evidence fields are null/skipped (Hermes does not produce
     # local artifacts / git evidence / a per-run Telegram on submit).
     from aee.adapters.base import RuntimeError as AdapterRuntimeError  # noqa: F811

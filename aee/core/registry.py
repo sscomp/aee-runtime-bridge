@@ -141,6 +141,26 @@ def _register_aee7_defaults() -> None:
     adapter_registry.register(ClaudeCodeExecutorAdapter(), replace=True)
 
 
+def register_dsh_headless(*, force: bool = False) -> bool:
+    """Explicit-opt-in registration of :class:`DshHeadlessAdapter`.
+
+    The DSH headless executor is **never** registered by
+    :func:`bootstrap_defaults`. Calling this function is the only way
+    the ``dsh-headless`` name enters the registry — typically from a
+    test, an A/B routing experiment, or a future, separate migration
+    work order. Calling it more than once is a no-op unless
+    ``force=True``.
+
+    Returns ``True`` if a new registration was performed, ``False`` if
+    the adapter was already registered.
+    """
+    if not force and "dsh-headless" in adapter_registry.names():
+        return False
+    from aee.adapters.dsh_headless import DshHeadlessAdapter  # local import
+    adapter_registry.register(DshHeadlessAdapter(), replace=True)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # WorkerRegistry — AEE-2 placeholder
 # ---------------------------------------------------------------------------
@@ -204,6 +224,7 @@ __all__ = [
     "AdapterRegistry",
     "adapter_registry",
     "bootstrap_defaults",
+    "register_dsh_headless",
     "WorkerRecord",
     "WorkerRegistry",
     "worker_registry",
