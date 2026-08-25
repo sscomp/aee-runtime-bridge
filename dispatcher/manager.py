@@ -904,9 +904,29 @@ class TaskManager:
                 (ts, duration, result_path, effective_model, delivery["warning_bump"], task_id),
             )
             if output_text is not None or usage is not None or raw is not None or delivery["artifacts"]:
+                # TASK-20260825-0010 (cross-call notification dedup):
+                # do NOT use ``INSERT OR REPLACE`` here — that would
+                # clobber any prior ``notification_json`` written by
+                # an earlier ``_notify_terminal`` (the in-process
+                # second-chance path persists the result, and
+                # ``INSERT OR REPLACE`` resets the whole row to NULL
+                # for that column). Instead, upsert only the
+                # output-text / usage / raw / delivery columns so a
+                # follow-up ``_notify_terminal`` (or the manager's
+                # own ``notif_blob`` persist) sees the prior blob
+                # and can short-circuit. ``_notify_terminal`` is
+                # the sole writer of ``notification_json`` and uses
+                # an explicit INSERT-or-UPDATE that does not touch
+                # the other columns.
                 conn2.execute(
-                    "INSERT OR REPLACE INTO task_outputs (task_id, output_text, usage_json, raw_json, delivery_json) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO task_outputs "
+                    "(task_id, output_text, usage_json, raw_json, delivery_json) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(task_id) DO UPDATE SET "
+                    "output_text = excluded.output_text, "
+                    "usage_json = excluded.usage_json, "
+                    "raw_json = excluded.raw_json, "
+                    "delivery_json = excluded.delivery_json",
                     (
                         task_id,
                         output_text,
@@ -1291,9 +1311,11 @@ class TaskManager:
     ) -> None:
         try:
             from dispatcher.executor_runs import upsert_run
+            from dispatcher.executor_identity import is_dsh_executor
             conn = get_conn()
             trow = conn.execute(
-                "SELECT hermes_run_id, external_run_id, adapter_name "
+                "SELECT hermes_run_id, external_run_id, adapter_name, "
+                "       runtime_type "
                 "FROM tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
@@ -1305,6 +1327,28 @@ class TaskManager:
                 # to a runtime that produces a run_id (e.g. a
                 # rejected/synthetic task). Nothing to sync.
                 return
+            # TASK-20260825-0027 lifecycle identity fix (2026-08-25):
+            # the previous fallback ``trow["adapter_name"] or "hermes"``
+            # silently downgraded a DSH-owned task to ``selected_executor
+            # = "hermes"`` whenever ``adapter_name`` happened to be NULL
+            # (the DSH placeholder path is a metadata-lag race; the
+            # ``adapter_name`` column is stamped by the dispatch branch
+            # and can lag the executor's terminal call). That downgrade
+            # surfaced as ``Executor: unknown`` in operator dashboards
+            # even when the executor was healthy. Fall back to
+            # ``runtime_type`` (also a task-side column) and, as a final
+            # resort, to a non-Hermes-preserving default only when the
+            # task is unambiguously DSH — otherwise keep the legacy
+            # ``hermes`` default so we do not falsely attribute a Hermes
+            # task to DSH.
+            adapter = trow["adapter_name"]
+            runtime = trow["runtime_type"]
+            if adapter:
+                selected_executor = adapter
+            elif runtime and is_dsh_executor(runtime):
+                selected_executor = runtime
+            else:
+                selected_executor = "hermes"
             _terminal = status in {"completed", "failed", "timeout", "cancelled"}
             _phase = "terminal" if _terminal else (
                 "queued" if status in {"queued", "pending"} else "running"
@@ -1316,14 +1360,14 @@ class TaskManager:
                 conn,
                 run_id=run_id,
                 requested_executor=None,
-                selected_executor=trow["adapter_name"] or "hermes",
+                selected_executor=selected_executor,
                 task_id=task_id,
                 status=status,
                 progress=1.0 if _terminal else 0.0,
                 exit_code=exit_code,
                 error=error,
                 routing={
-                    "selected_executor": trow["adapter_name"] or "hermes",
+                    "selected_executor": selected_executor,
                     "selection_source": "lifecycle_sync",
                 },
                 current_step=_step,
@@ -1789,6 +1833,70 @@ class TaskManager:
 
         Returns the gate's result dict (always non-None).
         """
+        # Cross-call dedup guard (TASK-20260825-0010). The reconcile
+        # path (``reconcile_executor_completion``) has its own prior
+        # guard, but the direct terminal methods (``complete`` /
+        # ``fail`` / ``timeout`` / ``cancel``) only relied on
+        # ``is_legal_transition`` to dedup — and any caller that
+        # bypasses that guard (e.g. blocking-gate revert + retry, or
+        # a custom executor path that force-replays the same verdict)
+        # can re-enter ``_notify_terminal`` for the same
+        # ``(task_id, status)`` and fire additional Telegram
+        # messages. We add a strict pre-fire guard here: if a
+        # persisted ``notification_json`` already shows the SAME
+        # status with ``sent=True`` AND a captured ``message_id``,
+        # we skip the entire v3 gate + inprocess chain so the
+        # operator never receives a duplicate Telegram for the same
+        # terminal transition. We deliberately treat the legacy
+        # path's ``sent=True, message_id=None`` shape as "not
+        # delivered" so a legacy success that did not capture
+        # ``message_id`` still gets a single inprocess retry — but
+        # only on the FIRST ``_notify_terminal`` call for this
+        # status. Subsequent calls see the inprocess record
+        # (``sent=True, message_id=<int>``) and short-circuit.
+        try:
+            _dedup_conn = get_conn()
+            _dedup_row = _dedup_conn.execute(
+                "SELECT notification_json FROM task_outputs WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            _dedup_blob = (
+                _dedup_row["notification_json"]
+                if _dedup_row is not None else None
+            )
+            if _dedup_blob:
+                try:
+                    _dedup_decoded = json.loads(_dedup_blob)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    _dedup_decoded = None
+                if isinstance(_dedup_decoded, dict):
+                    _already = (
+                        _dedup_decoded.get("sent") is True
+                        and _dedup_decoded.get("message_id") is not None
+                        and _dedup_decoded.get("status") == status
+                    )
+                    if _already:
+                        # Skip the entire fire chain and return the
+                        # prior record so the caller still gets a
+                        # structured dict (and so a future
+                        # reconcile / retry sees the same record
+                        # instead of a fresh attempted send).
+                        _dedup_decoded = dict(_dedup_decoded)
+                        _dedup_decoded.setdefault("status", status)
+                        _dedup_decoded.setdefault(
+                            "method", _dedup_decoded.get("method", "deduped_prior")
+                        )
+                        _dedup_decoded["deduped"] = True
+                        # Stamp attempts=0 because we did NOT
+                        # actually attempt this call.
+                        _dedup_decoded.setdefault("attempts", 0)
+                        return _dedup_decoded
+        except Exception as _dedup_exc:  # noqa: BLE001 — fail-open
+            log.debug(
+                "manager._notify_terminal: dedup pre-check failed "
+                "task_id=%s status=%s err=%s",
+                task_id, status, _dedup_exc,
+            )
         try:
             from dispatcher.notifier import (
                 notify_terminal_inprocess,

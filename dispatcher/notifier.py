@@ -1038,6 +1038,56 @@ def notify_terminal_inprocess(
     """
     ts_utc = _now_iso_utc()
     ts_taipei = _now_iso_taipei()
+    # Cross-call dedup guard (TASK-20260825-0010). When
+    # ``TaskManager._notify_terminal`` is re-entered for the same
+    # ``(task_id, status)`` (e.g. after a blocking-gate revert, a
+    # duplicate reconcile, or a replay from a custom executor
+    # path), a prior in-process send may have already delivered the
+    # terminal alert with a captured ``message_id``. Inspect the
+    # persisted ``task_outputs.notification_json`` and short-circuit
+    # so the operator never receives a duplicate Telegram for the
+    # SAME terminal transition. We only dedup when the prior blob
+    # matches the SAME status with a confirmed ``message_id`` —
+    # a failed prior (sent=False) or a status change
+    # (e.g. timeout -> completed reconciliation) still falls
+    # through to the normal fire path.
+    try:
+        from dispatcher.db import get_conn
+        _dedup_conn = get_conn()
+        _dedup_row = _dedup_conn.execute(
+            "SELECT notification_json FROM task_outputs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        _dedup_blob = (
+            _dedup_row["notification_json"]
+            if _dedup_row is not None else None
+        )
+        if _dedup_blob:
+            try:
+                _dedup_decoded = json.loads(_dedup_blob)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                _dedup_decoded = None
+            if isinstance(_dedup_decoded, dict):
+                _already = (
+                    _dedup_decoded.get("sent") is True
+                    and _dedup_decoded.get("message_id") is not None
+                    and _dedup_decoded.get("status") == status
+                )
+                if _already:
+                    _out = dict(_dedup_decoded)
+                    _out.setdefault("status", status)
+                    _out.setdefault(
+                        "method", _out.get("method", "deduped_prior")
+                    )
+                    _out["deduped"] = True
+                    _out.setdefault("attempts", 0)
+                    return _out
+    except Exception as _dedup_exc:  # noqa: BLE001 — fail-open
+        log.debug(
+            "notifier.notify_terminal_inprocess: dedup pre-check failed "
+            "task_id=%s status=%s err=%s",
+            task_id, status, _dedup_exc,
+        )
     cfg = _telegram_config()
     token = cfg.get("bot_token", "")
     resolved_chat_id = (
@@ -1190,6 +1240,65 @@ def notify_terminal_inprocess(
         "last_error": last_error,
         "credential_presence": credential_presence,
     }
+    # Stamp the terminal ``status`` into the in-process result so
+    # the cross-call dedup guard (``notify_terminal_inprocess``
+    # entry) can match a prior in-process delivery for the SAME
+    # terminal verdict. Mirrors the same ``setdefault('status',
+    # status)`` pattern ``_notify_terminal`` uses so the two
+    # writers agree on the persisted shape.
+    if isinstance(result, dict):
+        result = dict(result)
+        result.setdefault("status", status)
+    # Cross-call dedup persistence (TASK-20260825-0010). Stamp the
+    # in-process result into ``task_outputs.notification_json`` so
+    # subsequent calls — including a future
+    # ``TaskManager._notify_terminal`` entry or a direct inprocess
+    # call from a custom executor path — can short-circuit on the
+    # persisted blob without firing another HTTP. We use the same
+    # idempotent INSERT-or-REPLACE shape ``_notify_terminal`` uses
+    # so the two writers do not race. Best-effort: a persist
+    # failure is logged and swallowed so the inprocess result
+    # still propagates to the caller.
+    if sent and message_id is not None:
+        try:
+            from dispatcher.db import get_conn, transaction
+            _persist_blob = json.dumps(result, default=str,
+                                       ensure_ascii=False)
+            with transaction() as _persist_conn:
+                _cur = _persist_conn.execute(
+                    "SELECT 1 FROM task_outputs WHERE task_id = ?",
+                    (task_id,),
+                )
+                if _cur.fetchone() is None:
+                    _persist_conn.execute(
+                        "INSERT INTO task_outputs "
+                        "(task_id, notification_json) VALUES (?, ?)",
+                        (task_id, _persist_blob),
+                    )
+                else:
+                    # TASK-20260825-0010 (cross-call notification
+                    # dedup): use a guarded UPDATE so we do NOT
+                    # clobber the row if a concurrent ``complete()``
+                    # / ``reconcile_executor_completion`` already
+                    # wrote a confirmed-delivery blob for the SAME
+                    # status. The cross-call dedup guard inspects
+                    # ``notification_json`` for ``sent=True`` +
+                    # ``message_id`` + same status; overwriting that
+                    # blob would re-enable duplicate Telegram
+                    # sends on every re-entry.
+                    _persist_conn.execute(
+                        "UPDATE task_outputs SET notification_json = ? "
+                        "WHERE task_id = ? AND "
+                        "(notification_json IS NULL "
+                        " OR json_extract(notification_json, '$.message_id') IS NULL)",
+                        (_persist_blob, task_id),
+                    )
+        except Exception as _persist_exc:  # noqa: BLE001 — best-effort
+            log.debug(
+                "notifier.notify_terminal_inprocess: persist failed "
+                "task_id=%s status=%s err=%s",
+                task_id, status, _persist_exc,
+            )
     _append_notification_audit({
         "task_id": task_id,
         "status": status,

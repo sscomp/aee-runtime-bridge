@@ -407,5 +407,169 @@ class TestSecretsNotIncluded(_TempDbMixin, unittest.TestCase):
         self.assertIn("Taipei", text)
 
 
+# ---------------------------------------------------------------------------
+# 6. Cross-call dedup — TASK-20260825-0010
+# ---------------------------------------------------------------------------
+#
+# The original idempotency story only covered
+# ``reconcile_executor_completion`` re-entry. Direct terminal
+# methods (``complete`` / ``fail`` / ``timeout`` / ``cancel``) and
+# the in-process second-chance path can each be re-entered for the
+# same ``(task_id, status)`` when a caller bypasses
+# ``is_legal_transition`` (blocking-gate revert, custom executor
+# path, or a re-fire from a retry chain). The fix is a strict
+# prior-blob dedup at two layers:
+#
+#   * ``TaskManager._notify_terminal`` — short-circuits the v3
+#     gate + inprocess chain if the prior blob already has
+#     ``sent=True``, a captured ``message_id``, and the same
+#     ``status``. Returns the prior dict so the caller still gets a
+#     structured result without firing any HTTP.
+#   * ``notify_terminal_inprocess`` — same guard, applied at the
+#     in-process entry so any code path that lands on the
+#     second-chance notify is also deduped.
+#
+# These tests verify both layers short-circuit a second
+# ``_notify_terminal`` / ``notify_terminal_inprocess`` call for the
+# SAME (task_id, status) and that the urllib transport is NOT
+# invoked the second time.
+
+
+class TestCrossCallDedup(_TempDbMixin, unittest.TestCase):
+
+    def test_complete_then_complete_does_not_refire(self):
+        """A second ``complete()`` (which would normally be rejected
+        by ``is_legal_transition``) is bypassed by simulating a
+        blocking-gate revert + retry. The second ``_notify_terminal``
+        call must short-circuit because the prior inprocess blob
+        already shows ``sent=True`` + ``message_id`` for status
+        ``completed``. The urllib transport must be invoked only
+        ONCE for the entire sequence."""
+        m = TaskManager()
+        task_id = self._create_running_task(m, "dsh-headless:DEDUP-1")
+        captured: Dict[str, Any] = {}
+        p1, p2, p3, p4, p5, p6 = self._patches(_fake_urlopen_ok(8888, captured))
+        with p1, p2, p3, p4, p5, p6 as mock_urlopen:
+            # First complete: v3 hermes fails, legacy fails
+            # (mocked to return False), inprocess succeeds with
+            # message_id=8888.
+            m.complete(task_id, output_text="done")
+            self.assertEqual(mock_urlopen.call_count, 1)
+            # Simulate a blocking-gate revert that reset status
+            # back to running (the dedup guard inspects
+            # notification_json, NOT tasks.status, so this direct
+            # UPDATE is safe).
+            self._conn.execute(
+                "UPDATE tasks SET status='running', finished_at=NULL "
+                "WHERE task_id=?",
+                (task_id,),
+            )
+            self._conn.commit()
+            # Second complete(): is_legal_transition("running",
+            # "completed") is True so the manager reaches
+            # ``_notify_terminal`` again. The cross-call dedup
+            # must short-circuit before any HTTP.
+            task = m.complete(task_id, output_text="retry")
+        # Transport still invoked exactly once — no duplicate send.
+        self.assertEqual(mock_urlopen.call_count, 1)
+        self.assertEqual(task.status, "completed")
+
+    def test_inprocess_short_circuits_after_prior_delivery(self):
+        """Direct call to ``notify_terminal_inprocess`` after a
+        previous delivery (captured in ``notification_json``) must
+        short-circuit — no urllib call, returns the prior dict
+        marked ``deduped=True``."""
+        from dispatcher import notifier as notifier_mod
+        m = TaskManager()
+        task_id = self._create_running_task(m, "dsh-headless:DEDUP-2")
+        captured: Dict[str, Any] = {}
+        p1, p2, p3, p4, p5, p6 = self._patches(_fake_urlopen_ok(9999, captured))
+        with p1, p2, p3, p4, p5, p6 as mock_urlopen:
+            # First call: real send, message_id=9999.
+            first = notifier_mod.notify_terminal_inprocess(
+                task_id, "completed",
+            )
+            self.assertTrue(first.get("sent"))
+            self.assertEqual(first.get("message_id"), 9999)
+            self.assertEqual(mock_urlopen.call_count, 1)
+            # Second call for the SAME status must dedup.
+            second = notifier_mod.notify_terminal_inprocess(
+                task_id, "completed",
+            )
+            # No additional HTTP attempt.
+            self.assertEqual(mock_urlopen.call_count, 1)
+            # Returned dict is the prior blob, marked deduped.
+            self.assertTrue(second.get("deduped"))
+            self.assertTrue(second.get("sent"))
+            self.assertEqual(second.get("message_id"), 9999)
+            self.assertEqual(second.get("status"), "completed")
+
+    def test_inprocess_fires_for_status_change(self):
+        """A status change (e.g. ``timeout`` -> ``completed``) must
+        NOT dedup — the corrected verdict is a fresh attempt, not
+        a duplicate. The cross-call guard only short-circuits on
+        SAME-status prior deliveries."""
+        from dispatcher import notifier as notifier_mod
+        m = TaskManager()
+        task_id = self._create_running_task(m, "dsh-headless:DEDUP-3")
+        captured: Dict[str, Any] = {}
+        p1, p2, p3, p4, p5, p6 = self._patches(_fake_urlopen_ok(7777, captured))
+        with p1, p2, p3, p4, p5, p6 as mock_urlopen:
+            # First: timeout (succeeds with message_id=7777).
+            first = notifier_mod.notify_terminal_inprocess(
+                task_id, "timeout",
+            )
+            self.assertTrue(first.get("sent"))
+            self.assertEqual(first.get("message_id"), 7777)
+            self.assertEqual(mock_urlopen.call_count, 1)
+            # Status change: completed is a corrected verdict, not
+            # a duplicate — must fire again.
+            second = notifier_mod.notify_terminal_inprocess(
+                task_id, "completed",
+            )
+            self.assertTrue(second.get("sent"))
+            self.assertEqual(second.get("status"), "completed")
+            self.assertEqual(mock_urlopen.call_count, 2)
+            # No deduped marker (this was a real send).
+            self.assertNotEqual(second.get("deduped", False), True)
+
+    def test_inprocess_fires_when_prior_failed(self):
+        """If the prior attempt did NOT deliver (no ``message_id``
+        or sent=False), the inprocess must still fire on the next
+        call so the operator eventually sees a confirmed
+        ``message_id``-bearing Telegram."""
+        from dispatcher import notifier as notifier_mod
+        m = TaskManager()
+        task_id = self._create_running_task(m, "dsh-headless:DEDUP-4")
+        captured: Dict[str, Any] = {}
+        p1, p2, p3, p4, p5, p6 = self._patches(
+            _fake_urlopen_ok(5555, captured),
+        )
+        with p1, p2, p3, p4, p5, p6 as mock_urlopen:
+            # Simulate a prior failed attempt by writing a
+            # non-confirmed blob directly into task_outputs.
+            self._conn.execute(
+                "INSERT OR REPLACE INTO task_outputs (task_id, "
+                "notification_json) VALUES (?, ?)",
+                (task_id, json.dumps({
+                    "sent": False, "method": "inprocess_urllib",
+                    "message_id": None, "status": "completed",
+                    "last_error": "transport down",
+                })),
+            )
+            self._conn.commit()
+            # New call: must NOT dedup (prior was sent=False) —
+            # must actually send and capture message_id.
+            result = notifier_mod.notify_terminal_inprocess(
+                task_id, "completed",
+            )
+            self.assertTrue(result.get("sent"))
+            self.assertEqual(result.get("message_id"), 5555)
+            self.assertEqual(mock_urlopen.call_count, 1)
+
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
