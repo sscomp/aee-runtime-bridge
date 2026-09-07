@@ -2247,7 +2247,7 @@ def _persist_terminal_reconciliation(
         # because ``status`` is one of {completed, failed, timeout,
         # cancelled} which maps 1:1 to the terminal-step vocabulary.
         conn = get_conn()
-        return upsert_run(
+        upsert_run(
             conn,
             run_id=run_id,
             requested_executor=envelope.get("requested_executor"),
@@ -2275,6 +2275,69 @@ def _persist_terminal_reconciliation(
             current_step=status,
             phase="terminal",
         )
+        # Async lifecycle mirror (hermes reaper fix 2026-09-08):
+        # terminal reconciliation used to update ONLY executor_runs,
+        # so the dispatcher task stayed non-terminal until the
+        # reaper false-timed it out (tasks=timeout while
+        # executor_runs=completed). The persisted ``task_id`` on the
+        # executor_runs row is the join key: drive the dispatcher
+        # task to the same terminal verdict via the existing
+        # manager transitions (running -> terminal is always legal;
+        # the IllegalTransition catch covers a watcher/reaper race
+        # that already terminalised the row first).
+        _mapped_task_id = envelope.get("task_id")
+        if _mapped_task_id:
+            try:
+                from dispatcher.manager import TaskManager as _TM_hermes_term
+                _tm_hermes_term = _TM_hermes_term()
+                if status == "completed":
+                    try:
+                        _tm_hermes_term.complete(
+                            _mapped_task_id,
+                            output_text=envelope.get("stdout_summary")
+                            or None,
+                        )
+                    except Exception:
+                        _tm_hermes_term.reconcile_executor_completion(
+                            _mapped_task_id,
+                            run_id=run_id,
+                            status="completed",
+                            output_text=envelope.get("stdout_summary")
+                            or None,
+                        )
+                elif status in ("failed", "timeout", "cancelled"):
+                    try:
+                        _tm_hermes_term.fail(
+                            _mapped_task_id,
+                            str(error if error is not None
+                                else envelope.get("error")
+                                or f"hermes run {status}"),
+                        )
+                    except Exception:
+                        _tm_hermes_term.reconcile_executor_completion(
+                            _mapped_task_id,
+                            run_id=run_id,
+                            status="failed",
+                            error_message=str(
+                                error if error is not None
+                                else envelope.get("error")
+                                or f"hermes run {status}"
+                            ),
+                        )
+            except Exception as exc:  # pragma: no cover - defensive
+                import sys
+                print(
+                    f"[reconcile] task-side terminal mirror failed for "
+                    f"task_id={_mapped_task_id!r} run_id={run_id!r}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+        # Re-read the persisted envelope so callers (GET /runs/{run_id}
+        # and the ExecutorRunWatcher tick) keep receiving the same
+        # canonical ``upsert_run`` return shape as before the fix.
+        from dispatcher.executor_runs import get_run as _get_run_row
+        _persisted = _get_run_row(conn, run_id)
+        return _persisted if _persisted is not None else envelope
     except Exception as exc:  # pragma: no cover - defensive
         import sys
         print(
@@ -3213,7 +3276,58 @@ async def create_executor_run(
             runtime_identity=runtime_identity,
         )
         _persist_executor_run(envelope)
+        # Async lifecycle mirror (hermes reaper fix 2026-09-08): the
+        # submit failed before any run_id existed, so there is no
+        # upstream to poll. Converge the dispatcher task to the same
+        # terminal ``failed`` verdict via the existing
+        # ``reconcile_executor_completion`` helper (the same helper the
+        # claude-code-cli branch uses) instead of leaving the row in
+        # ``queued`` for the reaper to false-timeout later. run_id=None
+        # keeps the placeholder-free contract (no upstream id to stamp).
+        if executor_task_id:
+            try:
+                from dispatcher.manager import (
+                    TaskManager as _TM_hermes_fail,
+                )
+                _TM_hermes_fail().reconcile_executor_completion(
+                    executor_task_id,
+                    status="failed",
+                    error_message=f"hermes submit error: {exc}",
+                    exit_code=1,
+                )
+            except Exception as _fail_exc:  # pragma: no cover - defensive
+                import sys as _sys
+                print(
+                    f"[executor_run_lifecycle] hermes reconcile failed for "
+                    f"task_id={executor_task_id!r}: "
+                    f"{type(_fail_exc).__name__}: {_fail_exc}",
+                    file=_sys.stderr,
+                )
         return envelope
+    # Async lifecycle mirror (hermes reaper fix 2026-09-08): the task
+    # row was created in ``queued`` and never advanced, so the reaper's
+    # ``stale_queued_sec=300`` check reaped healthy async runs
+    # (tasks=timeout while executor_runs=running). Mirror the
+    # claude-code-cli / dsh-headless branches: as soon as the upstream
+    # run_id is known, stamp it onto the task and transition
+    # queued -> running via the same ``manager.start()`` used by the
+    # ``POST /runs`` Hermes dispatch path. Best-effort, same contract
+    # as the sibling branches: a lifecycle failure is logged and
+    # swallowed so the dispatch still returns the evidence envelope.
+    if executor_task_id and submit_result.external_run_id:
+        try:
+            from dispatcher.manager import TaskManager as _TM_hermes_lifecycle
+            _TM_hermes_lifecycle().start(
+                executor_task_id, submit_result.external_run_id,
+            )
+        except Exception as _lifecycle_exc:  # pragma: no cover - defensive
+            import sys as _sys
+            print(
+                f"[executor_run_lifecycle] hermes manager.start failed for "
+                f"task_id={executor_task_id!r}: "
+                f"{type(_lifecycle_exc).__name__}: {_lifecycle_exc}",
+                file=_sys.stderr,
+            )
     runtime_identity = collect_runtime_identity(
         selected_executor=selected, cfg=cfg
     )

@@ -118,11 +118,11 @@ def _last_progress_ts(manager: TaskManager, task_id: str) -> Optional[float]:
 
 def _executor_owns_queued_task(manager: TaskManager, task_id: str) -> bool:
     """Return True iff ``task_id`` has a non-terminal ``executor_runs``
-    row owned by a non-Hermes executor.
+    row owned by a non-Hermes executor, OR a non-terminal row of any
+    executor whose ``last_heartbeat_at`` is fresh.
 
     The dispatcher reaper skips queued tasks under this condition
-    because the executor path (``POST /runs/executor`` with
-    ``executor=dsh-headless`` or ``executor=claude-code-cli``) is the
+    because the executor path (``POST /runs/executor``) is the
     sole authority for the task's terminal transition. Reaping the
     task before the executor has finished races against the
     executor's own ``manager.complete()`` / ``manager.fail()`` /
@@ -130,6 +130,21 @@ def _executor_owns_queued_task(manager: TaskManager, task_id: str) -> bool:
     TASK-20260825-0027 symptom (a healthy run reported as
     ``timeout`` because task-side metadata lagged executor-side
     progress).
+
+    Hermes reaper fix (2026-09-08): the executor-owned skip used to
+    be limited to non-Hermes executors, so an async Hermes run whose
+    tasks row legitimately sat in ``queued`` (metadata lag on the
+    POST /runs/executor path) was false-timed-out by
+    ``stale_queued_sec`` while ``executor_runs`` showed a healthy
+    non-terminal run. Generalisation: skip ANY executor-owned queued
+    task whose latest ``executor_runs`` row is non-terminal AND whose
+    ``last_heartbeat_at`` is fresh (within ``stale_queued_sec``).
+    Non-Hermes executors keep the unconditional skip (their runners
+    heartbeat via update_heartbeat, but they are synchronous anyway);
+    for Hermes rows the heartbeat must be fresh — a stale/NULL
+    heartbeat keeps the legacy queued-age reap as the fallback for a
+    genuinely dead upstream. ``last_heartbeat_at`` is stamped by
+    ``_persist_executor_run`` at dispatch and by the live poll loop.
 
     Bounded: one SELECT against ``executor_runs`` keyed by
     ``task_id``. Returns False on any DB error (fail-safe: the
@@ -141,7 +156,8 @@ def _executor_owns_queued_task(manager: TaskManager, task_id: str) -> bool:
         from dispatcher.db import get_conn
         conn = get_conn()
         row = conn.execute(
-            "SELECT selected_executor, status FROM executor_runs "
+            "SELECT selected_executor, status, last_heartbeat_at "
+            "FROM executor_runs "
             "WHERE task_id = ? "
             "ORDER BY created_at DESC LIMIT 1",
             (task_id,),
@@ -158,7 +174,45 @@ def _executor_owns_queued_task(manager: TaskManager, task_id: str) -> bool:
     # reaper should NOT skip it; the queued-age reap still applies.
     if status in {"completed", "failed", "timeout", "cancelled"}:
         return False
-    return is_non_hermes_executor(selected)
+    if is_non_hermes_executor(selected):
+        return True
+    # Heartbeat-fresh guard for async executors (hermes): the row is
+    # non-terminal and the executor is still reporting progress, so
+    # the task is owned by the executor path and must not be reaped
+    # merely because the tasks row has not advanced yet.
+    if selected == "hermes":
+        from datetime import datetime
+        hb = row["last_heartbeat_at"]
+        if not hb:
+            return False
+        try:
+            hb_ts = datetime.fromisoformat(
+                str(hb).replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:  # noqa: BLE001 — malformed ts: legacy reap applies
+            return False
+        age = time.time() - hb_ts
+        try:
+            max_age = float(cfg_stale_queued_sec())
+        except Exception:  # noqa: BLE001 — config unreadable: use the default
+            max_age = 300.0
+        return age <= max_age
+    return False
+
+
+def cfg_stale_queued_sec() -> int:
+    """Read the live ``stale_queued_sec`` reaper threshold.
+
+    Small helper so the heartbeat-fresh guard and the reaper share one
+    source of truth (``config/reaper.json``) without re-loading the
+    whole config in the scan loop. Falls back to the reaper default
+    (300) on any read error.
+    """
+    try:
+        from config import load as _load
+        return int(_load("reaper").get("stale_queued_sec", 300))
+    except Exception:  # noqa: BLE001
+        return 300
 
 
 def reap_once(manager: TaskManager, cfg: ReaperConfig) -> ReapResult:

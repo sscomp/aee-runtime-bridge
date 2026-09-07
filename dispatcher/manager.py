@@ -1323,10 +1323,26 @@ class TaskManager:
                 return
             run_id = trow["hermes_run_id"] or trow["external_run_id"]
             if not run_id:
-                # No upstream run id — this task was never dispatched
-                # to a runtime that produces a run_id (e.g. a
-                # rejected/synthetic task). Nothing to sync.
-                return
+                # Hermes reaper fix (2026-09-08): the lookup used to
+                # return here, so a task whose ``hermes_run_id`` was
+                # NULL at terminal time (e.g. the placeholder stamped by
+                # start() was never overwritten, or the executor branch
+                # failed before stamping) never synced its terminal
+                # status into ``executor_runs`` — leaving the permanent
+                # tasks=timeout / executor_runs=running divergence.
+                # ``executor_runs.task_id`` is the durable join key
+                # stamped by the dispatch path, so fall back to it.
+                _fb = conn.execute(
+                    "SELECT run_id FROM executor_runs WHERE task_id = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if _fb is None or not _fb["run_id"]:
+                    # No upstream run id anywhere — this task was never
+                    # dispatched to a runtime that produces a run_id
+                    # (e.g. a rejected/synthetic task). Nothing to sync.
+                    return
+                run_id = _fb["run_id"]
             # TASK-20260825-0027 lifecycle identity fix (2026-08-25):
             # the previous fallback ``trow["adapter_name"] or "hermes"``
             # silently downgraded a DSH-owned task to ``selected_executor
