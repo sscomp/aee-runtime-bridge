@@ -95,6 +95,21 @@ That matrix was **moved** (not copied) from AEE-MINI per §21.9 and is now
 the canonical copy; the AEE-MINI frozen archive copy stays on disk
 untouched as the archive reference.
 
+## Claude Code Executor & external Anthropic-compatible providers
+
+**Service execution does NOT reliably inherit environment variables that
+exist only in your interactive shell** (e.g. `~/.bashrc` exports placed
+after the non-interactive early-return) — provider credentials for the
+`claude-code-cli` executor must live in the service's environment file and
+require a bridge restart to take effect.
+
+For the architecture, required environment variables
+(`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, the
+default-model trio, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`), secret-storage
+rules, an Ollama Cloud example (placeholders only), the non-fatal custom
+model-catalog warning, and the full troubleshooting matrix, see
+[`docs/CLAUDE_CODE_EXECUTOR.md`](docs/CLAUDE_CODE_EXECUTOR.md).
+
 ## Endpoints
 
 | Method | Path | Auth | Purpose |
@@ -497,6 +512,7 @@ Additional in-repo documentation:
 
 | Path | Category |
 |---|---|
+| [`docs/CLAUDE_CODE_EXECUTOR.md`](docs/CLAUDE_CODE_EXECUTOR.md) | Claude Code executor / external Anthropic-compatible providers (incl. Ollama Cloud) |
 | [`docs/HERMES_ADAPTER_CONTRACT_MATRIX.md`](docs/HERMES_ADAPTER_CONTRACT_MATRIX.md) | Adapter contract |
 | [`docs/MIGRATION_FROM_AEE_MINI.md`](docs/MIGRATION_FROM_AEE_MINI.md) | Migration guide (AEE-MINI → unified) |
 | [`docs/AEE_RUNTIME_INTEGRATION_GUIDE.md`](docs/AEE_RUNTIME_INTEGRATION_GUIDE.md) | Integration guide (AEE-4 Part B freeze) |
