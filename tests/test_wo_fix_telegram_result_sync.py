@@ -380,6 +380,13 @@ def test_get_run_returns_confirmed_telegram_after_reconcile(monkeypatch, tmp_pat
                 "ts_taipei": "2026-07-24T02:00:00+08:00",
                 "attempts": 1,
                 "last_error": None,
+                # TASK-20260908-0007: real persisted blobs carry the
+                # terminal ``status`` (stamped by _notify_terminal); the
+                # cross-call dedup guards match on it, so the synthetic
+                # blob must carry it too or the watcher-side reconcile
+                # (TASK-0006 T3) legitimately re-fires the gate and
+                # overwrites this confirmed record.
+                "status": "completed",
             })
             # Insert a task_outputs row with the notification blob
             # AND a non-empty output_text so _collect_task_evidence

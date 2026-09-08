@@ -69,6 +69,44 @@ log = logging.getLogger("dispatcher.notifier")
 ENFORCEMENT_GATE_VERSION = "v3.0.0"
 
 # ---------------------------------------------------------------------------
+# Shared fail-closed suppression boundary (TASK-20260908-0008)
+# ---------------------------------------------------------------------------
+# The notifier's send entry points consult the ONE shared suppression
+# gate in ``aee._notification_guard`` so test/verification contexts
+# cannot live-send even when they call the notifier directly (bypassing
+# ``TaskManager._notify_terminal``). Production keeps its normal
+# behavior: the gate only suppresses while the production authorization
+# sentinel (``AEE_NOTIFICATIONS_PRODUCTION``) is absent.
+from aee import _notification_guard as _notif_guard
+
+
+def _suppressed_result(
+    method: str, task_id: Optional[str], status: Optional[str]
+) -> Dict[str, Any]:
+    """Structured result dict + self-audit row for a suppressed send
+    (TASK-20260908-0008). Mirrors the normal gate result shape so
+    callers can persist it unchanged; the attempt is recorded to the
+    process-local suppression sink, never the live audit."""
+    result = {
+        "sent": False,
+        "method": method,
+        "status": status,
+        "recipient": None,
+        "message_id": None,
+        "ts_utc": _now_iso_utc(),
+        "ts_taipei": _now_iso_taipei(),
+        "attempts": 0,
+        "last_error": "suppressed: shared notification guard active",
+        "suppressed_by": "aee._notification_guard",
+    }
+    _notif_guard.record_suppressed_send("notifier." + method, {
+        "task_id": task_id,
+        "status": status,
+        "method": method,
+    })
+    return result
+
+# ---------------------------------------------------------------------------
 # Rate limiting (sliding window, in-memory; reset on bridge restart)
 # ---------------------------------------------------------------------------
 _SEND_HISTORY: Deque[float] = deque(maxlen=200)
@@ -165,6 +203,11 @@ def _telegram_config() -> dict:
 
 
 def _send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
+    # Shared suppression gate (TASK-20260908-0008): fail-closed in
+    # test/verification contexts regardless of credentials present.
+    if _notif_guard.notifications_disabled():
+        _suppressed_result("inprocess_urllib", None, None)
+        return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = urllib.parse.urlencode({
         "chat_id": chat_id,
@@ -439,6 +482,10 @@ def notify_terminal_hermes_gateway(
     """
     ts_utc = _now_iso_utc()
     ts_taipei = _now_iso_taipei()
+    # Shared suppression gate (TASK-20260908-0008): fail-closed before
+    # any subprocess (``hermes send``) is spawned.
+    if _notif_guard.notifications_disabled():
+        return _suppressed_result("hermes_send", task_id, status)
     resolved_chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "").strip() or None
     if not resolved_chat_id:
         return {
@@ -1038,6 +1085,12 @@ def notify_terminal_inprocess(
     """
     ts_utc = _now_iso_utc()
     ts_taipei = _now_iso_taipei()
+    # Shared suppression gate (TASK-20260908-0008): fail-closed before
+    # any urllib transport / subprocess work. This closes the direct
+    # notifier call path (bypassing TaskManager._notify_terminal) that
+    # the B1b semantic smoke incident (mids 3073-3077) proved open.
+    if _notif_guard.notifications_disabled():
+        return _suppressed_result("inprocess_urllib", task_id, status)
     # Cross-call dedup guard (TASK-20260825-0010). When
     # ``TaskManager._notify_terminal`` is re-entered for the same
     # ``(task_id, status)`` (e.g. after a blocking-gate revert, a

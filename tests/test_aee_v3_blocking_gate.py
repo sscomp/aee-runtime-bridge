@@ -38,6 +38,17 @@ Run:
     python3 -m unittest tests.test_aee_v3_blocking_gate -v
 """
 from __future__ import annotations
+# TASK-20260908-0008: these tests deliberately exercise the notification
+# gate's OPEN path with their own subprocess/transport mocks. The shared
+# fail-closed suppression gate (conftest Layer 0) would short-circuit
+# every gate call with a suppressed result, so this module opts out via
+# the explicit per-module marker (see tests/conftest.py
+# _allow_notification_gate_switch). The mocks themselves remain the
+# live-send safety net for this module.
+import pytest  # noqa: E402
+
+pytestmark = pytest.mark.allow_notification_gate
+
 
 import json
 import os
@@ -477,9 +488,12 @@ class TestBlockingGateShadowValidation(_TempDbMixin, unittest.TestCase):
         })
         with mock.patch("subprocess.run", fake):
             m.complete(task_id, output_text="audit test")
-        # The audit log path is <bridge_root>/logs/notification_audit.jsonl.
-        from dispatcher.manager import _BRIDGE_ROOT
-        audit_path = _BRIDGE_ROOT / "logs" / "notification_audit.jsonl"
+        # The audit log path (TASK-20260908-0007): the pytest session
+        # redirects notifier audit writes to a session sink, so assert
+        # against that path (falls back to the live path when no
+        # redirect is installed).
+        from tests.conftest import session_notification_audit_path
+        audit_path = session_notification_audit_path()
         self.assertTrue(audit_path.exists(), "audit log must be created")
         content = audit_path.read_text(encoding="utf-8").strip().splitlines()
         # The last line should be our audit record.

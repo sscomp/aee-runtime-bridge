@@ -31,10 +31,21 @@ messages, do NOT depend on the Hermes CLI, and do NOT interfere with
 the read-only run TASK-20260825-0008.
 
 Run:
-    cd /home/box/aee-runtime-bridge && \
+    cd /home/sscomp/aee-runtime-bridge && \
     .venv/bin/python -m pytest tests/test_dsh_telegram_terminal_notify.py -v
 """
 from __future__ import annotations
+# TASK-20260908-0008: these tests deliberately exercise the notification
+# gate's OPEN path with their own subprocess/transport mocks. The shared
+# fail-closed suppression gate (conftest Layer 0) would short-circuit
+# every gate call with a suppressed result, so this module opts out via
+# the explicit per-module marker (see tests/conftest.py
+# _allow_notification_gate_switch). The mocks themselves remain the
+# live-send safety net for this module.
+import pytest  # noqa: E402
+
+pytestmark = pytest.mark.allow_notification_gate
+
 
 import json
 import os

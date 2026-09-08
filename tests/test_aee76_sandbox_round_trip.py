@@ -25,6 +25,14 @@ that:
    comparison).
 5. The sandbox is hermetic on cleanup: the tempdir is
    removed and the child process is killed.
+6. The sandbox child runs with the SANITIZED environment
+   (TASK-20260908-0007): real Telegram credentials from
+   ``os.environ`` / the repo ``.env`` are replaced with dummies
+   (``tests._env_guard.sanitized_env``), so the child's import-time
+   ``load_dotenv()`` can never arm the notification gate with
+   production credentials. This closes the 2026-09-07 leak in which
+   a sandbox child delivered 4 real Telegram messages
+   (audit message_id 2930-2933) during a pytest run.
 
 Test isolation contract
 -----------------------
@@ -61,6 +69,16 @@ from aee.runtime_bridge_sandbox import (  # noqa: E402
     BridgeSandbox,
     bridge_sandbox,
 )
+
+# TASK-20260908-0007: every sandbox child MUST be spawned with the
+# sanitized environment (real Telegram credentials -> dummies). The
+# child's ``app.py`` runs ``load_dotenv()`` with the repo root as cwd;
+# with dummy values already present in the child env the .env re-load
+# cannot reintroduce real credentials (load_dotenv never overrides
+# existing variables). Conftest Layer 3 additionally enforces this at
+# the subprocess.Popen choke point; the explicit kwarg documents the
+# contract at the test level.
+from tests._env_guard import sanitized_env  # noqa: E402
 
 
 def _http_json(
@@ -119,7 +137,8 @@ class TestSandboxLifecycle(unittest.TestCase):
             self._sandbox = None
 
     def test_sandbox_starts_and_serves_health(self):
-        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20) as s:
+        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20,
+                            env=sanitized_env()) as s:
             self.assertIsInstance(s, BridgeSandbox)
             self.assertNotEqual(s.port, 8787)  # never the live port
             self.assertTrue(s.db_path.exists())
@@ -132,7 +151,8 @@ class TestSandboxLifecycle(unittest.TestCase):
             self.assertEqual(body["dispatcher"]["tasks_total"], 0)
 
     def test_sandbox_uses_fresh_db(self):
-        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20) as s:
+        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20,
+                            env=sanitized_env()) as s:
             # The sandbox DB must exist and be a fresh SQLite file
             # (no production rows). The dispatcher in the child
             # process ran the schema migrations on it.
@@ -154,7 +174,8 @@ class TestSandboxLifecycle(unittest.TestCase):
 
     def test_sandbox_does_not_touch_live_db(self):
         before = _live_db_signature()
-        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20) as s:
+        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20,
+                            env=sanitized_env()) as s:
             # Drive a /runs call to force the dispatcher to write
             # to the sandbox DB. (We don't care about the
             # response — we only care that the live DB is not
@@ -179,7 +200,8 @@ class TestSandboxLifecycle(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_sandbox_teardown_removes_tempdir(self):
-        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20) as s:
+        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20,
+                            env=sanitized_env()) as s:
             data_dir = s.data_dir
             self.assertTrue(data_dir.exists())
         # After context exit, tempdir is removed.
@@ -192,7 +214,8 @@ class TestSandboxLifecycle(unittest.TestCase):
             cleanup_bridge_sandbox,
         )
         try:
-            s = start_bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20)
+            s = start_bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20,
+                                     env=sanitized_env())
             proc = s.process
             self.assertIsNotNone(proc.pid)
             self.assertIsNone(proc.poll())  # still running
@@ -221,7 +244,8 @@ class TestHttpRoundTrip(unittest.TestCase):
         """``POST /runs`` with ``executor_session_id`` must persist
         the field on the row even if the upstream call fails.
         """
-        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20) as s:
+        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20,
+                            env=sanitized_env()) as s:
             self._sandbox = s  # for _extract_task_id_from_response fallback
             status, body = _http_json(
                 f"{s.base_url}/runs",
@@ -295,7 +319,8 @@ class TestHttpRoundTrip(unittest.TestCase):
         """A request without ``executor_session_id`` (legacy
         callers) keeps the column NULL — backward compat.
         """
-        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20) as s:
+        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20,
+                            env=sanitized_env()) as s:
             self._sandbox = s
             status, body = _http_json(
                 f"{s.base_url}/runs",
@@ -330,7 +355,8 @@ class TestHttpRoundTrip(unittest.TestCase):
         sentinel ``""`` value (mirrors the AEE-7.5 G2
         normalization at manager.create:241-242).
         """
-        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20) as s:
+        with bridge_sandbox(repo_root=ROOT, ready_timeout_sec=20,
+                            env=sanitized_env()) as s:
             self._sandbox = s
             status, body = _http_json(
                 f"{s.base_url}/runs",

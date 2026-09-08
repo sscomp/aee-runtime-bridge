@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1848,7 +1848,43 @@ class TaskManager:
         exactly once per terminal transition.
 
         Returns the gate's result dict (always non-None).
+
+        Env switch (TASK-20260908-0007/0008): when the shared
+        suppression gate (``aee._notification_guard``) is active —
+        ``AEE_BRIDGE_NOTIFICATIONS_DISABLED`` truthy or verification
+        mode armed, and no production sentinel — the ENTIRE gate is
+        skipped and a suppressed result is returned without any
+        subprocess / network / audit side effect. Production default is
+        unset/``false`` (gate behaves exactly as before); the AEE-7.6
+        sandbox sets it so spawned test bridges stay completely mute —
+        dummy Telegram credentials would otherwise ARM the gate (a
+        dummy chat_id looks present) and slow terminal paths down with
+        doomed hermes/Telegram round-trips.
+
+        The runtime import is lazy (inside this method) because
+        ``aee._notification_guard`` is the shared suppression boundary
+        and must not create a circular import with ``dispatcher``.
         """
+        # TASK-20260908-0008: lazy runtime import (no circular import —
+        # aee._notification_guard never imports dispatcher).
+        from aee import _notification_guard as _notif_guard  # noqa: PLC0415
+        if _notif_guard.notifications_disabled():
+            return {
+                "sent": False,
+                "method": "notifications_disabled",
+                "status": status,
+                "recipient": None,
+                "message_id": None,
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+                "ts_taipei": datetime.now(
+                    timezone(timedelta(hours=8))
+                ).isoformat(),
+                "attempts": 0,
+                "last_error": (
+                    "suppressed: AEE_BRIDGE_NOTIFICATIONS_DISABLED "
+                    "(test sandbox env)"
+                ),
+            }
         # Cross-call dedup guard (TASK-20260825-0010). The reconcile
         # path (``reconcile_executor_completion``) has its own prior
         # guard, but the direct terminal methods (``complete`` /

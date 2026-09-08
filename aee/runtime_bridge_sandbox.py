@@ -159,6 +159,7 @@ def start_bridge_sandbox(
     api_key: Optional[str] = None,
     port: Optional[int] = None,
     ready_timeout_sec: float = 30.0,
+    env: Optional[dict] = None,
 ) -> BridgeSandbox:
     """Start a fresh uvicorn bridge process on a sandbox port + temp DB.
 
@@ -166,7 +167,7 @@ def start_bridge_sandbox(
     ----------
     repo_root
         Absolute path to ``hermes-runtime-bridge`` (the repo root
-        with ``app.py`` and the ``.venv``).
+        with ``.venv``).
     api_key
         The ``Bearer`` key the sandbox will accept. Defaults to a
         random 16-char value. The caller uses this value to
@@ -178,6 +179,18 @@ def start_bridge_sandbox(
         Max seconds to wait for ``/health`` to return 200. The
         process is killed (SIGTERM then SIGKILL) if it doesn't
         come up in time.
+    env
+        Optional BASE environment for the child (TASK-20260908-0007).
+        When provided (e.g. ``tests._env_guard.sanitized_env()``), the
+        sandbox overlays its bridge-specific values on top of this
+        base instead of building a whitelist from scratch. Passing the
+        sanitized env guarantees the child cannot arm its Telegram
+        notification gate: ``app.py``'s import-time ``load_dotenv()``
+        never overrides variables that are already set in the
+        environment, so the dummy ``TELEGRAM_BOT_TOKEN`` /
+        ``TELEGRAM_CHAT_ID`` / ``BRIDGE_API_KEY`` from the base win
+        over the repo ``.env``. When omitted, the child env is built
+        exactly as before (whitelist).
 
     Returns
     -------
@@ -216,6 +229,7 @@ def start_bridge_sandbox(
         log_dir=log_dir,
         reports_dir=reports_dir,
         api_key=chosen_key,
+        base_env=env,
     )
 
     # Start the uvicorn process. We use a fresh python invocation
@@ -312,16 +326,21 @@ def bridge_sandbox(
     api_key: Optional[str] = None,
     port: Optional[int] = None,
     ready_timeout_sec: float = 30.0,
+    env: Optional[dict] = None,
 ) -> Generator[BridgeSandbox, None, None]:
     """Context manager wrapping :func:`start_bridge_sandbox` +
     :func:`cleanup_bridge_sandbox`. The sandbox is always
     cleaned up on exit, even if the body raises.
+
+    ``env`` (optional base env, e.g. ``tests._env_guard.sanitized_env()``)
+    is forwarded to :func:`start_bridge_sandbox` unchanged.
     """
     sandbox = start_bridge_sandbox(
         repo_root=repo_root,
         api_key=api_key,
         port=port,
         ready_timeout_sec=ready_timeout_sec,
+        env=env,
     )
     try:
         yield sandbox
@@ -351,17 +370,20 @@ def _build_sandbox_env(
     log_dir: Path,
     reports_dir: Path,
     api_key: str,
+    base_env: Optional[dict] = None,
 ) -> dict:
     """Build a hermetic child env.
 
-    The strategy is to start from a sanitized copy of os.environ,
-    then OVERWRITE the bridge-relevant keys. Anything that
-    could affect the dispatcher's behavior (DB path, API key,
-    runtime config, log directory) is set to the sandbox value.
-    We deliberately preserve PATH and HOME so the venv
-    python can find its site-packages.
+    The strategy is to start from ``base_env`` when given (tests pass
+    ``tests._env_guard.sanitized_env()`` so real Telegram credentials
+    are already replaced by dummies — see TASK-20260908-0007), or from
+    ``os.environ`` when no base is supplied, then OVERWRITE the
+    bridge-relevant keys. Anything that could affect the dispatcher's
+    behavior (DB path, API key, runtime config, log directory) is set
+    to the sandbox value.
     """
-    env = {
+    env = dict(os.environ if base_env is None else base_env)
+    env.update({
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
@@ -403,7 +425,25 @@ def _build_sandbox_env(
         # The repo root on PYTHONPATH so ``app`` imports as a
         # top-level module.
         "PYTHONPATH": str(repo_root),
-    }
+        # Silence the child's Telegram notification gate entirely
+        # (TASK-20260908-0007): dummy credentials would otherwise ARM
+        # the gate (a dummy chat_id looks present) and every terminal
+        # transition in the sandbox would burn seconds on doomed
+        # ``hermes send`` / api.telegram.org round-trips. Production
+        # default is unset — this key is sandbox-only.
+        #
+        # TASK-20260908-0008: credentials are sanitized via the shared
+        # guard (real values replaced, never copied) and the disable
+        # sentinel is enforced as a floor — even if a future base env
+        # forgets it or flips it off, the sandbox child stays mute.
+        # Production sentinel is never propagated to a child.
+        })
+    # Shared guard (TASK-20260908-0008): overlay the credential dummies
+    # + notification-disabled sentinel on top of the built env. Applied
+    # AFTER the update block so the sentinel cannot be unset by any
+    # base_env value.
+    from aee import _notification_guard as _notif_guard  # noqa: PLC0415
+    env = _notif_guard.sanitized_child_env(env)
     return env
 
 

@@ -224,8 +224,10 @@ class TestNotifier(unittest.TestCase):
         from dispatcher.notifier import _append_local_log
         line = '{"event":"test"}'
         _append_local_log(line)
-        from dispatcher.manager import _BRIDGE_ROOT
-        log_path = _BRIDGE_ROOT / "logs" / "notifier.log"
+        # TASK-20260908-0007: the pytest session redirects notifier
+        # local-log writes to a session sink.
+        from tests.conftest import session_notifier_log_path
+        log_path = session_notifier_log_path()
         self.assertTrue(log_path.exists())
         self.assertIn(line, log_path.read_text(encoding="utf-8"))
 

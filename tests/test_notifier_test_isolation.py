@@ -217,9 +217,17 @@ def test_guard_catches_unmocked_notifier_subprocess(tmp_path):
         assert result["message_id"] is None, (
             f"Guard should have prevented message_id, got: {result}"
         )
-        # The last_error should contain evidence the guard fired.
+        # The last_error should contain evidence a guard fired. With
+        # TASK-20260908-0008 the shared suppression gate (conftest
+        # Layer 0) short-circuits before the subprocess sentinel, so the
+        # suppressed result text is the expected evidence; the argv
+        # sentinel's BLOCKED text remains valid for gate-opt-out runs.
         last_error = result.get("last_error", "")
-        assert "hermes send" in last_error or "BLOCKED" in last_error, (
+        assert (
+            "hermes send" in last_error
+            or "BLOCKED" in last_error
+            or "shared notification guard" in last_error
+        ), (
             f"last_error should mention the guard blocked 'hermes send', "
             f"got: {last_error!r}"
         )
