@@ -105,12 +105,18 @@ def main() -> int:
 
             m = TaskManager()
             results = {}
-            for method, status in (
-                ("timeout", "timeout"),
-                ("cancel", "cancelled"),
+            for method, kwargs, status in (
+                ("timeout",
+                 # TaskManager.timeout REQUIRES a reason kwarg
+                 # (dispatcher/manager.py signature). Use the reaper's
+                 # own semantics so the recorded reason matches the
+                 # real timeout path.
+                 {"reason": "smoke: no progress, reaper timeout"},
+                 "timeout"),
+                ("cancel", {}, "cancelled"),
             ):
                 try:
-                    getattr(m, method)("T-A")
+                    getattr(m, method)("T-A", **kwargs)
                     results[method] = "transitioned"
                 except Exception as exc:  # noqa: BLE001
                     # Illegal-transition on the second call is expected

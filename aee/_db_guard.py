@@ -490,6 +490,20 @@ def install_unlink_guard() -> None:
         _UNLINK_GUARD_STATE["installed"] = True
 
 
+def unlink_guard_installed() -> bool:
+    """True once :func:`install_unlink_guard` has wrapped the unlink
+    callables in THIS process (idempotent-install proof surface).
+
+    Runners and smokes must print/assert THIS value — never a hardcoded
+    ``True`` — so an un-armed wrapper surfaces instead of being
+    reported as armed. pytest's conftest Layer 0 and
+    ``scripts/a2_runner.py`` both install through the same entry point,
+    so both report through this same truth.
+    """
+    with _lock:
+        return bool(_UNLINK_GUARD_STATE["installed"])
+
+
 def dispatcher_db_is_production_bound() -> bool:
     """True iff ``dispatcher.db.DB_PATH`` currently resolves to the
     production DB identity. The pytest fail-closed gate asserts this is

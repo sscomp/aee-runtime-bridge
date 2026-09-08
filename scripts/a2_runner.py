@@ -69,10 +69,17 @@ def main(argv: list) -> int:
     from aee import _db_guard as _b4_guard
 
     _b4_guard.enter_verification_mode()
+    # The unlink wrapper is the last-ditch layer against direct
+    # os.unlink/os.remove/Path.unlink calls resolving to the
+    # production DB identity (same entry point pytest conftest Layer 0
+    # uses). The banner below prints the GUARD's own installed state —
+    # never a hardcoded True — so an un-armed wrapper can never be
+    # reported as armed.
+    _b4_guard.install_unlink_guard()
     print(
         "[a2_runner] DB guard armed "
         f"(temp_db={_b4_guard.child_db_sentinel()}, "
-        f"unlink_guard={True})",
+        f"unlink_guard={_b4_guard.unlink_guard_installed()})",
         file=sys.stderr,
     )
     print(
