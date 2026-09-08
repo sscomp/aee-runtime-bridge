@@ -50,16 +50,27 @@ def _mk(runtime_id: str = "r1", **kwargs) -> RuntimeDescriptor:
 
 
 def _reset_db() -> None:
-    p = dispatcher_db.DB_PATH
-    for ext in ("", "-wal", "-shm"):
-        f = p.with_name(p.name + ext)
-        if f.exists():
-            try:
-                f.unlink()
-            except Exception:
-                pass
+    """B4 fail-closed: reset a SANDBOX dispatcher DB, never production.
+
+    Legacy shape unlinked ``dispatcher_db.DB_PATH`` (the production
+    ``data/dispatcher.db``) — the 2026-09-07 shell-incident class. This
+    module owns a module-scoped sandbox binding (``_guard_rebind``,
+    taken at import before any test class runs) and unlinks through the
+    guarded choke point, which refuses the production identity.
+    """
+    from aee._db_guard import safe_unlink_dispatcher_db
+
+    safe_unlink_dispatcher_db(dispatcher_db.DB_PATH)
     dispatcher_db._local.conn = None  # type: ignore[attr-defined]
     dispatcher_db._initialized = False  # type: ignore[attr-defined]
+
+
+# B4: bind THIS module to its own sandbox DB before any test class's
+# setUp can call _reset_db() (see aee/_db_guard.py).
+from aee._db_guard import rebind_dispatcher_db as _b4_rebind  # noqa: E402
+
+_guard_rebind = _b4_rebind()
+_guard_rebind.__enter__()
 
 
 class TestAee5JobLifecycle(unittest.TestCase):

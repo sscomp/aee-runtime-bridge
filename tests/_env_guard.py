@@ -150,6 +150,22 @@ def sanitized_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         env[_task0008_guard.NOTIFICATIONS_DISABLED_ENV] = "true"
     except Exception:  # noqa: BLE001 — fallback to the literal name
         env["AEE_BRIDGE_NOTIFICATIONS_DISABLED"] = "true"
+    # B4 (TASK dispatcher-DB fail-closed): point any dispatcher-aware
+    # child at THIS process's isolated temp DB. A child whose
+    # ``AEE_BRIDGE_DB_PATH`` is unset would otherwise fall back to the
+    # production ``data/dispatcher.db``; the sentinel makes the child's
+    # sandbox bootstrap rebind to the parent's temp DB instead. When
+    # this process has no isolated binding (a genuinely
+    # production-context parent), no sentinel is injected — production
+    # behavior is unchanged.
+    try:
+        from aee import _db_guard as _b4_guard
+
+        sentinel = _b4_guard.child_db_sentinel()
+        if sentinel is not None:
+            env["AEE_BRIDGE_DB_PATH"] = str(sentinel)
+    except Exception:  # noqa: BLE001 — notification sanitization must not fail
+        pass
     return env
 
 

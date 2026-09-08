@@ -61,6 +61,20 @@ def main(argv: list) -> int:
     # dispatcher/notifier import in the target can read credentials.
     snap = guard.enter_verification_mode()
     guard.sanitize_os_environ()
+    # B4 (dispatcher-DB fail-closed): arm the DB guard BEFORE the target
+    # runs — a verification script's dispatcher calls can never touch
+    # the production DB, and a production-bound dispatcher module is
+    # auto-rebound to a unique temp DB (the notification contract's
+    # enter_verification_mode does not cover DB paths; this does).
+    from aee import _db_guard as _b4_guard
+
+    _b4_guard.enter_verification_mode()
+    print(
+        "[a2_runner] DB guard armed "
+        f"(temp_db={_b4_guard.child_db_sentinel()}, "
+        f"unlink_guard={True})",
+        file=sys.stderr,
+    )
     print(
         "[a2_runner] verification mode armed "
         f"(env={guard.NOTIFICATIONS_DISABLED_ENV}=true, "

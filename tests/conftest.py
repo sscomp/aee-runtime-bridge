@@ -298,6 +298,13 @@ def _register_guard_markers(config):
 
 def pytest_configure(config):
     _register_guard_markers(config)
+    config.addinivalue_line(
+        "markers",
+        "live_db_optin: explicitly allow a test to bind the dispatcher "
+        "DB to the production path (requirement-6f shape tests only; "
+        "writes/unlinks against production are still refused by "
+        "aee._db_guard.assert_not_production_db)",
+    )
 
 
 def _telegram_http_blocked(target) -> AssertionError:
@@ -375,6 +382,65 @@ def pytest_sessionstart(session):
         _task0008_guard.set_audit_sink(
             _AUDIT_SINK_DIR / "suppressed_sends.jsonl"
         )
+    # B4 Layer 0 (dispatcher-DB fail-closed): if any early import left
+    # the dispatcher module production-bound, rebind it to a unique
+    # temp DB BEFORE the first test module's module-level ``_reset_db()``
+    # executes. Also installs the guarded unlink choke point so any
+    # module-level ``os.unlink``/``Path.unlink`` against the production
+    # path raises before it can recreate the shell shape.
+    from aee import _db_guard as _b4_guard
+
+    _b4_guard.install_unlink_guard()
+    _b4_guard.apply_default_test_db_override()
+
+
+def pytest_collection(session=None):
+    """B4 Layer 1: the dispatcher module must NOT be production-bound
+    at collection time — the fail-closed gate.
+
+    Module-level ``_reset_db()`` code in legacy test modules (the
+    2026-09-07 shell-incident class) executes at IMPORT, i.e. during
+    collection. A production binding surviving into collection would
+    let that code unlink + recreate the production DB, so the session
+    fails closed instead of proceeding with the hazard present.
+
+    A module that genuinely needs the production path opts in with
+    ``@pytest.mark.live_db_optin`` on its test classes (the binding is
+    still write-protected by the unlink guard / safe_unlink).
+    """
+    from aee import _db_guard as _b4_guard
+
+    if _b4_guard.dispatcher_db_is_production_bound():
+        raise pytest.UsageError(
+            "FAIL-CLOSED: dispatcher.db.DB_PATH resolves to the production "
+            "data/dispatcher.db in a pytest process. This is the 2026-09-07 "
+            "shell-incident precondition (module-level _reset_db() would "
+            "unlink/recreate production). Tests must use a temp/sandbox DB "
+            "(tests/_executor_test_helpers.setup_temp_db or "
+            "aee._db_guard.apply_default_test_db_override). A module that "
+            "genuinely needs the production path opts in with "
+            "@pytest.mark.live_db_optin."
+        )
+    return None
+
+
+def pytest_collection_finish(session):
+    """B4 Layer 2: same invariant re-asserted AFTER collection.
+
+    Catches a module that re-imported and re-bound the dispatcher
+    module to production during collection (after the first-touch
+    rebind and the pre-collection gate ran).
+    """
+    from aee import _db_guard as _b4_guard
+
+    if _b4_guard.dispatcher_db_is_production_bound():
+        raise pytest.UsageError(
+            "FAIL-CLOSED (post-collection): dispatcher.db.DB_PATH resolves "
+            "to the production data/dispatcher.db after test-module "
+            "collection. The offending module re-bound the dispatcher to "
+            "production; see aee/_db_guard.py for the guarded rebind "
+            "entry points."
+        )
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -383,6 +449,15 @@ def pytest_sessionfinish(session, exitstatus):
 
     _task0008_guard.exit_verification_mode()
     env_guard.restore_os_environ()
+    # B4: remove the temp DB dirs this session allocated. Never touches
+    # the production path (the tempdirs were created under /tmp by
+    # aee._db_guard.allocate_temp_db_path).
+    try:
+        from aee import _db_guard as _b4_guard
+
+        _b4_guard.cleanup_temp_dbs()
+    except Exception:  # noqa: BLE001 — teardown must never raise
+        pass
 
 
 # ---------------------------------------------------------------------------

@@ -33,12 +33,37 @@ def _patch_module_db_path() -> None:
     the module-level constant. ``dispatcher.db.get_conn()``
     reads ``DB_PATH`` lazily on first call, so this is enough
     to redirect all subsequent DB I/O to the sandbox.
+
+    B4 fail-closed hardening (TASK dispatcher-DB shell incident): the
+    bootstrap now REFUSES to rebind the child's dispatcher module to
+    the production DB identity. The sandbox env builder hands the
+    child a sandbox tempdir path; a rebind attempt whose target
+    resolves to the production ``data/dispatcher.db`` identity
+    (realpath / device / inode) means a caller smuggled the production
+    path into the sandbox env, and the correct behavior is to fail
+    loudly rather than open the live production DB in a child process.
     """
     sandbox_db = os.environ.get("AEE_BRIDGE_DB_PATH")
     if not sandbox_db:
         return
     from dispatcher import db as dispatcher_db
+    from aee._db_guard import ProductionDBWriteAttemptError, assert_not_production_db
+
     new_path = Path(sandbox_db)
+    try:
+        assert_not_production_db(
+            new_path, operation="sandbox child DB rebind"
+        )
+    except ProductionDBWriteAttemptError:
+        import sys
+
+        print(
+            "[sandbox_bootstrap] REFUSED: AEE_BRIDGE_DB_PATH resolves to "
+            "the production dispatcher DB; child would touch production. "
+            "Aborting the sandbox child instead.",
+            file=sys.stderr,
+        )
+        raise
     new_dir = new_path.parent
     new_dir.mkdir(parents=True, exist_ok=True)
     dispatcher_db.DB_DIR = new_dir

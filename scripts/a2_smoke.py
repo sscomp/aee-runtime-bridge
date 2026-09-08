@@ -71,6 +71,18 @@ def main() -> int:
         sink = audit_sink_file()
         print(f"[a2_smoke] suppression armed; sink={sink}")
 
+        # B4: arm the dispatcher-DB fail-closed guard BEFORE any
+        # dispatcher import inside this smoke — production DB paths are
+        # refused and a production-bound module is auto-rebound to a
+        # unique temp DB.
+        from aee import _db_guard as _b4_guard
+
+        _b4_guard.enter_verification_mode()
+        assert not _b4_guard.dispatcher_db_is_production_bound(), (
+            "a2_smoke: dispatcher module must not be production-bound "
+            "under the B4 guard"
+        )
+
         from tests._live_db_guard import (
             make_temp_dispatcher_db,
             point_module_to_temp_db,
