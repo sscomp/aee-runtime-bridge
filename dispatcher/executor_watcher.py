@@ -176,8 +176,30 @@ class ExecutorRunWatcher:
             run_id = row.get("run_id")
             if not run_id:
                 continue
+            # B1b liveness heartbeat (2026-09-08): the dispatch path
+            # stamps ``last_heartbeat_at`` exactly once at
+            # ``POST /runs/executor`` / hermes mapping time, and
+            # neither the GET reconcile path nor this watcher
+            # advanced it while a run stayed non-terminal — so the
+            # reaper's ``_last_progress_ts`` saw a frozen executor
+            # timestamp and a long-running Hermes task emitting
+            # PROGRESS events was false-reaped ("no progress for
+            # 1804s"). ``stamp_heartbeat=True`` makes the shared
+            # reconcile core stamp one canonical heartbeat AFTER a
+            # successful non-terminal poll — a poll that reports the
+            # run still alive IS the liveness evidence, and a failed
+            # poll (upstream unreachable) never stamps, so a dead
+            # upstream cannot keep a genuinely idle run alive.
+            # ``update_heartbeat`` is the existing authoritative
+            # writer with built-in safety: terminal rows are never
+            # re-heartbeated, missing rows are skipped, and only
+            # canonical lifecycle steps are accepted. ``GET /runs``
+            # (the other caller of the shared core) keeps its pure
+            # read contract — only the background watcher writes.
             try:
-                await _reconcile_hermes_run_once(run_id, row)
+                await _reconcile_hermes_run_once(
+                    run_id, row, stamp_heartbeat=True
+                )
             except Exception as exc:  # noqa: BLE001
                 # Per-row failure must not crash the tick.
                 log.warning(

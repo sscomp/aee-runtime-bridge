@@ -2069,6 +2069,8 @@ async def list_executors(
 async def _reconcile_hermes_run_once(
     run_id: str,
     persisted: Dict[str, Any],
+    *,
+    stamp_heartbeat: bool = False,
 ) -> Dict[str, Any]:
     """Bounded reconciliation: poll upstream Hermes once for a non-terminal run.
 
@@ -2149,6 +2151,32 @@ async def _reconcile_hermes_run_once(
     if poll_result is None:
         return persisted
     if not poll_result.is_terminal:
+        # B1b liveness heartbeat (2026-09-08): a successful poll that
+        # reports the run still in flight IS the upstream liveness
+        # evidence. Callers that opt in (the background
+        # ExecutorRunWatcher — the only caller allowed to write;
+        # ``GET /runs`` stays a pure read per the P1.1 contract) get
+        # the canonical ``update_heartbeat`` writer to advance
+        # ``last_heartbeat_at`` so the dispatcher reaper's freshness
+        # clock consumes real liveness instead of a dispatch-time
+        # stamp frozen at row creation. A poll that fails (upstream
+        # unreachable) never reaches this line, so a dead upstream
+        # cannot keep a genuinely idle run alive forever. Terminal
+        # rows are handled by ``_persist_terminal_reconciliation``
+        # below and are never re-heartbeated (``update_heartbeat``
+        # refuses them).
+        if stamp_heartbeat:
+            try:
+                from dispatcher.db import get_conn as _hb_conn
+                from dispatcher.executor_runs import update_heartbeat
+                update_heartbeat(
+                    _hb_conn(),
+                    run_id=run_id,
+                    current_step="running",
+                    phase="running",
+                )
+            except Exception:  # noqa: BLE001 — best-effort stamp
+                pass
         return persisted
 
     # Translate the poll result into the persisted envelope.  Hermes'

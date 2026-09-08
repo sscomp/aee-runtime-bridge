@@ -10,10 +10,20 @@ separate from the watcher makes it unit-testable without HTTP.
 Heuristics
 ----------
 * `stale_running_sec` (default 1800s = 30 min): an in-flight `running`
-  or `waiting` task whose *last* `progress` event is older than this
+  or `waiting` task whose *last* meaningful activity is older than this
   is reaped. Rationale: if Hermes is still chugging, the watcher
   updates progress every 2s; if no progress has been written for
   30 minutes, the task is effectively dead.
+
+  B1b freshness fix (2026-09-08): "last meaningful activity" is the
+  max over the authoritative sources consumed by
+  ``_last_progress_ts`` — the worker heartbeat, the newest
+  ``task_events`` PROGRESS event, and (for non-terminal rows) the
+  latest ``executor_runs`` heartbeat. Previously the first non-null
+  of ``heartbeat_at/started_at/created_at`` won, so ``created_at``
+  short-circuited the PROGRESS scan and a long-running Hermes task
+  emitting 60/80/95% PROGRESS was false-reaped with
+  ``no progress for 1804s`` measured from task creation.
 
 * `stale_queued_sec` (default 300s = 5 min): a `queued` task that has
   not transitioned to `running` within this window is reaped.
@@ -78,42 +88,131 @@ class ReapResult:
 
 
 def _last_progress_ts(manager: TaskManager, task_id: str) -> Optional[float]:
-    """Return the unix-epoch of the most recent heartbeat / progress
+    """Return the unix-epoch of the most recent meaningful activity
     for this task.
 
-    Order of preference (AEE-2):
-      1. `tasks.heartbeat_at` — set by the worker via
-         POST /jobs/{id}/heartbeat. The most direct signal that
-         the worker is still alive.
-      2. `tasks.started_at` if heartbeat_at is null but the task
-         is in `running` — better than nothing.
-      3. Fall back to the most recent `progress` event (legacy
-         path; the watcher used to advance progress every 2s).
-      4. Fall back to `created_at`.
+    B1b freshness fix (2026-09-08): the legacy implementation returned
+    the first non-null of ``heartbeat_at``/``started_at``/``created_at``
+    — but ``created_at`` is never null, so the ``task_events`` PROGRESS
+    scan below was dead code and the freshness clock degenerated to
+    "time since task creation". A long-running Hermes task emitting
+    60%/80%/95% PROGRESS events was false-reaped with
+    ``no progress for 1804s (threshold=1800s)`` measured from
+    ``created_at`` (incident run_86b294fab2054d4b9495bccf4fdecadd,
+    TASK-20260907-0002: reaper fired 19:09:06Z while the newest
+    PROGRESS was 18:53:20Z).
+
+    New semantics — two-tier precedence (B1b, 2026-09-08):
+
+      STRONG sources (worker-side liveness; a stale strong source must
+      win over fresh weak ones — the AEE-2 jobs contract reaps a task
+      whose worker heartbeat is stale even when other stamps are new):
+
+        1. ``tasks.heartbeat_at`` — set by the worker via
+           POST /jobs/{id}/heartbeat.
+        2. the newest ``task_events`` row with ``kind='progress'``
+           (legacy watcher path; the watcher advances progress
+           periodically). Only events at or after ``started_at``
+           count, so a PROGRESS event recorded during a PREVIOUS
+           lifecycle of the same task id cannot keep a fresh run
+           alive.
+
+      WEAK sources (executor/bookkeeping timestamps; only consulted
+      when no strong source exists):
+
+        3. ``executor_runs.last_heartbeat_at`` / ``updated_at`` for a
+           NON-TERMINAL row of this task — stamped by the executor
+           dispatch path and advanced by the ExecutorRunWatcher's
+           liveness heartbeat (B1b). A TERMINAL row (or any stale
+           watcher stamp) is ignored: it must never pin a genuinely
+           idle run alive forever.
+        4. ``tasks.started_at``.
+        5. ``created_at``.
+
+      The freshness clock = max(strong sources) when any strong source
+      exists, else max(weak sources).
     """
     from datetime import datetime
+
+    def _parse_ts(raw) -> Optional[float]:
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(
+                str(raw).replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:  # noqa: BLE001 — malformed ts: skip this source
+            return None
+
     t = manager.get(task_id)
     if t is None:
         return None
-    # AEE-2: prefer the heartbeat_at column when present.
-    for ts_field in ("heartbeat_at", "started_at", "created_at"):
-        raw = getattr(t, ts_field, None)
-        if not raw:
-            continue
-        try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-        except Exception:  # noqa: BLE001
-            continue
-    # Legacy: scan events.
+
+    strong: List[float] = []
+    weak: List[float] = []
+
+    # STRONG 1) Worker heartbeat column (AEE-2).
+    hb_ts = _parse_ts(getattr(t, "heartbeat_at", None))
+    if hb_ts is not None:
+        strong.append(hb_ts)
+
+    # 2) Newest PROGRESS event. manager.events() returns rows in
+    #    insertion order (oldest first, capped to the newest
+    #    ``limit`` rows), so scan in reverse to find the newest
+    #    eligible event. Guard: ignore events older than
+    #    ``started_at`` when a start timestamp exists, so a PROGRESS
+    #    event recorded during a PREVIOUS lifecycle of the same task
+    #    id cannot keep a fresh run alive.
+    started_ts = _parse_ts(getattr(t, "started_at", None))
     ev = manager.events(task_id, limit=500)
-    for e in ev:
-        if e.kind == "progress":
-            try:
-                ts = datetime.fromisoformat(e.ts.replace("Z", "+00:00"))
-                return ts.timestamp()
-            except Exception:  # noqa: BLE001
-                continue
-    return None
+    for e in reversed(ev):
+        if e.kind != "progress":
+            continue
+        ev_ts = _parse_ts(e.ts)
+        if ev_ts is None:
+            continue
+        if started_ts is not None and ev_ts < started_ts:
+            continue  # pre-start event: stale lifecycle, not liveness
+        strong.append(ev_ts)
+        break  # newest eligible PROGRESS found
+
+    # 3) Executor-side heartbeat (B1b): only meaningful when the
+    #    latest executor_runs row for this task is NON-terminal — a
+    #    terminal row's timestamps describe a finished run and must
+    #    not keep the task alive (fail-safe to the task-side clock).
+    try:
+        from dispatcher.db import get_conn
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT status, last_heartbeat_at, updated_at "
+            "FROM executor_runs "
+            "WHERE task_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is not None and row["status"] not in {
+            "completed", "failed", "timeout", "cancelled",
+        }:
+            for col in ("last_heartbeat_at", "updated_at"):
+                ts = _parse_ts(row[col])
+                if ts is not None:
+                    weak.append(ts)
+    except Exception:  # noqa: BLE001 — fail-safe: task-side sources still apply
+        pass
+
+    # 4/5) Legacy task-side fallbacks.
+    for ts_field in ("started_at", "created_at"):
+        ts = _parse_ts(getattr(t, ts_field, None))
+        if ts is not None:
+            weak.append(ts)
+
+    # Two-tier precedence: a strong worker-side signal wins over any
+    # executor/bookkeeping stamp (the AEE-2 jobs contract reaps a
+    # task whose worker heartbeat is stale even when other stamps are
+    # new); otherwise the best executor/task-side timestamp applies.
+    if strong:
+        return max(strong)
+    return max(weak) if weak else None
 
 
 def _executor_owns_queued_task(manager: TaskManager, task_id: str) -> bool:
