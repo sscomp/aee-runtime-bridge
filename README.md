@@ -1,72 +1,61 @@
-# AEE Runtime Bridge
+# AEE v2 — private-host MCP execution bridge
 
-AEE (Agent Execution Engine) runs controlled agent jobs on a private Linux host.
-ChatGPT connects to its restricted MCP gateway through OpenAI Secure MCP Tunnel.
-AEE runs on your host; OpenAI hosts the tunnel control plane. The separate
-`tunnel-client` forwards requests over outbound HTTPS.
+AEE runs the MCP gateway, reviewed agent executable, sandbox and job store on
+**your Linux host**. ChatGPT and inference models run at OpenAI; Secure MCP Tunnel
+forwards requests over outbound HTTPS. Tasks, admitted source content and bounded
+results can cross that boundary. See [security and privacy](docs/security-model.md).
 
-```text
-ChatGPT custom MCP Plugin -> OpenAI Platform tunnel
-                                      ^ outbound HTTPS
-<AEE_HOST>:                     tunnel-client
-                                      |
-                              127.0.0.1:8791/mcp (restricted)
-                                      |
-                              AEE jobs / controlled runtime
-Local operator -------------> 127.0.0.1:8790/mcp (full/local)
+The current deployment target is **Linux x86_64, systemd with cgroup v2, CPython
+3.13.x**, rootless user/mount/PID/network namespaces, GCC and Bubblewrap. Production
+pins Codex 0.159.2 plus its Code Mode companion and the exact Bubblewrap artifact
+in `config/p2c/sandbox-profile.json`. Other binaries/hosts require a reviewed policy
+change. A fresh independent host and ChatGPT E2E are **not yet validated**.
+
+Start with the single [host setup](docs/deployment.md) sequence: clone a reviewed
+commit, install the hash-locked MCP closure, run the credential-free smoke below,
+then use the existing offline packager and operator-approved systemd deployment.
+The packager emits `STAGE1_NOT_DEPLOYABLE`; tests never authorize deployment.
+
+```bash
+git clone https://github.com/sscomp/aee-runtime-bridge.git
+cd aee-runtime-bridge
+# For this review candidate, checkout feat/stage2c-canonical-v2 before setup.
+# For deployment, the operator must select and record an approved commit.
+uv venv --python 3.13 .venv
+uv pip sync --python .venv/bin/python --require-hashes requirements-mcp.lock
+PYTHONPATH=.:tests/mcp .venv/bin/python -m unittest test_p2b_protocol -v
 ```
 
-## One-host quick start
+Configure `config/p2c/gateway-restricted.env.example` privately, retaining
+`127.0.0.1:8791/mcp (restricted)`, authentication and exactly `aee_status`,
+`aee_agents`, `aee_dispatch`, `aee_job_status`, `aee_job_result`.
+Only `codex` / `read_only` dispatch is supported; `aee_exec` remains local/full only
+on port 8790. Follow [host setup](docs/deployment.md) to qualify and start the
+broker/gateway; [validation](docs/agent-operations.md) covers health, MCP handshake,
+agent discovery, safe dispatch and completed-result verification.
 
-1. Obtain an operator-approved source revision containing `mcp_gateway.py` and
-   `requirements-mcp.lock`. Follow [host setup](docs/operations.md) to install
-   locked dependencies and configure a private gateway environment.
-2. Start the approved restricted gateway on loopback 8791. Check bearer auth and
-   the exact five-tool list. The optional full/local 8790 endpoint must never
-   be the tunnel target.
-3. Download OpenAI `tunnel-client`, associate a Platform tunnel with the intended
-   ChatGPT workspace, and configure separate control-plane and gateway-forward
-   credentials. Follow [tunnel setup](docs/openai-secure-mcp-tunnel.md).
-4. In ChatGPT Plugins, add a custom MCP server using **Tunnel**, install the Plugin,
-   and check `aee_status` and `aee_agents`. Follow the
-   [Plugin checklist](docs/chatgpt-plugin-deployment.md).
+Use [tunnel setup](docs/chatgpt-mcp.md) and its [Plugin checklist](docs/chatgpt-mcp.md)
+after local validation. Operator-managed credentials and workspace authorization
+are required. See [troubleshooting and rollback](docs/troubleshooting.md).
 
-The public `main` revision inspected for this review does **not** contain the MCP
-gateway. Do not use the legacy HTTP installer for this route. Fetchability of an
-approved MCP revision on a new host is **NOT VERIFIED**; obtain that revision or a
-reviewed source bundle from the operator. P2C is a deployment candidate with its
-own closed production gate; this guide does not authorize or qualify its rollout.
+The four supported HTTP/CLI install profiles remain available through the
+[legacy HTTP/profile reference](docs/legacy-http-profiles.md).
+**Do not use the legacy HTTP installer for this route**: `install.sh` does not
+install the MCP closure or qualify production MCP dispatch.
 
-## Security and verification
+## Repository map and verification
 
-The remote surface is exactly `aee_status`, `aee_agents`, `aee_dispatch`,
-`aee_job_status`, and `aee_job_result`. Dispatch accepts only `codex` / `read_only`
-with a reviewed existing working directory and a nonempty task. Other discovered
-agents are not authorized for remote execution. `aee_exec` remains local/full only.
+- [Architecture](docs/architecture.md): trust boundaries and code entrypoints.
+- [Agent operations](docs/agent-operations.md): independent-agent checklist and CI.
+- [Retirement ownership](docs/legacy-retirement.md): 24 external archive checks
+  retired; current profiles, APIs, adapters and real-host upgrade path preserved.
+- [Config contracts](config/p2c/README.md): immutable release layout, credentials,
+  resource limits and approval gate. Examples are uninstalled templates.
+- [Runtime tests](tests/mcp/README.md): controlled C/socket/SSE fixtures and separate
+  optional native qualification. Fixture success is not real model inference.
 
-Keep gateways on loopback, require bearer auth, and separate tunnel, gateway and
-inference credentials. Health/discovery does not prove successful inference.
-New-host startup, ChatGPT account access, end-to-end calls and reboot persistence
-are **NOT VERIFIED** by this documentation patch.
-
-| Reference | Purpose |
-|---|---|
-| [Operations](docs/operations.md) | Install, gateway configuration, smoke checks and troubleshooting |
-| [Tunnel guide](docs/openai-secure-mcp-tunnel.md) | Client, profile and workspace association |
-| [Plugin guide](docs/chatgpt-plugin-deployment.md) | Connection, authentication and tools |
-| [Architecture](docs/architecture.md) | Bootstrap and candidate responsibilities |
-| [Security model](docs/security-model.md) | Authorization and isolation limits |
-| [Configuration examples](config/examples/README.md) | Non-secret templates and scope |
-| [Changelog](CHANGELOG.md) | Documentation changes |
-
-The legacy HTTP/profile bridge (`app.py`, default 8787) and its
-[GPT Action setup](gpt/GPT_SETUP_GUIDE.md) remain separate compatibility paths. See the
-[legacy HTTP/profile reference](docs/legacy-http-profiles.md) for profile
-selection, installer/Docker behavior and the historical migration context.
-MCP uses `requirements-mcp.lock`; legacy HTTP has its own dependencies.
-
-Product metadata remains `2.0.0-rc1`. Historical Stage 2B BLOCKED decisions remain
-unchanged; documentation review is independent of runtime qualification. Centralized
-updates, fleet patch orchestration and advanced policy are roadmap items, **not
-implemented**. Do not publish private environments, logs, job stores or historical
-evidence automatically.
+Required CI covers isolated HTTP API/job tests, all four profile suites, shell bootstrap regression, MCP auth
+and five-tool boundary, job lifecycle/results, broker policies, packaging,
+documentation/configuration and public-source secret scanning. It never installs
+services or publishes a release. Host qualification and planned Stage 3 E2E are
+separate, explicit acceptance steps.

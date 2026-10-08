@@ -1,0 +1,4 @@
+# A3 MCP gateway direct dependencies, captured from the working deployment.
+# Separate from the legacy FastAPI bridge requirements; do not sync its venv.
+mcp==1.30.0
+uvicorn==0.54.0

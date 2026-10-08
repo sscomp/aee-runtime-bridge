@@ -19,7 +19,7 @@ cutover. AEE-MINI `1.0.1` is the **last release of the AEE-MINI line**
 
 ## Canonical references
 
-- **Master Plan:** `/home/ubuntu/Abacus/AEE/AEE_MASTER_PLAN.md`
+- **Master Plan:** `AEE_MASTER_PLAN.md (external historical context)`
   - §21.8 Release Strategy (line 7792)
   - §21.9 Documentation Migration (line 7798)
   - §21.10 Deprecation Plan (lines 7804–7815)
@@ -28,9 +28,9 @@ cutover. AEE-MINI `1.0.1` is the **last release of the AEE-MINI line**
   Unification: one AEE product, four profiles (`full`, `mini`,
   `edge`, `developer`).
 - **Unified product README:**
-  `/home/ubuntu/hermes-runtime-bridge/README.md`
+  `README.md (this repository)`
 - **AEE-MINI deprecation marker:**
-  `/home/ubuntu/Abacus/aee-runtime-api-mini/DEPRECATED.md`
+  `aee-runtime-api-mini/DEPRECATED.md (external archive)`
 
 ## The `mini` profile
 
@@ -47,15 +47,17 @@ migrating from AEE-MINI:
 Install the unified product with the `mini` profile:
 
 ```bash
-cd /home/ubuntu/hermes-runtime-bridge
-./install.sh --profile mini
+bash install.sh --profile mini --dry-run
 ```
 
 The `mini` profile string literal is the **only surviving reference**
 to the "MINI" name after the AEE-MINI repo is archived (Master Plan
 §21.10 line 7812).
 
-## Deprecation timeline (4 rows)
+## Historical deprecation plan (4 rows)
+
+The following is the original planned timeline, not proof that those releases or
+clean-host validation occurred. Current MCP onboarding uses [deployment](deployment.md).
 
 Per Master Plan §21.10 (lines 7808–7814):
 

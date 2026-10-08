@@ -170,12 +170,8 @@ class CIJobSpec:
     * ``install_command`` — the canonical install command the job
       runs. Always ``install.sh --profile <p> --dry-run`` in this
       slice.
-    * ``smoke_command`` — the smoke step the job runs after install.
-      The §21.7 proposal lists "smoke test" as the second step; in
-      this slice the smoke is a no-op exit-0 placeholder, because
-      the §21.3 shell-level execution path is not authorized. The
-      workflow runs ``python3 -c "import sys; sys.exit(0)"`` as the
-      smoke placeholder; no production service is started.
+    * ``smoke_command`` — a real CLI import and read-only installation
+      plan. No production service is started.
     * ``needs_all_green`` — always ``True`` (per §21.7 line 7790:
       "All 4 jobs must pass for merge to ``master``").
     """
@@ -220,17 +216,8 @@ def _build_install_command(profile: str) -> Tuple[str, ...]:
 
 
 def _build_smoke_command() -> Tuple[str, ...]:
-    """Build the smoke step command.
-
-    The §21.7 proposal lists "smoke test" as the second step. In
-    this slice, the smoke is a no-op exit-0 placeholder, because
-    the §21.3 shell-level execution path is not authorized (the
-    installer backend's ``execute(dry_run=False)`` raises
-    :class:`ExecuteNotAuthorizedError`). No production service is
-    started. The placeholder is explicit so the workflow YAML can
-    be audited for the absence of a real smoke invocation.
-    """
-    return ("python3", "-c", "import sys; sys.exit(0)")
+    """Exercise the installed CLI import and read-only plan, without a service."""
+    return ("python3", "-m", "aee.cli", "install", "--dry-run", "--json")
 
 
 def _build_job(profile: str) -> CIJobSpec:

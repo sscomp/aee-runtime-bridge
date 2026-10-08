@@ -1,0 +1,30 @@
+{
+  "revision": "codex-readonly-r2-1",
+  "scope": "gateway-service-and-one-lease-owned-job-tree",
+  "rlimits": {
+    "address_space_bytes": 2199023255552,
+    "cpu_soft_seconds": 300,
+    "cpu_hard_seconds": 301,
+    "open_files": 128,
+    "core_bytes": 0,
+    "file_bytes": 4194304,
+    "nproc": "not-set-use-cgroup-pids"
+  },
+  "cgroup": {
+    "memory_high_bytes": 1610612736,
+    "memory_max_bytes": 2147483648,
+    "memory_swap_max_bytes": 0,
+    "tasks_max": 64,
+    "cpu_quota_percent": 150
+  },
+  "job_timeout_seconds": 900,
+  "cleanup": "kill-runner-process-group-and-private-pid-namespace; systemd-KillMode=control-group-OOMPolicy=stop",
+  "rationale": {
+    "address_space": "Finite 2 TiB retains headroom above measured full V8 reserve ~1.35 TiB; this is not the resident memory budget. Small finite limits cause reservation failure or smaller fallback reservations.",
+    "memory": "A3 has 15.5 GiB physical RAM; 2 GiB service tree budget with 1.5 GiB reclaim threshold leaves host headroom. Synthetic native peak ~62 MiB is not a production workload sizing guarantee.",
+    "swap": "Zero job swap prevents the test or candidate from displacing host workloads into swap.",
+    "tasks": "64 tasks includes threads and gateway overhead; kernel pids accounting governs descendants regardless of sessions or real UID.",
+    "cpu": "150 percent is 1.5 CPU equivalents on a four-CPU host; per-process 300/301 CPU seconds remains complementary.",
+    "timeout": "Retain existing 900 second wall deadline, 128 descriptors, zero cores, bounded streams and 4 MiB private SQLite file allowance. Systemd kills the entire service on OOM/stop."
+  }
+}

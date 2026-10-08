@@ -6,8 +6,8 @@
 through the private tunnel. Both are private loopback services. Candidate port 8791
 forces the restricted surface, requires bearer auth, and rejects an explicitly empty
 or expanded tool allowlist. Its fixed five-tool list/call guard excludes `aee_exec`,
-including future registrations. The existing bootstrap's five tools are independently
-captured in the bootstrap baseline in the approved MCP source; candidate enforcement is not a live upgrade.
+including future registrations. The current published protocol and bootstrap
+regressions enforce this boundary; publication is not a live service upgrade.
 
 Secure MCP Tunnel is transport, not AEE authorization policy. Plugin access does not
 grant unrestricted host access. Workspace/tunnel access, forwarded AEE bearer checks,
@@ -57,9 +57,9 @@ bounds are 10,000 files, 4 MiB/file, 64 MiB total. Codex timeout is at most 900 
 default stdout/stderr caps are 65,536 bytes each, result 65,536 bytes, summary 4,000
 characters and log excerpt 2,000. Limits validation and whole-process-group cleanup
 fail closed. P2C resource/cgroup/provider contracts have additional qualified bounds;
-see resource policy in the approved MCP source and
-sandbox contract in that source. Do not infer these apply
-to the still-running bootstrap.
+see [resource policy](../config/p2c/resource-profile.json) and
+[sandbox policy](../config/p2c/sandbox-profile.json). Host enforcement is independently
+verified before production approval; portable fixtures are not host evidence.
 
 Candidate job storage uses private permissions, bounded/schema-validated atomic
 records, kernel leases for admission, lost-owner reconciliation without retry, and

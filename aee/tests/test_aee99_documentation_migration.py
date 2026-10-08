@@ -1,9 +1,6 @@
-"""Documentation compatibility for the MCP entry point and legacy reference.
+"""Current compatibility documentation and deprecation API contracts.
 
-Current repository docs are tested through canonical README links and the
-maintained legacy HTTP/profile reference. External §21.9/§21.10 preservation
-checks require authentic relative fixtures; missing inputs remain failures.
-See fixtures/historical_docs/README.md for the acquisition contract.
+External AEE-MINI archive ownership was retired; see docs/legacy-retirement.md.
 """
 
 from __future__ import annotations
@@ -29,16 +26,9 @@ from aee.profiles.descriptor import KNOWN_PROFILES, DEFAULT_PROFILE, get_descrip
 
 _UNIFIED_README = Path(_REPO_ROOT) / "README.md"
 _LEGACY_REFERENCE = Path(_REPO_ROOT) / "docs" / "legacy-http-profiles.md"
-_HISTORICAL_FIXTURES = Path(__file__).parent / "fixtures" / "historical_docs"
 _UNIFIED_MOVED_MATRIX = Path(_REPO_ROOT) / "docs" / "HERMES_ADAPTER_CONTRACT_MATRIX.md"
 
-_AEE_MINI_REPO_ROOT = _HISTORICAL_FIXTURES / "aee-runtime-api-mini"
-_AEE_MINI_README = _AEE_MINI_REPO_ROOT / "README.md"
-_AEE_MINI_ARCHIVE_MATRIX = (
-    _AEE_MINI_REPO_ROOT / "docs" / "HERMES_ADAPTER_CONTRACT_MATRIX.md"
-)
 
-_MASTER_PLAN_PATH = _HISTORICAL_FIXTURES / "AEE_MASTER_PLAN.md"
 
 
 def _read(path: Path) -> str:
@@ -160,67 +150,12 @@ class TestUnifiedReadmeMasterPlanReference(unittest.TestCase):
 # §21.A item 9d — AEE-MINI README has a deprecation notice
 # ---------------------------------------------------------------------------
 
-class TestAeeMiniReadmeDeprecationNotice(unittest.TestCase):
-    """§21.A item 9d: AEE-MINI ``README.md`` has a deprecation notice."""
-
-    def setUp(self):
-        self.readme = _read(_AEE_MINI_README)
-
-    def test_aee_mini_readme_exists(self):
-        self.assertTrue(_AEE_MINI_README.is_file())
-
-    def test_readme_contains_deprecation_marker(self):
-        lowered = self.readme.lower()
-        self.assertIn("deprecat", lowered)
-
-    def test_readme_redirects_to_profile_mini(self):
-        lowered = self.readme.lower()
-        self.assertIn("--profile mini", lowered)
-
-    def test_readme_redirects_to_unified_repo(self):
-        self.assertTrue(
-            "hermes-runtime-bridge" in self.readme or "aee-runtime-bridge" in self.readme,
-            "deprecation notice must name the unified repository",
-        )
-
-    def test_readme_references_master_plan_section_21_10(self):
-        """The deprecation notice should point operators to §21.10
-        for the full deprecation timeline."""
-        self.assertIn("§21.10", self.readme)
-
-    def test_readme_states_frozen_at_1_0_1(self):
-        """AEE-MINI 1.0.1 is the last release of the line; the notice
-        should say so."""
-        self.assertIn("1.0.1", self.readme)
-
-    def test_readme_preserves_original_title(self):
-        """Old links should still resolve visually — the H1 is
-        preserved."""
-        self.assertTrue(self.readme.lstrip().startswith("# AEE Runtime API Mini"))
 
 
 # ---------------------------------------------------------------------------
 # §21.A item 9e — AEE-MINI README is short (deprecation notice only)
 # ---------------------------------------------------------------------------
 
-class TestAeeMiniReadmeIsShort(unittest.TestCase):
-    """§21.A item 9e: AEE-MINI ``README.md`` is the deprecation notice
-    only; the long adapter matrix is gone (moved, not duplicated here)."""
-
-    def test_aee_mini_readme_line_count_is_small(self):
-        line_count = len(_read(_AEE_MINI_README).splitlines())
-        self.assertLess(line_count, 100,
-                        f"AEE-MINI README should be a short deprecation "
-                        f"notice (<100 lines); got {line_count}")
-
-    def test_aee_mini_readme_does_not_document_adapter_contract(self):
-        """The long adapter contract matrix should NOT live in the
-        AEE-MINI README anymore (it has been moved to the unified
-        repo). The README may *mention* the matrix by name, but it
-        should not contain the contract tables themselves."""
-        readme = _read(_AEE_MINI_README)
-        self.assertNotIn("VERIFIED_FROM_CODE", readme)
-        self.assertNotIn("VERIFIED_FROM_TEST_STUB", readme)
 
 
 # ---------------------------------------------------------------------------
@@ -286,17 +221,6 @@ class TestMovedMatrixHeaderReferencesUnifiedApi(unittest.TestCase):
 # §21.9 — "no documentation deleted" — AEE-MINI archive still on disk
 # ---------------------------------------------------------------------------
 
-class TestAeeMiniArchivePreserved(unittest.TestCase):
-    """§21.9: no documentation is deleted; the AEE-MINI frozen archive
-    stays on disk untouched."""
-
-    def test_aee_mini_archive_matrix_still_exists(self):
-        self.assertTrue(_AEE_MINI_ARCHIVE_MATRIX.is_file(),
-                        "authentic AEE-MINI archive matrix fixture is required")
-
-    def test_aee_mini_archive_matrix_is_nonempty(self):
-        content = _read(_AEE_MINI_ARCHIVE_MATRIX)
-        self.assertGreater(len(content), 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -388,13 +312,9 @@ class TestBackwardCompatBridgeContent(unittest.TestCase):
 # Broken-link / reference detection — Master Plan path exists on disk
 # ---------------------------------------------------------------------------
 
-class TestMasterPlanPathResolves(unittest.TestCase):
+class TestHistoricalContextReference(unittest.TestCase):
     """The authentic historical Master Plan fixture must exist for preservation checks."""
 
-    def test_master_plan_path_exists(self):
-        self.assertTrue(_MASTER_PLAN_PATH.is_file(),
-                        "authentic historical AEE_MASTER_PLAN.md fixture missing; "
-                        "see aee/tests/fixtures/historical_docs/README.md")
 
     def test_master_plan_is_identified_as_external_historical_context(self):
         reference = _read(_LEGACY_REFERENCE)
@@ -408,25 +328,13 @@ class TestMasterPlanPathResolves(unittest.TestCase):
 # AEE-MINI README is the deprecation notice. (Sanity check.)
 # ---------------------------------------------------------------------------
 
-class TestBothReadmesCoexist(unittest.TestCase):
-    """Both READMEs exist; the unified README is the entry point and the
-    AEE-MINI README is the deprecation notice."""
+class TestRepositoryReadmeExists(unittest.TestCase):
+    """The repository README remains the current entry point."""
 
     def test_unified_readme_exists(self):
         self.assertTrue(_UNIFIED_README.is_file())
 
-    def test_aee_mini_readme_exists(self):
-        self.assertTrue(_AEE_MINI_README.is_file())
 
-    def test_unified_readme_is_longer_than_aee_mini_readme(self):
-        """The unified README is the single entry point; the AEE-MINI
-        README is a short deprecation notice."""
-        unified_size = _UNIFIED_README.stat().st_size
-        mini_size = len(_read(_AEE_MINI_README).encode("utf-8"))
-        self.assertGreater(unified_size, mini_size,
-                           f"unified README ({unified_size}B) should be "
-                           f"larger than AEE-MINI deprecation notice "
-                           f"({mini_size}B)")
 
 
 class TestCanonicalReadmeLinks(unittest.TestCase):
@@ -434,9 +342,9 @@ class TestCanonicalReadmeLinks(unittest.TestCase):
         readme = _read(_UNIFIED_README)
         for label, target in (
             ("legacy HTTP/profile reference", "docs/legacy-http-profiles.md"),
-            ("host setup", "docs/operations.md"),
-            ("tunnel setup", "docs/openai-secure-mcp-tunnel.md"),
-            ("Plugin checklist", "docs/chatgpt-plugin-deployment.md"),
+            ("host setup", "docs/deployment.md"),
+            ("tunnel setup", "docs/chatgpt-mcp.md"),
+            ("Plugin checklist", "docs/chatgpt-mcp.md"),
         ):
             with self.subTest(target=target):
                 self.assertIn(f"[{label}]({target})", readme)

@@ -5,7 +5,7 @@ profile-aware CLI, installer and Docker entrypoint. It is maintained alongside
 their implementation. The [MCP-first README](../README.md) is the entry point for
 OpenAI Secure MCP Tunnel onboarding. Legacy profile installation does not install
 or qualify that restricted MCP route; obtain an operator-approved MCP revision
-and follow [operations](operations.md) for that route.
+and follow [deployment](deployment.md) for that route.
 
 ## Profile matrix
 
@@ -115,5 +115,6 @@ host-location references are historical context, not portable prerequisites.
 The current [Hermes adapter contract matrix](HERMES_ADAPTER_CONTRACT_MATRIX.md)
 references `aee/adapters/hermes_adapter.py` and records the §21.9 move from
 AEE-MINI. The external frozen AEE-MINI archive is a separate historical input.
-Historical-preservation tests need authentic, source-backed fixture snapshots;
-this current matrix is not a substitute for that archive or proof of its state.
+External archive-preservation checks are retired from current CI; see
+[retirement ownership](legacy-retirement.md). This current matrix remains the
+contract reference for the maintained Hermes adapter.

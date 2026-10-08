@@ -642,7 +642,7 @@ class TestWorkflowYamlAgreement(unittest.TestCase):
         # `secrets.` is the GitHub Actions secrets context; any
         # reference to it would imply the workflow reads or writes
         # repository secrets, which is out of scope for §21.7.
-        self.assertNotIn("secrets.", text)
+        self.assertNotRegex(text, r"\$\{\{\s*secrets\.")
 
     def test_workflow_does_not_enable_release(self) -> None:
         text = self._yaml_text()
@@ -679,6 +679,15 @@ class TestWorkflowYamlAgreement(unittest.TestCase):
         text = self._yaml_text()
         # The merge-gate job is the §21.7 "all 4 must pass" enforcement.
         self.assertIn("merge-gate", text)
+
+    def test_merge_gate_requires_current_mcp_and_profiles(self) -> None:
+        text = self._yaml_text()
+        self.assertIn('needs: [profile-job, mcp-runtime, compatibility-api]', text)
+        for job in ('profile-job', 'mcp-runtime', 'compatibility-api'):
+            self.assertIn('${{ needs.' + job + '.result }}" != "success"', text)
+        self.assertNotIn('continue-on-error', text)
+        self.assertIn("-m unittest discover -s tests/mcp -p 'test_*.py'", text)
+
 
     def test_workflow_matrix_includes_subset_kind_per_profile(self) -> None:
         text = self._yaml_text()
