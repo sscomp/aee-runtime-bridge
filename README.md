@@ -60,7 +60,9 @@ are **NOT VERIFIED** by this documentation patch.
 | [Changelog](CHANGELOG.md) | Documentation changes |
 
 The legacy HTTP/profile bridge (`app.py`, default 8787) and its
-[GPT Action setup](gpt/GPT_SETUP_GUIDE.md) remain separate compatibility paths.
+[GPT Action setup](gpt/GPT_SETUP_GUIDE.md) remain separate compatibility paths. See the
+[legacy HTTP/profile reference](docs/legacy-http-profiles.md) for profile
+selection, installer/Docker behavior and the historical migration context.
 MCP uses `requirements-mcp.lock`; legacy HTTP has its own dependencies.
 
 Product metadata remains `2.0.0-rc1`. Historical Stage 2B BLOCKED decisions remain

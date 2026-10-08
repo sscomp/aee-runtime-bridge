@@ -24,7 +24,7 @@ Test suite for the §21.10 Deprecation Plan slice:
 
 Run:
 
-    cd /home/ubuntu/hermes-runtime-bridge
+    # From the repository root:
     python3 -m unittest aee.tests.test_aee9_10_deprecation_plan -v
 
 Stdlib ``unittest`` only — no pytest dependency.
@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from pathlib import Path
 import sys
 import unittest
 
@@ -41,10 +42,12 @@ import unittest
 # Paths
 # ---------------------------------------------------------------------------
 
-_AEE_MINI_REPO = "/home/ubuntu/Abacus/aee-runtime-api-mini"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_HISTORICAL_FIXTURES = Path(__file__).parent / "fixtures" / "historical_docs"
+_AEE_MINI_REPO = str(_HISTORICAL_FIXTURES / "aee-runtime-api-mini")
 _DEPRECATED_MD = os.path.join(_AEE_MINI_REPO, "DEPRECATED.md")
 
-_BRIDGE_DOCS = "/home/ubuntu/hermes-runtime-bridge/docs"
+_BRIDGE_DOCS = str(_REPO_ROOT / "docs")
 _MIGRATION_MD = os.path.join(_BRIDGE_DOCS, "MIGRATION_FROM_AEE_MINI.md")
 
 
@@ -54,14 +57,12 @@ _MIGRATION_MD = os.path.join(_BRIDGE_DOCS, "MIGRATION_FROM_AEE_MINI.md")
 
 
 def _read_text(path: str) -> str:
-    """Read a UTF-8 text file and return its contents.
-
-    Raises:
-        unittest.SkipTest: if the file does not exist (so the test
-            suite reports a skip rather than a confusing error).
-    """
+    """Read current docs or genuine historical fixtures; absent inputs fail."""
     if not os.path.isfile(path):
-        raise unittest.SkipTest(f"required file not found: {path}")
+        raise FileNotFoundError(
+            f"required document/fixture missing: {Path(path).relative_to(_REPO_ROOT)}; "
+            "see aee/tests/fixtures/historical_docs/README.md"
+        )
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
@@ -357,8 +358,10 @@ class TestLegacyPathPreservation(unittest.TestCase):
             os.path.join(_AEE_MINI_REPO, "pyproject.toml"),
         ]
         for path in candidates:
-            if not os.path.isfile(path):
-                continue
+            self.assertTrue(
+                os.path.isfile(path),
+                f"authentic fixture missing: {Path(path).relative_to(_REPO_ROOT)}",
+            )
             self.assertTrue(
                 os.access(path, os.W_OK),
                 f"{path} must remain writable (this slice is additive; "

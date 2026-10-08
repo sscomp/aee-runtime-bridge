@@ -14,33 +14,27 @@
 # names and the default come from the canonical Python source via
 # ``python3 -m aee.cli install --help``.
 #
-# Safety contract (per workorder §6):
-#   * No system user creation, no environment file writes, no
-#     supervisord reload, no package installation, no deploy, no
-#     restart.
-#   * The shell-level execution path (real production install) is
-#     guarded behind an explicit ``--execute`` flag. Even with
-#     ``--execute``, this slice does NOT perform side effects — it
-#     prints a guarded "execute not authorized in this slice"
-#     message and exits with code 6 (EXIT_EXECUTE_NOT_AUTHORIZED),
-#     matching the Python backend's ExecuteNotAuthorizedError.
-#   * Default mode is dry-run: the wrapper invokes the Python CLI
-#     in dry-run mode and propagates its exit code.
+# Safety contract:
+#   * Default mode is dry-run: read-only planning and pre-flight,
+#     with no bootstrap side effects.
+#   * Explicit --execute delegates to the existing BootstrapRunner:
+#     stages 02-07 may create a venv, install dependencies and write
+#     bootstrap markers. Credentials are operator-provisioned.
+#   * Profile validation and exit codes come from the Python CLI.
 #
 # Exit code propagation (composed with the Python backend):
-#   0  — success (dry-run plan + pre-flight passed)
+#   0  — dry-run or bootstrap success
 #   2  — argument parsing failure (argparse / shell usage)
 #   3  — unknown profile (defence in depth)
-#   4  — pre-flight failed (e.g. repo root missing)
+#   4  — pre-flight or bootstrap stage failed
 #   5  — profile switch rejected (existing install with different profile)
-#   6  — execute not authorized (this slice's guard)
 #  64  — missing python interpreter
-#  65  — missing aee.cli module
+#  65  — missing CLI or installer module
 #  70  — internal error (unexpected CLI output)
 #
 # Run: ./install.sh --help
 #      ./install.sh --profile mini --dry-run
-#      ./install.sh --profile edge --execute   (will be refused; exit 6)
+#      ./install.sh --profile edge --execute   (real bootstrap; opt in)
 
 set -euo pipefail
 
@@ -97,32 +91,27 @@ Options:
   --json              Emit the install plan as a JSON object on stdout
                       (forwarded to the Python CLI's --json flag).
 
-  --execute           Authorize the shell-level execution path. In this
-                      slice, --execute is REFUSED: the wrapper prints a
-                      guarded message and exits with code 6
-                      (EXIT_EXECUTE_NOT_AUTHORIZED), matching the Python
-                      backend's ExecuteNotAuthorizedError. The real
-                      production install path (system user creation, env
-                      file writes, supervisord reload, smoke test) is a
-                      separately authorizable follow-up.
+  --execute           Run the existing BootstrapRunner (stages 02-07).
+                      This is an explicit opt-in to bootstrap side effects:
+                      venv creation, locked dependency installation, health
+                      and smoke checks, and AGENT_READY marker writes.
+                      Credentials must already be provisioned by the operator.
 
   -h, --help          Show this help message and exit.
 
 Exit codes:
-  0   success (dry-run plan + pre-flight passed)
+  0   dry-run or bootstrap success
   2   argument parsing failure
   3   unknown profile (defence in depth)
-  4   pre-flight failed
+  4   pre-flight or bootstrap stage failed
   5   profile switch rejected (existing install with different profile)
-  6   execute not authorized (this slice's guard)
   64  missing python interpreter
-  65  missing aee.cli module
+  65  missing CLI or installer module
   70  internal error (unexpected CLI output)
 
-NOTE: This slice performs NO system-level side effects (no system user
-creation, no environment file writes, no supervisord reload, no package
-installation, no deploy, no restart). The actual production install path
-is a separately authorizable follow-up per Master Plan §21.3.
+NOTE: Default --dry-run performs no bootstrap side effects. Explicit --execute
+runs bootstrap stages; use it only for an operator-approved installation.
+See docs/aee/bootstrap/onboarding.md for the existing bootstrap contract.
 USAGE
 }
 
@@ -177,14 +166,33 @@ if [ "$show_help" -eq 1 ]; then
     exit 0
 fi
 
-# ---------------------------------------------------------------------------\
-# Refuse --execute in this slice (workorder §6: no production side effects).
-# The Python backend's ExecuteNotAuthorizedError maps to exit code 6.
-# ---------------------------------------------------------------------------\
-# Bootstrap hardening: --execute now drives the full stage chain via
-# the Python CLI. The Python backend's BootstrapRunner executes stages
-# 02-07 (clone, runtime_setup, health_check, smoke_test, agent_ready).
-# Stages 00 (detect) and 01 (deps) are shell-owned and run above.
+# ---------------------------------------------------------------------------
+# Locate the Python interpreter. Prefer python3, fall back to python.
+# Exit code 64 if no interpreter is found.
+# ---------------------------------------------------------------------------
+python_bin=""
+if command -v python3 >/dev/null 2>&1; then
+    python_bin="python3"
+elif command -v python >/dev/null 2>&1; then
+    python_bin="python"
+else
+    echo "install.sh: no python interpreter found (python3 or python)" >&2
+    exit 64
+fi
+
+# ---------------------------------------------------------------------------
+# Verify the CLI and installer backend are importable. Exit 65 if missing.
+# This catches the case where the wrapper is invoked from outside the
+# repo or the aee package is not on PYTHONPATH.
+# ---------------------------------------------------------------------------
+if ! "$python_bin" -c 'import aee.cli; import aee.installer.cli_install' >/dev/null 2>&1; then
+    echo "install.sh: cannot import aee.cli or aee.installer.cli_install" >&2
+    echo "install.sh: ensure you are invoking this wrapper from the repo root" >&2
+    exit 65
+fi
+
+# Explicit --execute delegates to the existing BootstrapRunner (stages 02-07).
+# Interpreter and module checks apply before either dispatch mode.
 if [ "$execute" -eq 1 ]; then
     # Forward --execute to the Python CLI so the BootstrapRunner drives
     # the stage chain. The CLI exits 0 on success (AGENT_READY written)
@@ -202,31 +210,6 @@ if [ "$execute" -eq 1 ]; then
     cli_exit=$?
     set -e
     exit "$cli_exit"
-fi
-
-# ---------------------------------------------------------------------------
-# Locate the Python interpreter. Prefer python3, fall back to python.
-# Exit code 64 if no interpreter is found.
-# ---------------------------------------------------------------------------
-python_bin=""
-if command -v python3 >/dev/null 2>&1; then
-    python_bin="python3"
-elif command -v python >/dev/null 2>&1; then
-    python_bin="python"
-else
-    echo "install.sh: no python interpreter found (python3 or python)" >&2
-    exit 64
-fi
-
-# ---------------------------------------------------------------------------
-# Verify the aee.cli module is importable. Exit code 65 if missing.
-# This catches the case where the wrapper is invoked from outside the
-# repo or the aee package is not on PYTHONPATH.
-# ---------------------------------------------------------------------------
-if ! "$python_bin" -c 'import aee.cli' >/dev/null 2>&1; then
-    echo "install.sh: cannot import aee.cli (PYTHONPATH=${PYTHONPATH})" >&2
-    echo "install.sh: ensure you are invoking this wrapper from the repo root" >&2
-    exit 65
 fi
 
 # ---------------------------------------------------------------------------
