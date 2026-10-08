@@ -126,6 +126,8 @@ jobs:
           aee.tests.test_bootstrap_runner aee.tests.test_aee7_orchestrator_e2e -v
       - name: Canonical documentation and config contract
         run: python scripts/check-canonical-docs.py
+      - name: Clean checkout packaging smoke
+        run: python scripts/smoke-canonical-package.py
       - name: Public source secret gate
         run: python scripts/scan-aee-baseline-secrets.py
 

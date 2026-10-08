@@ -48,6 +48,11 @@ PYTHONPATH=.:tests/mcp .venv/bin/python -m unittest discover -s tests/mcp -p 'te
 .venv/bin/python scripts/check-canonical-docs.py
 ```
 
+From a clean committed checkout, `python scripts/smoke-canonical-package.py`
+also builds/verifies/plans the actual repository using a synthetic ELF and keeps
+the deployment gate closed. It requires temporary space; do not delete another
+operator's `/tmp` data to satisfy it.
+
 Native qualification tests report explicit skips without operator-provided native
 paths. They are documented in [runtime tests](../tests/mcp/README.md).
 
