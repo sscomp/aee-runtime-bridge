@@ -100,7 +100,8 @@ jobs:
 
   mcp-runtime:
     name: MCP runtime, packaging and public-source gates
-    runs-on: ubuntu-22.04
+    # Jammy's bwrap 0.6.1 lacks --size; systemd 249 cannot verify our %d unit.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -110,6 +111,17 @@ jobs:
           python-version: '3.13'
       - name: Install fixture prerequisites
         run: sudo apt-get update && sudo apt-get install -y bubblewrap gcc systemd
+      - name: Prepare runner sandbox fixtures
+        run: |
+          bwrap --version
+          systemd-analyze --version
+          # CI only: the reviewed sandbox uses /lib64 -> /usr/lib. Ubuntu's
+          # loader lives in a multiarch directory; provide its equivalent alias
+          # for fixture ELF/prlimit execution without changing the runtime view.
+          if [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+            test -f /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+            sudo ln -s x86_64-linux-gnu/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+          fi
       - name: Install hashed MCP closure
         run: python -m pip install --require-hashes -r requirements-mcp.lock
       - name: Import and packaging CLI smoke
