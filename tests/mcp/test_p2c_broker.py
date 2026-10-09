@@ -75,7 +75,12 @@ class P2CBroker(unittest.TestCase):
     def call(self, path, method='POST', target='/v1/responses', body=None, headers=None):
         c = UnixHTTP(path)
         try:
-            c.request(method, target, json.dumps(request_body() if body is None else body),
+            # GET/CONNECT are rejected before reading a body. Sending the POST
+            # fixture after their headers races the server's connection close.
+            payload = None
+            if method == 'POST' or body is not None:
+                payload = json.dumps(request_body() if body is None else body)
+            c.request(method, target, payload,
                       headers or {'Content-Type': 'application/json'})
             r = c.getresponse()
             return r.status, r.read()
