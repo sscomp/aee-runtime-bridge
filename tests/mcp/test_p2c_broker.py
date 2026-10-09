@@ -243,6 +243,44 @@ class P2CBroker(unittest.TestCase):
                 with self.assertRaises(PolicyError):
                     validate_request('POST', '/v1/responses', {}, json.dumps(body).encode())
 
+    def test_provider_receipt_output_items_accept_missing_namespace(self):
+        # RESPONSE-side mirror of the bda1c4f request-side fix: the real
+        # api.openai.com Responses stream omits `namespace` on custom_tool_call
+        # output items, so every tool-using job's lease receipt was invalidated
+        # (TOOL_EVIDENCE_INCOMPLETE). Missing namespace corroborates; explicit
+        # other namespaces, drift names and malformed calls still invalidate.
+        from aee.mcp_runtime.provider_receipt import ResponseReceipt
+        lease = Lease(None)
+        item = {'type': 'custom_tool_call', 'id': 'o1', 'call_id': 'exec-abc',
+                'input': 'ls', 'name': 'exec', 'status': 'completed'}
+        message = {'id': 'm1', 'type': 'message', 'role': 'assistant', 'status': 'completed',
+                   'content': [{'type': 'output_text', 'text': 'done', 'annotations': []}]}
+        receipt = ResponseReceipt(lease)
+        receipt.feed(b'data: ' + json.dumps({'type': 'response.output_item.done', 'item': item}).encode() + b'\n')
+        receipt.feed(b'data: ' + json.dumps({'type': 'response.completed', 'response': {
+            'status': 'completed', 'output': [message]}}).encode() + b'\n')
+        receipt.finish()
+        self.assertTrue(lease.receipt_valid)
+        self.assertTrue(lease.response_complete)
+        self.assertEqual(lease.expected_calls, {'exec-abc': 'exec'})
+
+    def test_provider_receipt_explicit_other_namespace_invalidates(self):
+        from aee.mcp_runtime.provider_receipt import ResponseReceipt
+        for name, namespace in [('exec', 'unknown'), ('exec', 'functions' + 'x'), ('exec', ''),
+                                ('exec_command', None), ('spawn_agent', None)]:
+            with self.subTest(name=name, namespace=namespace):
+                lease = Lease(None)
+                item = {'type': 'custom_tool_call', 'id': 'o1', 'call_id': 'exec-abc',
+                        'input': 'ls', 'name': name, 'status': 'completed'}
+                if namespace is not None:
+                    item['namespace'] = namespace
+                receipt = ResponseReceipt(lease)
+                receipt.feed(b'data: ' + json.dumps({'type': 'response.output_item.done',
+                                                     'item': item}).encode() + b'\n')
+                receipt.finish()
+                self.assertFalse(lease.receipt_valid)
+                self.assertEqual(lease.expected_calls, {})
+
 
     @unittest.skipUnless(NATIVE.exists(), 'operator-pinned native CLI contract probe unavailable')
     def test_actual_native_cli_completes_approved_single_agent_contract(self):
