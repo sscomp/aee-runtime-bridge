@@ -242,3 +242,71 @@ These commands are planned target-host steps, **not executed by publication CI**
 An auth/config/gate failure is a stop condition. Validate MCP using
 [agent operations](agent-operations.md), then connect [ChatGPT](chatgpt-mcp.md).
 See [rollback](troubleshooting.md) before enabling services at boot.
+
+## 4a. Model credential presentation on modern systemd (verified pattern)
+
+`aee-p2c-broker.service` ships `LoadCredential=openai-api-key:/etc/aee/secrets/openai-api-key`.
+On systemd 257 (`systemd --version`) this host presented the credential mount as
+`0440` owned by uid 0, which can never satisfy the broker's unchanged mode policy
+(`mode & 0o077 == 0` with owner uid 0 or the broker's own uid — an owner-only
+0600 file). The reviewed pattern used on the deployed host keeps the secret value
+identical and bypasses only the presentation mechanism:
+
+- `/etc/aee/secrets/openai-api-key` is a broker-owned, mode 0600 regular file
+  (`chown aee-broker:aee-inference; chmod 600`), and `/etc/aee/secrets` stays
+  `root:aee-inference` mode 0710.
+- A verified drop-in (
+  `/etc/systemd/system/aee-p2c-broker.service.d/credential-path.conf`) overrides
+  only `ExecStart=` so `--credential-file` points at that path directly.
+- The broker's credential policy code is untouched: an over-permissive or
+  group-readable file is still refused at start-up.
+- After any change: `systemd-analyze verify`, `systemctl daemon-reload`, restart
+  both units, confirm `/health`. Rollback is restoring the shipped `ExecStart=`
+  and removing the drop-in.
+
+Probe your own host's presentation before choosing (`mode`/`uid` only — never the
+value): run a transient unit with `User=aee-broker` and `LoadCredential=...` that
+prints `os.stat('/run/credentials/<unit>/openai-api-key')` mode and uid.
+
+## 4b. Service lifecycle and boot persistence (cold-boot validated)
+
+Production units are SYSTEM units: `aee-p2c-broker.service`,
+`aee-p2c-gateway@restricted.service` (the gateway unit `Requires=`/`BindsTo=` the
+broker and pins `aee-runtime.slice` resource limits matching
+`config/p2c/resource-profile.json`). After a reviewed install:
+
+```bash
+# boot persistence (example names — match installed units)
+sudo systemctl enable aee-p2c-broker.service aee-p2c-gateway@restricted.service
+# cold-boot validation after an operator-approved reboot:
+systemctl is-active aee-p2c-broker.service aee-p2c-gateway@restricted.service
+systemctl is-enabled aee-p2c-broker.service aee-p2c-gateway@restricted.service
+curl -sS -o /dev/null -w 'HEALTH %{http_code}\n' http://127.0.0.1:8791/health
+ss -ltn                     # restricted lister stays on 127.0.0.1:8791 only
+```
+
+Stop conditions stay honest: if a post-reboot health/listener check fails, treat
+boot persistence as NOT achieved and return to [troubleshooting](troubleshooting.md)
+instead of re-testing dispatch on a degraded gateway.
+
+## 4c. Completed-job smoke test (real HTTP MCP, production seal)
+
+Run after every deployment change or reboot. This is the dispatch route the
+completed-result contract currently accepts end to end — a **read-only,
+answer-only** dispatch (no tool calls) through the real HTTP MCP surface, whose
+persisted record carries the `aee-completed-v1` seal checked by
+`result_contract.validate_success`. Tool-using dispatches exercise
+`TOOL_EVIDENCE_INCOMPLETE` / contract fail-closed paths and prove containment but
+do not produce a completed record; see [agent operations](agent-operations.md)
+for scripted positives/negatives.
+
+```bash
+# auth negatives first (expect 401): no bearer and a wrong bearer
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8791/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}'
+# then, with the real bearer: initialize → tools/list (exactly five, no aee_exec)
+# → aee_dispatch (answer-only read-only task, allowed root as working_directory)
+# → poll aee_job_status to completed → aee_job_result (status completed, exit 0)
+# full scripted sequence: see agent-operations.md and the R2 report smoke notes
+```
