@@ -2,8 +2,8 @@
 
 > **Migrated per Master Plan §21.9 (Documentation Migration).** This
 > matrix was **moved** (not copied) from the AEE-MINI repository
-> (`/home/ubuntu/Abacus/aee-runtime-api-mini/docs/HERMES_ADAPTER_CONTRACT_MATRIX.md`)
-> into the unified repo at `/home/ubuntu/hermes-runtime-bridge/docs/`. The
+> (`aee-runtime-api-mini/docs/HERMES_ADAPTER_CONTRACT_MATRIX.md`)
+> into the unified repo at `docs/`. The
 > AEE-MINI archive copy stays on disk untouched as the frozen archive
 > reference; **this file is the canonical copy** going forward. The target
 > file reference below was updated from the AEE-MINI
@@ -16,7 +16,7 @@
 **Target file:** `aee/adapters/hermes_adapter.py` (unified repo)
 **Companion stub:** `tests/test_hermes_adapter.py` (in the AEE-MINI
 archive; the unified repo's adapter tests live in `aee/tests/`)
-**Source-of-truth repo:** `/home/ubuntu/hermes-runtime-bridge/`
+**Source-of-truth repo:** `this repository`
 
 This matrix is the source of truth for what the Hermes adapter is known
 to do today, what is configurable, and what is still assumed. It is

@@ -1,0 +1,12 @@
+[Unit]
+Description=AEE aggregate gateway and runner budget (P2C candidate)
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=4G
+MemoryMax=6G
+MemorySwapMax=0
+CPUAccounting=yes
+CPUQuota=200%
+TasksAccounting=yes
+TasksMax=128

@@ -1,0 +1,13 @@
+{
+  "revision": "codex-readonly-r3-1",
+  "ownership": "AEE-private-job-namespaces-and-admitted-readonly-view; Codex-native-tool-bubblewrap-and-seccomp",
+  "proc": "fresh-job-PID-namespace-proc-with-native-userns-map-writes; never-host-proc-bind",
+  "bwrap_path": "/usr/bin/bwrap",
+  "bwrap_version": "bubblewrap 0.12.0",
+  "bwrap_sha256": "7c44fa8e7326e62e81ab3f70ff682bfc0eb3b447b39cf9fbb779a31948364762",
+  "requires_resource_revision": "codex-readonly-r2-1",
+  "failure_semantics": "codex-native-otlp-r3-1",
+  "tool_failures": "sticky-fail-closed-no-recovery-override",
+  "telemetry": "private-loopback-local-collector; no-credentials-no-upstream-export; bounded-normalized-receipt",
+  "retained": ["readonly-root", "readonly-workspace", "minimal-host-view", "clear-environment", "private-home", "cap-drop-ALL", "private-net", "private-PID", "private-user", "task-stdin", "finite-cgroup-and-rlimits", "process-tree-cleanup"]
+}

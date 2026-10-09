@@ -1,39 +1,13 @@
-"""AEE Epic 9 §21.10 — Deprecation Plan tests.
+"""Current compatibility documentation and deprecation API contracts.
 
-Test suite for the §21.10 Deprecation Plan slice:
-
-1. ``DEPRECATED.md`` exists at the AEE-MINI repo root and has the
-   required content (deprecated, 1.0.1, fresh install, ``--profile
-   mini``, ADR-009, §21.10).
-2. ``MIGRATION_FROM_AEE_MINI.md`` exists, references ADR-009,
-   ``--profile mini``, fresh install (not in-place), and the 4-row
-   timeline.
-3. ``emit_deprecation_warning()`` returns a non-empty string
-   containing ``"DEPRECATED"`` and ``"1.0.1"``.
-4. ``is_aee_mini_deprecated()`` returns ``True``.
-5. ``AEE_MINI_LAST_VERSION == "1.0.1"`` exactly.
-6. ``DEPRECATION_PHASE`` contains ``"Phase F"``.
-7. ``deprecation.py`` imports without I/O and without exception.
-8. Calling ``emit_deprecation_warning()`` twice returns the same
-   string (idempotent).
-9. ``validate_deprecation_config(phase)`` returns ``False`` for
-   unknown phase names and ``True`` for the 4 canonical phases
-   (Phase F/G/H plus the ``"archive"`` sentinel).
-10. Legacy path preservation: the deprecation does NOT delete or
-    rename any existing file; ``DEPRECATED.md`` is additive.
-
-Run:
-
-    cd /home/ubuntu/hermes-runtime-bridge
-    python3 -m unittest aee.tests.test_aee9_10_deprecation_plan -v
-
-Stdlib ``unittest`` only — no pytest dependency.
+External AEE-MINI archive ownership was retired; see docs/legacy-retirement.md.
 """
 
 from __future__ import annotations
 
 import importlib
 import os
+from pathlib import Path
 import sys
 import unittest
 
@@ -41,10 +15,9 @@ import unittest
 # Paths
 # ---------------------------------------------------------------------------
 
-_AEE_MINI_REPO = "/home/ubuntu/Abacus/aee-runtime-api-mini"
-_DEPRECATED_MD = os.path.join(_AEE_MINI_REPO, "DEPRECATED.md")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_BRIDGE_DOCS = "/home/ubuntu/hermes-runtime-bridge/docs"
+_BRIDGE_DOCS = str(_REPO_ROOT / "docs")
 _MIGRATION_MD = os.path.join(_BRIDGE_DOCS, "MIGRATION_FROM_AEE_MINI.md")
 
 
@@ -54,14 +27,12 @@ _MIGRATION_MD = os.path.join(_BRIDGE_DOCS, "MIGRATION_FROM_AEE_MINI.md")
 
 
 def _read_text(path: str) -> str:
-    """Read a UTF-8 text file and return its contents.
-
-    Raises:
-        unittest.SkipTest: if the file does not exist (so the test
-            suite reports a skip rather than a confusing error).
-    """
+    """Read current docs or genuine historical fixtures; absent inputs fail."""
     if not os.path.isfile(path):
-        raise unittest.SkipTest(f"required file not found: {path}")
+        raise FileNotFoundError(
+            f"required document/fixture missing: {Path(path).relative_to(_REPO_ROOT)}; "
+            "see aee/tests/fixtures/historical_docs/README.md"
+        )
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
@@ -71,54 +42,6 @@ def _read_text(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class TestDeprecatedMd(unittest.TestCase):
-    """DEPRECATED.md at AEE-MINI repo root."""
-
-    def test_file_exists_at_repo_root(self):
-        """DEPRECATED.md exists at the AEE-MINI repo root."""
-        self.assertTrue(
-            os.path.isfile(_DEPRECATED_MD),
-            f"DEPRECATED.md not found at {_DEPRECATED_MD}",
-        )
-
-    def test_content_has_deprecated_marker(self):
-        """File contains the literal 'DEPRECATED'."""
-        text = _read_text(_DEPRECATED_MD)
-        self.assertIn("DEPRECATED", text)
-
-    def test_content_mentions_version_1_0_1(self):
-        """File states AEE-MINI is frozen at version 1.0.1."""
-        text = _read_text(_DEPRECATED_MD)
-        self.assertIn("1.0.1", text)
-
-    def test_content_mentions_fresh_install(self):
-        """File documents the fresh-install upgrade path."""
-        text = _read_text(_DEPRECATED_MD)
-        # Accept either the literal phrase or its hyphenated variant.
-        self.assertTrue(
-            "fresh install" in text.lower(),
-            "DEPRECATED.md must mention 'fresh install'",
-        )
-
-    def test_content_mentions_profile_mini(self):
-        """File references the ``--profile mini`` upgrade path."""
-        text = _read_text(_DEPRECATED_MD)
-        self.assertIn("--profile mini", text)
-
-    def test_content_references_adr_009(self):
-        """File references ADR-009 as the architecture decision."""
-        text = _read_text(_DEPRECATED_MD)
-        self.assertIn("ADR-009", text)
-
-    def test_content_references_master_plan_section_21_10(self):
-        """File references Master Plan §21.10 as canonical source."""
-        text = _read_text(_DEPRECATED_MD)
-        self.assertIn("§21.10", text)
-
-    def test_content_states_no_forced_migration(self):
-        """File carries the 'no forced migration' clause."""
-        text = _read_text(_DEPRECATED_MD)
-        self.assertIn("No forced migration", text)
 
 
 class TestMigrationGuide(unittest.TestCase):
@@ -325,45 +248,7 @@ class TestValidateDeprecationConfig(unittest.TestCase):
 class TestLegacyPathPreservation(unittest.TestCase):
     """§21.10 must be additive — no deletion or rename of existing files."""
 
-    def test_deprecated_md_is_additive_not_replacing_readme(self):
-        """DEPRECATED.md is a separate file; README.md is preserved.
 
-        The AEE-MINI README was already updated to carry a deprecation
-        notice (per §21.9); DEPRECATED.md is an **additional** marker
-        at the repo root. The act of placing DEPRECATED.md must not
-        delete or rename README.md.
-        """
-        readme = os.path.join(_AEE_MINI_REPO, "README.md")
-        self.assertTrue(
-            os.path.isfile(readme),
-            "README.md must still exist (DEPRECATED.md is additive)",
-        )
-        self.assertTrue(
-            os.path.isfile(_DEPRECATED_MD),
-            "DEPRECATED.md must exist at repo root",
-        )
-
-    def test_no_file_marked_readonly_by_this_slice(self):
-        """No existing file in the AEE-MINI repo has been marked
-        read-only by this slice.
-
-        We assert that README.md, pyproject.toml, and the docs/ tree
-        are still writable. This is a sampling check, not an
-        exhaustive scan — it catches the obvious destructive failure
-        modes without being brittle to the full repo layout.
-        """
-        candidates = [
-            os.path.join(_AEE_MINI_REPO, "README.md"),
-            os.path.join(_AEE_MINI_REPO, "pyproject.toml"),
-        ]
-        for path in candidates:
-            if not os.path.isfile(path):
-                continue
-            self.assertTrue(
-                os.access(path, os.W_OK),
-                f"{path} must remain writable (this slice is additive; "
-                "no file is marked read-only)",
-            )
 
     def test_deprecation_module_does_not_delete_or_rename(self):
         """The deprecation module source contains no os.remove /

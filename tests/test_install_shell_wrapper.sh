@@ -8,16 +8,16 @@
 #   3. Each of the four profiles exits 0 and reflects the profile
 #   4. Invalid profile exits non-zero (argparse exit code 2)
 #   5. Quoting: --profile="mini" works, spaces in args don't break parsing
-#   6. Exit codes: success=0, invalid=2, execute-guard=6
+#   6. Exit codes: success=0, invalid=2, delegated bootstrap failure=4
 #   7. Missing python interpreter: exit 64
 #   8. Missing aee.cli module: exit 65
-#   9. --execute is refused with exit 6 (unauthorized execute guard)
+#   9. --execute delegates exact argv using an isolated stub interpreter
 #  10. --json produces valid JSON output
 #
 # Run: ./tests/test_install_shell_wrapper.sh
 # Or:  bash tests/test_install_shell_wrapper.sh
 #
-# Exits 0 if all tests pass, non-zero on first failure (TAP-like).
+# Exits 0 if all tests pass, non-zero if any assertion fails (TAP-like).
 
 set -euo pipefail
 
@@ -121,20 +121,123 @@ else
     not_ok "--profile=mini (equals form) works (exit=$_exit)"
 fi
 
-# 7. Exit code: --execute is refused with exit 6
-run_wrapper --profile mini --execute
-if [ "$_exit" -eq 6 ]; then
-    ok "--execute refused with exit 6 (unauthorized execute guard)"
+# Execute tests use a copied wrapper in an empty repo with an exclusive PATH.
+# No real Python is available there; any attempt to use it cannot import AEE.
+# The stub records exact argv and never runs a CLI, runner or bootstrap stage.
+bash_bin="$(command -v bash)"
+stub_root="$(mktemp -d)"
+trap 'rm -rf "$stub_root"' EXIT
+stub_bin="$stub_root/bin"
+stub_repo="$stub_root/repo"
+mkdir -p "$stub_bin" "$stub_repo"
+cp "$wrapper" "$stub_repo/install.sh"
+ln -s "$(command -v dirname)" "$stub_bin/dirname"
+printf '#!%s\n' "$bash_bin" >"$stub_bin/python3"
+cat >>"$stub_bin/python3" <<'STUB'
+set -euo pipefail
+if [ "$#" -eq 2 ] && [ "$1" = "-c" ] &&
+   [ "$2" = "import aee.cli; import aee.installer.cli_install" ]; then
+    exit "${AEE_TEST_IMPORT_EXIT:-0}"
+fi
+if [ "$#" -lt 3 ] || [ "$1" != "-m" ] || [ "$2" != "aee.cli" ] || [ "$3" != "install" ]; then
+    echo "unexpected interpreter invocation" >&2
+    exit 70
+fi
+printf '%s\n' "$@" >"$AEE_TEST_ARGV"
+exit "${AEE_TEST_CLI_EXIT:-0}"
+STUB
+chmod +x "$stub_bin/python3"
+
+run_execute_stub() {
+    local cli_exit="$1" import_exit="$2"
+    shift 2
+    rm -f "$stub_root/argv"
+    set +e
+    ( cd "$stub_repo" && env -u PYTHONPATH PATH="$stub_bin" \
+        AEE_TEST_ARGV="$stub_root/argv" AEE_TEST_CLI_EXIT="$cli_exit" \
+        AEE_TEST_IMPORT_EXIT="$import_exit" \
+        "$bash_bin" ./install.sh "$@" ) >"$stub_root/out" 2>"$stub_root/err"
+    _exit=$?
+    set -e
+    _out="$(cat "$stub_root/out")"
+    _err="$(cat "$stub_root/err")"
+    _argv=""
+    if [ -f "$stub_root/argv" ]; then
+        _argv="$(cat "$stub_root/argv")"
+    fi
+}
+
+# 7. Explicit mini profile: exact execute argv and success propagation.
+run_execute_stub 0 0 --profile mini --execute
+expected_argv="$(printf '%s\n' -m aee.cli install --profile mini --execute)"
+if [ "$_exit" -eq 0 ] && [ "$_argv" = "$expected_argv" ]; then
+    ok "--execute delegates mini argv and propagates success (stub only)"
 else
-    not_ok "--execute refused with exit 6 (exit=$_exit)"
+    not_ok "--execute mini delegation (exit=$_exit)"
 fi
 
-# 8. Exit code: --execute guard fires even with default profile
-run_wrapper --execute
-if [ "$_exit" -eq 6 ]; then
-    ok "--execute with default profile refused with exit 6"
+# 8. Omitted profile: let the Python CLI resolve full; propagate stage failure.
+run_execute_stub 4 0 --execute
+expected_argv="$(printf '%s\n' -m aee.cli install --execute)"
+if [ "$_exit" -eq 4 ] && [ "$_argv" = "$expected_argv" ]; then
+    ok "--execute delegates default-profile argv and propagates failure 4"
 else
-    not_ok "--execute with default profile refused with exit 6 (exit=$_exit)"
+    not_ok "--execute default-profile delegation (exit=$_exit)"
+fi
+
+run_execute_stub 4 0 --profile mini --json --execute
+expected_argv="$(printf '%s\n' -m aee.cli install --profile mini --json --execute)"
+if [ "$_exit" -eq 4 ] && [ "$_argv" = "$expected_argv" ]; then
+    ok "--execute forwards --json and propagates mini failure 4"
+else
+    not_ok "--execute --json delegation (exit=$_exit)"
+fi
+
+run_execute_stub 0 0 --execute
+expected_argv="$(printf '%s\n' -m aee.cli install --execute)"
+if [ "$_exit" -eq 0 ] && [ "$_argv" = "$expected_argv" ]; then
+    ok "--execute default-profile success propagation"
+else
+    not_ok "--execute default-profile success (exit=$_exit)"
+fi
+
+# Module import failure must prevent dispatch in both modes.
+for mode in --dry-run --execute; do
+    run_execute_stub 0 1 --profile mini "$mode"
+    if [ "$_exit" -eq 65 ] && [ -z "$_argv" ] && \
+       [[ "$_err" == *"cannot import aee.cli or aee.installer.cli_install"* ]]; then
+        ok "$mode missing installer module exits 65 before dispatch"
+    else
+        not_ok "$mode missing installer module (exit=$_exit)"
+    fi
+done
+
+# No interpreter: PATH contains only dirname, which the wrapper needs.
+no_python_bin="$stub_root/no-python"
+mkdir "$no_python_bin"
+ln -s "$(command -v dirname)" "$no_python_bin/dirname"
+for mode in --dry-run --execute; do
+    set +e
+    ( cd "$stub_repo" && env -u PYTHONPATH PATH="$no_python_bin" \
+        "$bash_bin" ./install.sh --profile mini "$mode" ) \
+        >"$stub_root/out" 2>"$stub_root/err"
+    _exit=$?
+    set -e
+    if [ "$_exit" -eq 64 ] && grep -q "no python interpreter found" "$stub_root/err"; then
+        ok "$mode missing interpreter exits 64"
+    else
+        not_ok "$mode missing interpreter (exit=$_exit)"
+    fi
+done
+
+# Exercise the python fallback without allowing any real Python in PATH.
+mv "$stub_bin/python3" "$stub_bin/python"
+run_execute_stub 0 0 --execute
+expected_argv="$(printf '%s\n' -m aee.cli install --execute)"
+if [ "$_exit" -eq 0 ] && [ "$_argv" = "$expected_argv" ]; then
+    ok "--execute supports python fallback (stub only)"
+else
+    not_ok "--execute python fallback (exit=$_exit)"
 fi
 
 # 9. Unknown option exits 2
@@ -176,20 +279,6 @@ else
     fi
 fi
 
-# 13. Missing python interpreter: simulate by overriding PATH
-# We test the interpreter-detection logic by invoking the wrapper
-# with an empty PATH (only /bin and /usr/bin for coreutils).
-# Since python3 is in /usr/bin, we need a more surgical approach:
-# invoke with a wrapper that shadows python3/python to nothing.
-run_wrapper_no_python() {
-    local tmp_bin
-    tmp_bin="$(mktemp -d)"
-    # Create a fake PATH that has no python
-    local fake_path="$tmp_bin:/dev/null"
-    # We can't easily remove python from PATH in a portable way,
-    # so we test the module-missing case instead (more reliable).
-    echo "$tmp_bin"
-}
 # Test 13: missing aee.cli module — invoke the wrapper from a
 # directory where aee is NOT importable. The wrapper computes
 # repo_root from its own script path, so we copy the wrapper into a

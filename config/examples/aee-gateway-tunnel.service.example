@@ -1,0 +1,20 @@
+[Unit]
+Description=AEE A3 MCP Gateway (restricted five-tool surface)
+After=aee-gateway.service
+Wants=aee-gateway.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/aee-runtime-bridge
+EnvironmentFile=%h/aee-runtime-bridge/.env.aee-mcp-tunnel
+ExecStart=%h/aee-runtime-bridge/.venv/bin/python %h/aee-runtime-bridge/mcp_gateway.py
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

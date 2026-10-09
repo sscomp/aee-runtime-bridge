@@ -1,0 +1,45 @@
+[Unit]
+Description=AEE dedicated inference broker (UNINSTALLED candidate)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=aee-broker
+Group=aee-inference
+RuntimeDirectory=aee-broker
+RuntimeDirectoryMode=0750
+WorkingDirectory=/opt/aee/current/source
+# Replace reviewed numeric UID at installation; this is not an executable example.
+EnvironmentFile=/etc/aee/broker.env
+LoadCredential=openai-api-key:/etc/aee/secrets/openai-api-key
+ExecStart=/opt/aee/venvs/mcp-py313/bin/python -m aee.mcp_runtime.broker --directory /run/aee-broker --gateway-uid ${AEE_GATEWAY_UID} --credential-file %d/openai-api-key
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=30
+TimeoutStopSec=10
+KillMode=control-group
+OOMPolicy=stop
+MemoryHigh=192M
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=50%
+TasksMax=16
+LimitNOFILE=128
+LimitCORE=0
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/aee-broker
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

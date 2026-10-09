@@ -1,0 +1,54 @@
+[Unit]
+Description=AEE P2C %i gateway and bounded runner tree (UNINSTALLED candidate)
+Requires=aee-p2c-broker.service
+After=aee-p2c-broker.service
+BindsTo=aee-p2c-broker.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=aee-gateway
+Group=aee-gateway
+SupplementaryGroups=aee-inference
+Slice=aee-runtime.slice
+WorkingDirectory=/opt/aee/current/source
+EnvironmentFile=/etc/aee/gateway-%i.env
+StateDirectory=aee
+StateDirectoryMode=0700
+ExecStart=/opt/aee/venvs/mcp-py313/bin/python /opt/aee/current/source/mcp_gateway.py
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=45
+TimeoutStopSec=15
+KillMode=control-group
+OOMPolicy=stop
+MemoryAccounting=yes
+TasksAccounting=yes
+# config/p2c/resource-profile.json codex-readonly-r2-1; entire service/job tree.
+MemoryHigh=1536M
+MemoryMax=2G
+MemorySwapMax=0
+CPUQuota=150%
+TasksMax=64
+LimitNOFILE=256
+LimitCORE=0
+UMask=0077
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aee
+# R4A: non-setuid Bubblewrap configures loopback using NETLINK_ROUTE in a
+# fresh child net/user namespace. This family allowance is broader than ROUTE;
+# host capabilities stay empty and native command seccomp remains enforced.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+# Bubblewrap requires user/mount/PID/net namespaces. Do not add
+# RestrictNamespaces/PrivateUsers/MemoryDenyWriteExecute without fixture review.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel client for AEE A3
+Requires=aee-gateway-tunnel.service
+After=network-online.target aee-gateway-tunnel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/aee-runtime-bridge
+EnvironmentFile=%h/aee-runtime-bridge/.env.aee-tunnel-creds
+ExecStart=%h/.local/bin/tunnel-client run --profile <TUNNEL_PROFILE>
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,1185 @@
+{
+  "before_policy": [
+    {
+      "name": "159-current-p2c",
+      "result": {
+        "version": "codex-cli 0.159.2",
+        "executable_sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e",
+        "overrides": [],
+        "requests": [
+          {
+            "method": "POST",
+            "path": "/v1/responses",
+            "header_names": [
+              "accept",
+              "content-length",
+              "content-type",
+              "host",
+              "originator",
+              "session-id",
+              "thread-id",
+              "user-agent",
+              "x-client-request-id",
+              "x-codex-beta-features",
+              "x-codex-turn-metadata",
+              "x-codex-window-id",
+              "x-openai-internal-codex-responses-lite"
+            ],
+            "keys": [
+              "client_metadata",
+              "include",
+              "input",
+              "model",
+              "parallel_tool_calls",
+              "prompt_cache_key",
+              "reasoning",
+              "store",
+              "stream",
+              "text",
+              "tool_choice"
+            ],
+            "model": "gpt-6.1-sol",
+            "reasoning": {
+              "effort": "high",
+              "context": "all_turns"
+            },
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "tools": [],
+            "additional_tools": [
+              [
+                {
+                  "type": "namespace",
+                  "name": "functions",
+                  "schema_sha256": "ba29b1192366bfee22faf7aa21c133f6bf85a0114e78d03d43649501a9ce3b9f",
+                  "tools": [
+                    {
+                      "type": "custom",
+                      "name": "exec",
+                      "schema_sha256": "e9e0236044ef3feb184ae9f338f319aa207a0838d190eee94227f230cb56edcb"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait",
+                      "schema_sha256": "aa0a9201f8095e1f6d2e4c451cd697cab1b698630063fa9e2fb2d1c4b0caaa27"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input",
+                      "schema_sha256": "d966b55e964da3155fb6956528a375b7cea02b3fc189086b7d9225f4d025fa6c"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input_async",
+                      "schema_sha256": "1758e0ef7a3d190edbdad3fe9dadda9bd000d896a3eb2bd82f8dec5ff7cbef0a"
+                    }
+                  ]
+                },
+                {
+                  "type": "namespace",
+                  "name": "clock",
+                  "schema_sha256": "b91c24597c3acf3a1a35d85a764f631374f17c327ede58ce518808aff1e5c24d",
+                  "tools": [
+                    {
+                      "type": "function",
+                      "name": "sleep",
+                      "schema_sha256": "aeb52aba96d3f24b01d3669d91a8e484c5c60367754a69ba21eb668a3b83bfd9"
+                    }
+                  ]
+                },
+                {
+                  "type": "namespace",
+                  "name": "collaboration",
+                  "schema_sha256": "d3cc9067ab1757a61b99bcedf1eaddead53483a84eee3ed61d33c5e712624b20",
+                  "tools": [
+                    {
+                      "type": "function",
+                      "name": "followup_task",
+                      "schema_sha256": "99fcb47834ace2b611610ca166e044a9ee393930c52d81dd5af75733840b744f"
+                    },
+                    {
+                      "type": "function",
+                      "name": "interrupt_agent",
+                      "schema_sha256": "be9a92ade10521e273f96dfebaef1615751d38d1d6699bef23ac6cfb6c219b7f"
+                    },
+                    {
+                      "type": "function",
+                      "name": "list_agents",
+                      "schema_sha256": "40a1c60bbf212ddd66a16f724ecacefc9a315b74c78178e603b90361a5fd8ab4"
+                    },
+                    {
+                      "type": "function",
+                      "name": "send_message",
+                      "schema_sha256": "2f2df19d49585b027a1c863144ef635e76df500f08a0d3473c9130b19682b5e1"
+                    },
+                    {
+                      "type": "function",
+                      "name": "spawn_agent",
+                      "schema_sha256": "00b5d055a5edd0edeefefcec8922e830f13c3b3f97be8a11b1695ffbd3faa730"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait_agent",
+                      "schema_sha256": "59ce049f0bd5ee093105feb2081a5b35026d99ebb1edfc17c4fa58a266358182"
+                    }
+                  ]
+                }
+              ]
+            ],
+            "additional_tools_sha256": [
+              "c208a7aa613cd76569db97be2f952a0de6d2b86295200caa3a4a5d6fb1cadbe4"
+            ],
+            "input_types": [
+              "additional_tools",
+              "message",
+              "message",
+              "message",
+              "message",
+              "message",
+              "message"
+            ]
+          }
+        ],
+        "accepted_requests": 0,
+        "upstream_requests": 0,
+        "exit_code": 1,
+        "terminal_valid": false,
+        "event_types": [
+          "thread.started",
+          "item.completed",
+          "turn.started",
+          "error",
+          "turn.failed"
+        ]
+      }
+    },
+    {
+      "name": "159-agents-disabled",
+      "result": {
+        "version": "codex-cli 0.159.2",
+        "executable_sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e",
+        "overrides": [
+          "agents.enabled=false"
+        ],
+        "requests": [
+          {
+            "method": "POST",
+            "path": "/v1/responses",
+            "header_names": [
+              "accept",
+              "content-length",
+              "content-type",
+              "host",
+              "originator",
+              "session-id",
+              "thread-id",
+              "user-agent",
+              "x-client-request-id",
+              "x-codex-beta-features",
+              "x-codex-turn-metadata",
+              "x-codex-window-id",
+              "x-openai-internal-codex-responses-lite"
+            ],
+            "keys": [
+              "client_metadata",
+              "include",
+              "input",
+              "model",
+              "parallel_tool_calls",
+              "prompt_cache_key",
+              "reasoning",
+              "store",
+              "stream",
+              "text",
+              "tool_choice"
+            ],
+            "model": "gpt-6.1-sol",
+            "reasoning": {
+              "effort": "high",
+              "context": "all_turns"
+            },
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "tools": [],
+            "additional_tools": [
+              [
+                {
+                  "type": "namespace",
+                  "name": "functions",
+                  "schema_sha256": "ba29b1192366bfee22faf7aa21c133f6bf85a0114e78d03d43649501a9ce3b9f",
+                  "tools": [
+                    {
+                      "type": "custom",
+                      "name": "exec",
+                      "schema_sha256": "e9e0236044ef3feb184ae9f338f319aa207a0838d190eee94227f230cb56edcb"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait",
+                      "schema_sha256": "aa0a9201f8095e1f6d2e4c451cd697cab1b698630063fa9e2fb2d1c4b0caaa27"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input",
+                      "schema_sha256": "d966b55e964da3155fb6956528a375b7cea02b3fc189086b7d9225f4d025fa6c"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input_async",
+                      "schema_sha256": "1758e0ef7a3d190edbdad3fe9dadda9bd000d896a3eb2bd82f8dec5ff7cbef0a"
+                    }
+                  ]
+                },
+                {
+                  "type": "namespace",
+                  "name": "clock",
+                  "schema_sha256": "b91c24597c3acf3a1a35d85a764f631374f17c327ede58ce518808aff1e5c24d",
+                  "tools": [
+                    {
+                      "type": "function",
+                      "name": "sleep",
+                      "schema_sha256": "aeb52aba96d3f24b01d3669d91a8e484c5c60367754a69ba21eb668a3b83bfd9"
+                    }
+                  ]
+                }
+              ]
+            ],
+            "additional_tools_sha256": [
+              "9bc8d86f39e73903207d9432ec5b6418bd65ae9908adb25f98584df9f42d350f"
+            ],
+            "input_types": [
+              "additional_tools",
+              "message",
+              "message",
+              "message",
+              "message"
+            ]
+          }
+        ],
+        "accepted_requests": 0,
+        "upstream_requests": 0,
+        "exit_code": 1,
+        "terminal_valid": false,
+        "event_types": [
+          "thread.started",
+          "item.completed",
+          "turn.started",
+          "error",
+          "turn.failed"
+        ]
+      }
+    },
+    {
+      "name": "159-minimal",
+      "result": {
+        "version": "codex-cli 0.159.2",
+        "executable_sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e",
+        "overrides": [
+          "agents.enabled=false",
+          "features.sleep_tool=false",
+          "tools.experimental_request_user_input.enabled=false"
+        ],
+        "requests": [
+          {
+            "method": "POST",
+            "path": "/v1/responses",
+            "header_names": [
+              "accept",
+              "content-length",
+              "content-type",
+              "host",
+              "originator",
+              "session-id",
+              "thread-id",
+              "user-agent",
+              "x-client-request-id",
+              "x-codex-beta-features",
+              "x-codex-turn-metadata",
+              "x-codex-window-id",
+              "x-openai-internal-codex-responses-lite"
+            ],
+            "keys": [
+              "client_metadata",
+              "include",
+              "input",
+              "model",
+              "parallel_tool_calls",
+              "prompt_cache_key",
+              "reasoning",
+              "store",
+              "stream",
+              "text",
+              "tool_choice"
+            ],
+            "model": "gpt-6.1-sol",
+            "reasoning": {
+              "effort": "high",
+              "context": "all_turns"
+            },
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "tools": [],
+            "additional_tools": [
+              [
+                {
+                  "type": "namespace",
+                  "name": "functions",
+                  "schema_sha256": "fcea1462459a6115595eb7b1895eba53f4e70a0dbffeeccbc9b9de34d36cb586",
+                  "tools": [
+                    {
+                      "type": "custom",
+                      "name": "exec",
+                      "schema_sha256": "e9e0236044ef3feb184ae9f338f319aa207a0838d190eee94227f230cb56edcb"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait",
+                      "schema_sha256": "aa0a9201f8095e1f6d2e4c451cd697cab1b698630063fa9e2fb2d1c4b0caaa27"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input_async",
+                      "schema_sha256": "1758e0ef7a3d190edbdad3fe9dadda9bd000d896a3eb2bd82f8dec5ff7cbef0a"
+                    }
+                  ]
+                }
+              ]
+            ],
+            "additional_tools_sha256": [
+              "225c191d28cbee94126542e86c7090cca69a2f81fb0c8f74fd9643c434cfb58f"
+            ],
+            "input_types": [
+              "additional_tools",
+              "message",
+              "message",
+              "message",
+              "message"
+            ]
+          }
+        ],
+        "accepted_requests": 0,
+        "upstream_requests": 0,
+        "exit_code": 1,
+        "terminal_valid": false,
+        "event_types": [
+          "thread.started",
+          "item.completed",
+          "turn.started",
+          "error",
+          "turn.failed"
+        ]
+      }
+    },
+    {
+      "name": "159-host-disabled",
+      "result": {
+        "version": "codex-cli 0.159.2",
+        "executable_sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e",
+        "overrides": [
+          "agents.enabled=false",
+          "features.sleep_tool=false",
+          "tools.experimental_request_user_input.enabled=false",
+          "features.code_mode_host=false"
+        ],
+        "requests": [
+          {
+            "method": "POST",
+            "path": "/v1/responses",
+            "header_names": [
+              "accept",
+              "content-length",
+              "content-type",
+              "host",
+              "originator",
+              "session-id",
+              "thread-id",
+              "user-agent",
+              "x-client-request-id",
+              "x-codex-beta-features",
+              "x-codex-turn-metadata",
+              "x-codex-window-id",
+              "x-openai-internal-codex-responses-lite"
+            ],
+            "keys": [
+              "client_metadata",
+              "include",
+              "input",
+              "model",
+              "parallel_tool_calls",
+              "prompt_cache_key",
+              "reasoning",
+              "store",
+              "stream",
+              "text",
+              "tool_choice"
+            ],
+            "model": "gpt-6.1-sol",
+            "reasoning": {
+              "effort": "high",
+              "context": "all_turns"
+            },
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "tools": [],
+            "additional_tools": [
+              [
+                {
+                  "type": "namespace",
+                  "name": "functions",
+                  "schema_sha256": "fcea1462459a6115595eb7b1895eba53f4e70a0dbffeeccbc9b9de34d36cb586",
+                  "tools": [
+                    {
+                      "type": "custom",
+                      "name": "exec",
+                      "schema_sha256": "e9e0236044ef3feb184ae9f338f319aa207a0838d190eee94227f230cb56edcb"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait",
+                      "schema_sha256": "aa0a9201f8095e1f6d2e4c451cd697cab1b698630063fa9e2fb2d1c4b0caaa27"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input_async",
+                      "schema_sha256": "1758e0ef7a3d190edbdad3fe9dadda9bd000d896a3eb2bd82f8dec5ff7cbef0a"
+                    }
+                  ]
+                }
+              ]
+            ],
+            "additional_tools_sha256": [
+              "225c191d28cbee94126542e86c7090cca69a2f81fb0c8f74fd9643c434cfb58f"
+            ],
+            "input_types": [
+              "additional_tools",
+              "message",
+              "message",
+              "message",
+              "message"
+            ]
+          }
+        ],
+        "accepted_requests": 0,
+        "upstream_requests": 0,
+        "exit_code": 1,
+        "terminal_valid": false,
+        "event_types": [
+          "thread.started",
+          "item.completed",
+          "item.completed",
+          "turn.started",
+          "error",
+          "turn.failed"
+        ]
+      }
+    },
+    {
+      "name": "160-current-p2c",
+      "result": {
+        "version": "codex-cli 0.160.0",
+        "executable_sha256": "12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad",
+        "overrides": [],
+        "requests": [
+          {
+            "method": "POST",
+            "path": "/v1/responses",
+            "header_names": [
+              "accept",
+              "content-length",
+              "content-type",
+              "host",
+              "originator",
+              "session-id",
+              "thread-id",
+              "user-agent",
+              "x-client-request-id",
+              "x-codex-beta-features",
+              "x-codex-turn-metadata",
+              "x-codex-window-id",
+              "x-openai-internal-codex-responses-lite"
+            ],
+            "keys": [
+              "client_metadata",
+              "include",
+              "input",
+              "model",
+              "parallel_tool_calls",
+              "prompt_cache_key",
+              "reasoning",
+              "store",
+              "stream",
+              "text",
+              "tool_choice"
+            ],
+            "model": "gpt-6.1-sol",
+            "reasoning": {
+              "effort": "high",
+              "context": "all_turns"
+            },
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "tools": [],
+            "additional_tools": [
+              [
+                {
+                  "type": "namespace",
+                  "name": "functions",
+                  "schema_sha256": "ba29b1192366bfee22faf7aa21c133f6bf85a0114e78d03d43649501a9ce3b9f",
+                  "tools": [
+                    {
+                      "type": "custom",
+                      "name": "exec",
+                      "schema_sha256": "e9e0236044ef3feb184ae9f338f319aa207a0838d190eee94227f230cb56edcb"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait",
+                      "schema_sha256": "aa0a9201f8095e1f6d2e4c451cd697cab1b698630063fa9e2fb2d1c4b0caaa27"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input",
+                      "schema_sha256": "d966b55e964da3155fb6956528a375b7cea02b3fc189086b7d9225f4d025fa6c"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input_async",
+                      "schema_sha256": "1758e0ef7a3d190edbdad3fe9dadda9bd000d896a3eb2bd82f8dec5ff7cbef0a"
+                    }
+                  ]
+                },
+                {
+                  "type": "namespace",
+                  "name": "clock",
+                  "schema_sha256": "b91c24597c3acf3a1a35d85a764f631374f17c327ede58ce518808aff1e5c24d",
+                  "tools": [
+                    {
+                      "type": "function",
+                      "name": "sleep",
+                      "schema_sha256": "aeb52aba96d3f24b01d3669d91a8e484c5c60367754a69ba21eb668a3b83bfd9"
+                    }
+                  ]
+                },
+                {
+                  "type": "namespace",
+                  "name": "collaboration",
+                  "schema_sha256": "d3cc9067ab1757a61b99bcedf1eaddead53483a84eee3ed61d33c5e712624b20",
+                  "tools": [
+                    {
+                      "type": "function",
+                      "name": "followup_task",
+                      "schema_sha256": "99fcb47834ace2b611610ca166e044a9ee393930c52d81dd5af75733840b744f"
+                    },
+                    {
+                      "type": "function",
+                      "name": "interrupt_agent",
+                      "schema_sha256": "be9a92ade10521e273f96dfebaef1615751d38d1d6699bef23ac6cfb6c219b7f"
+                    },
+                    {
+                      "type": "function",
+                      "name": "list_agents",
+                      "schema_sha256": "40a1c60bbf212ddd66a16f724ecacefc9a315b74c78178e603b90361a5fd8ab4"
+                    },
+                    {
+                      "type": "function",
+                      "name": "send_message",
+                      "schema_sha256": "2f2df19d49585b027a1c863144ef635e76df500f08a0d3473c9130b19682b5e1"
+                    },
+                    {
+                      "type": "function",
+                      "name": "spawn_agent",
+                      "schema_sha256": "00b5d055a5edd0edeefefcec8922e830f13c3b3f97be8a11b1695ffbd3faa730"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait_agent",
+                      "schema_sha256": "59ce049f0bd5ee093105feb2081a5b35026d99ebb1edfc17c4fa58a266358182"
+                    }
+                  ]
+                }
+              ]
+            ],
+            "additional_tools_sha256": [
+              "c208a7aa613cd76569db97be2f952a0de6d2b86295200caa3a4a5d6fb1cadbe4"
+            ],
+            "input_types": [
+              "additional_tools",
+              "message",
+              "message",
+              "message",
+              "message",
+              "message",
+              "message"
+            ]
+          }
+        ],
+        "accepted_requests": 0,
+        "upstream_requests": 0,
+        "exit_code": 1,
+        "terminal_valid": false,
+        "event_types": [
+          "thread.started",
+          "item.completed",
+          "turn.started",
+          "error",
+          "turn.failed"
+        ]
+      }
+    },
+    {
+      "name": "160-minimal",
+      "result": {
+        "version": "codex-cli 0.160.0",
+        "executable_sha256": "12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad",
+        "overrides": [
+          "agents.enabled=false",
+          "features.sleep_tool=false",
+          "tools.experimental_request_user_input.enabled=false"
+        ],
+        "requests": [
+          {
+            "method": "POST",
+            "path": "/v1/responses",
+            "header_names": [
+              "accept",
+              "content-length",
+              "content-type",
+              "host",
+              "originator",
+              "session-id",
+              "thread-id",
+              "user-agent",
+              "x-client-request-id",
+              "x-codex-beta-features",
+              "x-codex-turn-metadata",
+              "x-codex-window-id",
+              "x-openai-internal-codex-responses-lite"
+            ],
+            "keys": [
+              "client_metadata",
+              "include",
+              "input",
+              "model",
+              "parallel_tool_calls",
+              "prompt_cache_key",
+              "reasoning",
+              "store",
+              "stream",
+              "text",
+              "tool_choice"
+            ],
+            "model": "gpt-6.1-sol",
+            "reasoning": {
+              "effort": "high",
+              "context": "all_turns"
+            },
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "tools": [],
+            "additional_tools": [
+              [
+                {
+                  "type": "namespace",
+                  "name": "functions",
+                  "schema_sha256": "fcea1462459a6115595eb7b1895eba53f4e70a0dbffeeccbc9b9de34d36cb586",
+                  "tools": [
+                    {
+                      "type": "custom",
+                      "name": "exec",
+                      "schema_sha256": "e9e0236044ef3feb184ae9f338f319aa207a0838d190eee94227f230cb56edcb"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait",
+                      "schema_sha256": "aa0a9201f8095e1f6d2e4c451cd697cab1b698630063fa9e2fb2d1c4b0caaa27"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input_async",
+                      "schema_sha256": "1758e0ef7a3d190edbdad3fe9dadda9bd000d896a3eb2bd82f8dec5ff7cbef0a"
+                    }
+                  ]
+                }
+              ]
+            ],
+            "additional_tools_sha256": [
+              "225c191d28cbee94126542e86c7090cca69a2f81fb0c8f74fd9643c434cfb58f"
+            ],
+            "input_types": [
+              "additional_tools",
+              "message",
+              "message",
+              "message",
+              "message"
+            ]
+          }
+        ],
+        "accepted_requests": 0,
+        "upstream_requests": 0,
+        "exit_code": 1,
+        "terminal_valid": false,
+        "event_types": [
+          "thread.started",
+          "item.completed",
+          "turn.started",
+          "error",
+          "turn.failed"
+        ]
+      }
+    }
+  ],
+  "after_policy": [
+    {
+      "name": "159-selected",
+      "result": {
+        "version": "codex-cli 0.159.2",
+        "executable_sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e",
+        "overrides": [],
+        "requests": [
+          {
+            "method": "POST",
+            "path": "/v1/responses",
+            "header_names": [
+              "accept",
+              "content-length",
+              "content-type",
+              "host",
+              "originator",
+              "session-id",
+              "thread-id",
+              "user-agent",
+              "x-client-request-id",
+              "x-codex-beta-features",
+              "x-codex-turn-metadata",
+              "x-codex-window-id",
+              "x-openai-internal-codex-responses-lite"
+            ],
+            "keys": [
+              "client_metadata",
+              "include",
+              "input",
+              "model",
+              "parallel_tool_calls",
+              "prompt_cache_key",
+              "reasoning",
+              "store",
+              "stream",
+              "text",
+              "tool_choice"
+            ],
+            "model": "gpt-6.1-sol",
+            "reasoning": {
+              "effort": "high",
+              "context": "all_turns"
+            },
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "tools": [],
+            "additional_tools": [
+              [
+                {
+                  "type": "namespace",
+                  "name": "functions",
+                  "schema_sha256": "eb6e3e0208bc83de33fdd641a371543c745c487567f295b99146274ff0bdc412",
+                  "tools": [
+                    {
+                      "type": "custom",
+                      "name": "exec",
+                      "schema_sha256": "40a50a4b21f007bfa145c1a77dfb8d76d2ce94d0e4448eaee046d6d07fcabdd5"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait",
+                      "schema_sha256": "aa0a9201f8095e1f6d2e4c451cd697cab1b698630063fa9e2fb2d1c4b0caaa27"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input_async",
+                      "schema_sha256": "1758e0ef7a3d190edbdad3fe9dadda9bd000d896a3eb2bd82f8dec5ff7cbef0a"
+                    }
+                  ]
+                }
+              ]
+            ],
+            "additional_tools_sha256": [
+              "8b94e0eb34175a0d2ac7e364d2f6b38524ee5cb8f24ea419169a342d51e13917"
+            ],
+            "input_types": [
+              "additional_tools",
+              "message",
+              "message",
+              "message",
+              "message"
+            ]
+          }
+        ],
+        "accepted_requests": 1,
+        "upstream_requests": 1,
+        "exit_code": 0,
+        "terminal_valid": true,
+        "event_types": [
+          "thread.started",
+          "item.completed",
+          "turn.started",
+          "item.completed",
+          "turn.completed"
+        ]
+      }
+    },
+    {
+      "name": "160-selected",
+      "result": {
+        "version": "codex-cli 0.160.0",
+        "executable_sha256": "12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad",
+        "overrides": [],
+        "requests": [
+          {
+            "method": "POST",
+            "path": "/v1/responses",
+            "header_names": [
+              "accept",
+              "content-length",
+              "content-type",
+              "host",
+              "originator",
+              "session-id",
+              "thread-id",
+              "user-agent",
+              "x-client-request-id",
+              "x-codex-beta-features",
+              "x-codex-turn-metadata",
+              "x-codex-window-id",
+              "x-openai-internal-codex-responses-lite"
+            ],
+            "keys": [
+              "client_metadata",
+              "include",
+              "input",
+              "model",
+              "parallel_tool_calls",
+              "prompt_cache_key",
+              "reasoning",
+              "store",
+              "stream",
+              "text",
+              "tool_choice"
+            ],
+            "model": "gpt-6.1-sol",
+            "reasoning": {
+              "effort": "high",
+              "context": "all_turns"
+            },
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "tools": [],
+            "additional_tools": [
+              [
+                {
+                  "type": "namespace",
+                  "name": "functions",
+                  "schema_sha256": "eb6e3e0208bc83de33fdd641a371543c745c487567f295b99146274ff0bdc412",
+                  "tools": [
+                    {
+                      "type": "custom",
+                      "name": "exec",
+                      "schema_sha256": "40a50a4b21f007bfa145c1a77dfb8d76d2ce94d0e4448eaee046d6d07fcabdd5"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait",
+                      "schema_sha256": "aa0a9201f8095e1f6d2e4c451cd697cab1b698630063fa9e2fb2d1c4b0caaa27"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input_async",
+                      "schema_sha256": "1758e0ef7a3d190edbdad3fe9dadda9bd000d896a3eb2bd82f8dec5ff7cbef0a"
+                    }
+                  ]
+                }
+              ]
+            ],
+            "additional_tools_sha256": [
+              "8b94e0eb34175a0d2ac7e364d2f6b38524ee5cb8f24ea419169a342d51e13917"
+            ],
+            "input_types": [
+              "additional_tools",
+              "message",
+              "message",
+              "message",
+              "message"
+            ]
+          }
+        ],
+        "accepted_requests": 1,
+        "upstream_requests": 1,
+        "exit_code": 0,
+        "terminal_valid": true,
+        "event_types": [
+          "thread.started",
+          "item.completed",
+          "turn.started",
+          "item.completed",
+          "turn.completed"
+        ]
+      }
+    },
+    {
+      "name": "159-collaboration-restored",
+      "result": {
+        "version": "codex-cli 0.159.2",
+        "executable_sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e",
+        "overrides": [
+          "agents.enabled=true"
+        ],
+        "requests": [
+          {
+            "method": "POST",
+            "path": "/v1/responses",
+            "header_names": [
+              "accept",
+              "content-length",
+              "content-type",
+              "host",
+              "originator",
+              "session-id",
+              "thread-id",
+              "user-agent",
+              "x-client-request-id",
+              "x-codex-beta-features",
+              "x-codex-turn-metadata",
+              "x-codex-window-id",
+              "x-openai-internal-codex-responses-lite"
+            ],
+            "keys": [
+              "client_metadata",
+              "include",
+              "input",
+              "model",
+              "parallel_tool_calls",
+              "prompt_cache_key",
+              "reasoning",
+              "store",
+              "stream",
+              "text",
+              "tool_choice"
+            ],
+            "model": "gpt-6.1-sol",
+            "reasoning": {
+              "effort": "high",
+              "context": "all_turns"
+            },
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "tools": [],
+            "additional_tools": [
+              [
+                {
+                  "type": "namespace",
+                  "name": "functions",
+                  "schema_sha256": "eb6e3e0208bc83de33fdd641a371543c745c487567f295b99146274ff0bdc412",
+                  "tools": [
+                    {
+                      "type": "custom",
+                      "name": "exec",
+                      "schema_sha256": "40a50a4b21f007bfa145c1a77dfb8d76d2ce94d0e4448eaee046d6d07fcabdd5"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait",
+                      "schema_sha256": "aa0a9201f8095e1f6d2e4c451cd697cab1b698630063fa9e2fb2d1c4b0caaa27"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input_async",
+                      "schema_sha256": "1758e0ef7a3d190edbdad3fe9dadda9bd000d896a3eb2bd82f8dec5ff7cbef0a"
+                    }
+                  ]
+                },
+                {
+                  "type": "namespace",
+                  "name": "collaboration",
+                  "schema_sha256": "d3cc9067ab1757a61b99bcedf1eaddead53483a84eee3ed61d33c5e712624b20",
+                  "tools": [
+                    {
+                      "type": "function",
+                      "name": "followup_task",
+                      "schema_sha256": "99fcb47834ace2b611610ca166e044a9ee393930c52d81dd5af75733840b744f"
+                    },
+                    {
+                      "type": "function",
+                      "name": "interrupt_agent",
+                      "schema_sha256": "be9a92ade10521e273f96dfebaef1615751d38d1d6699bef23ac6cfb6c219b7f"
+                    },
+                    {
+                      "type": "function",
+                      "name": "list_agents",
+                      "schema_sha256": "40a1c60bbf212ddd66a16f724ecacefc9a315b74c78178e603b90361a5fd8ab4"
+                    },
+                    {
+                      "type": "function",
+                      "name": "send_message",
+                      "schema_sha256": "2f2df19d49585b027a1c863144ef635e76df500f08a0d3473c9130b19682b5e1"
+                    },
+                    {
+                      "type": "function",
+                      "name": "spawn_agent",
+                      "schema_sha256": "00b5d055a5edd0edeefefcec8922e830f13c3b3f97be8a11b1695ffbd3faa730"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait_agent",
+                      "schema_sha256": "59ce049f0bd5ee093105feb2081a5b35026d99ebb1edfc17c4fa58a266358182"
+                    }
+                  ]
+                }
+              ]
+            ],
+            "additional_tools_sha256": [
+              "b9ff739d2f6a3a0d9c7d483a909aeb222a5a09018e869a60092351da3cde89ff"
+            ],
+            "input_types": [
+              "additional_tools",
+              "message",
+              "message",
+              "message",
+              "message",
+              "message",
+              "message"
+            ]
+          }
+        ],
+        "accepted_requests": 0,
+        "upstream_requests": 0,
+        "exit_code": 1,
+        "terminal_valid": false,
+        "event_types": [
+          "thread.started",
+          "item.completed",
+          "turn.started",
+          "error",
+          "turn.failed"
+        ]
+      }
+    },
+    {
+      "name": "159-selected-host-disabled",
+      "result": {
+        "version": "codex-cli 0.159.2",
+        "executable_sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e",
+        "overrides": [
+          "features.code_mode_host=false"
+        ],
+        "requests": [
+          {
+            "method": "POST",
+            "path": "/v1/responses",
+            "header_names": [
+              "accept",
+              "content-length",
+              "content-type",
+              "host",
+              "originator",
+              "session-id",
+              "thread-id",
+              "user-agent",
+              "x-client-request-id",
+              "x-codex-beta-features",
+              "x-codex-turn-metadata",
+              "x-codex-window-id",
+              "x-openai-internal-codex-responses-lite"
+            ],
+            "keys": [
+              "client_metadata",
+              "include",
+              "input",
+              "model",
+              "parallel_tool_calls",
+              "prompt_cache_key",
+              "reasoning",
+              "store",
+              "stream",
+              "text",
+              "tool_choice"
+            ],
+            "model": "gpt-6.1-sol",
+            "reasoning": {
+              "effort": "high",
+              "context": "all_turns"
+            },
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "tools": [],
+            "additional_tools": [
+              [
+                {
+                  "type": "namespace",
+                  "name": "functions",
+                  "schema_sha256": "eb6e3e0208bc83de33fdd641a371543c745c487567f295b99146274ff0bdc412",
+                  "tools": [
+                    {
+                      "type": "custom",
+                      "name": "exec",
+                      "schema_sha256": "40a50a4b21f007bfa145c1a77dfb8d76d2ce94d0e4448eaee046d6d07fcabdd5"
+                    },
+                    {
+                      "type": "function",
+                      "name": "wait",
+                      "schema_sha256": "aa0a9201f8095e1f6d2e4c451cd697cab1b698630063fa9e2fb2d1c4b0caaa27"
+                    },
+                    {
+                      "type": "function",
+                      "name": "request_user_input_async",
+                      "schema_sha256": "1758e0ef7a3d190edbdad3fe9dadda9bd000d896a3eb2bd82f8dec5ff7cbef0a"
+                    }
+                  ]
+                }
+              ]
+            ],
+            "additional_tools_sha256": [
+              "8b94e0eb34175a0d2ac7e364d2f6b38524ee5cb8f24ea419169a342d51e13917"
+            ],
+            "input_types": [
+              "additional_tools",
+              "message",
+              "message",
+              "message",
+              "message"
+            ]
+          }
+        ],
+        "accepted_requests": 1,
+        "upstream_requests": 1,
+        "exit_code": 0,
+        "terminal_valid": true,
+        "event_types": [
+          "thread.started",
+          "item.completed",
+          "item.completed",
+          "turn.started",
+          "item.completed",
+          "turn.completed"
+        ]
+      }
+    }
+  ]
+}
