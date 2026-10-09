@@ -122,6 +122,27 @@ jobs:
             test -f /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
             sudo ln -s x86_64-linux-gnu/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
           fi
+          # Probe the real fixture sandbox before discovery collapses its
+          # startup errors into AGENT_UNAVAILABLE. No credentials or model.
+          python - <<'PY'
+          import subprocess, sys, tempfile
+          from pathlib import Path
+          from aee.mcp_runtime.process import Limits, run_bounded
+          from aee.mcp_runtime.sandbox import sandbox_command
+          with tempfile.TemporaryDirectory(prefix='aee-ci-sandbox-') as name:
+              root = Path(name)
+              binary = root / 'codex'
+              workspace = root / 'source'
+              workspace.mkdir()
+              subprocess.run(['gcc', '-O2', 'tests/mcp/fixtures/codex_probe.c', '-o', str(binary)], check=True)
+              limits = Limits(timeout=5)
+              result = run_bounded(sandbox_command(binary, workspace, ['/runner/codex', '--version'], limits), env={}, limits=limits)
+              sys.stdout.write(result.stdout.decode(errors='replace'))
+              sys.stderr.write(result.stderr.decode(errors='replace'))
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+              assert result.stdout.startswith(b'codex-cli ')
+          PY
       - name: Install hashed MCP closure
         run: python -m pip install --require-hashes -r requirements-mcp.lock
       - name: Import and packaging CLI smoke
