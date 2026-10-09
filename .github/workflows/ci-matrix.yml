@@ -110,11 +110,29 @@ jobs:
         with:
           python-version: '3.13'
       - name: Install fixture prerequisites
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap gcc systemd
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap gcc systemd apparmor
       - name: Prepare runner sandbox fixtures
         run: |
           bwrap --version
           systemd-analyze --version
+          # CI VM only: Noble restricts namespace capabilities unless the
+          # sandbox helper has an explicit userns profile. Keep the global
+          # AppArmor restriction enabled and scope the grant to /usr/bin/bwrap.
+          # https://documentation.ubuntu.com/release-notes/24.04/
+          for profile in /etc/apparmor.d/bwrap /etc/apparmor.d/bwrap-userns-restrict; do
+            if [ -f "$profile" ]; then
+              sudo apparmor_parser -R "$profile"
+            fi
+          done
+          cat > "$RUNNER_TEMP/aee-ci-bwrap.apparmor" <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile aee-ci-bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          sudo apparmor_parser -r "$RUNNER_TEMP/aee-ci-bwrap.apparmor"
+          sysctl kernel.apparmor_restrict_unprivileged_userns
           # CI only: the reviewed sandbox uses /lib64 -> /usr/lib. Ubuntu's
           # loader lives in a multiarch directory; provide its equivalent alias
           # for fixture ELF/prlimit execution without changing the runtime view.
