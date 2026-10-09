@@ -23,6 +23,7 @@ from aee.mcp_runtime.sandbox import sandbox_command
 from aee.mcp_runtime.store import JobError
 
 ROOT = Path(__file__).resolve().parents[2]
+FIXTURES = Path(__file__).parent / 'fixtures'
 NATIVE = Path(os.environ.get('AEE_TEST_NATIVE_CODEX', '/nonexistent/qualification/codex'))
 JOB = 'A3JOB-20261003-' + 'a' * 32
 
@@ -211,6 +212,37 @@ class P2CBroker(unittest.TestCase):
         self.assertIn('model_providers.aee_broker.requires_openai_auth=false', argv)
         self.assertIn('model_providers.aee_broker.supports_websockets=false', argv)
         self.assertNotIn('OPENAI_API_KEY', ' '.join(argv))
+
+    def test_upstream_tool_call_history_without_namespace_admitted(self):
+        # Real api.openai.com Responses serialization of the client's own final
+        # turn omits `namespace` on custom tool call items; the reviewed R1
+        # qualification fixtures carry `functions`. Only both spellings pass;
+        # the name allowlist stays `exec` (read-only) — any other name or
+        # namespace is a policy bypass attempt.
+        tools = json.loads((FIXTURES / 'codex-r1-approved-tools.json').read_text())
+        body = request_body()
+        body['input'].insert(0, {'type': 'additional_tools', 'role': 'developer', 'tools': tools})
+        body['input'] += [
+            {'type': 'custom_tool_call', 'id': 'tcx', 'call_id': 'cx', 'input': 'text("x")',
+             'status': 'completed', 'name': 'exec'},
+            {'type': 'custom_tool_call_output', 'id': 'tcxout', 'call_id': 'cx', 'output': 'x'},
+        ]
+        self.assertEqual(json.loads(validate_request('POST', '/v1/responses', {}, json.dumps(body).encode()))['input'],
+                         body['input'])
+    def test_tool_call_name_and_namespace_drift_rejected(self):
+        tools = json.loads((FIXTURES / 'codex-r1-approved-tools.json').read_text())
+        for name, namespace in [('exec_command', None), ('spawn_agent', None), ('exec', 'unknown'),
+                                ('exec', 'functions' + 'x'), ('exec', '')]:
+            with self.subTest(name=name, namespace=namespace):
+                body = request_body()
+                body['input'].insert(0, {'type': 'additional_tools', 'role': 'developer', 'tools': tools})
+                call = {'type': 'custom_tool_call', 'id': 'tcx', 'call_id': 'cx', 'input': 'x', 'name': name}
+                if namespace is not None:
+                    call['namespace'] = namespace
+                body['input'] += [call, {'type': 'custom_tool_call_output', 'id': 'o', 'call_id': 'cx', 'output': 'x'}]
+                with self.assertRaises(PolicyError):
+                    validate_request('POST', '/v1/responses', {}, json.dumps(body).encode())
+
 
     @unittest.skipUnless(NATIVE.exists(), 'operator-pinned native CLI contract probe unavailable')
     def test_actual_native_cli_completes_approved_single_agent_contract(self):

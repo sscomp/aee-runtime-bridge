@@ -5,6 +5,32 @@ existing offline `aee.mcp_runtime.packaging` entrypoint and supplied systemd uni
 `install.sh` remains the compatibility HTTP/profile installer. No source checkout,
 package build or CI result constitutes permission to deploy a host.
 
+The sequence has five tiers; stop at the tier your authorization allows:
+
+- **§0–2 Local validation** (no root, no credentials) — proves the repository
+  installs and the MCP protocol surface is intact. **Verified working on a fresh
+  host with these exact commands** (see §5 evidence note).
+- **§2c Broker-qualified local dispatch** (no root, needs an OpenAI API key
+  provisioned by the operator) — real read-only Codex jobs on a running gateway.
+  **Verified working on a fresh host.**
+- **§3–4 Production deployment** (root) — immutable release layout, system
+  accounts, pinned binaries, operator review gate. Adds native telemetry receipts,
+  cgroup containment checks and broker corroboration on top of §2c.
+
+## 0. Host tooling (user-level, reversible, no root)
+
+```bash
+command -v git curl gcc prlimit bwrap || true
+# Missing uv? Install it user-level; it manages its own CPython 3.13:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+```
+
+`uv venv --python 3.13` fetches and runs a uv-managed CPython 3.13 when the host
+Python differs — no system Python change is needed. Rollback: delete `~/.local/bin/uv*`
+and `~/.local/share/uv`.
+
 ## 1. Inspect the host and choose a reviewed commit
 
 Use a fresh Linux x86_64 host with systemd/cgroup v2, CPython 3.13.x, `uv`, Git,
@@ -55,6 +81,72 @@ operator's `/tmp` data to satisfy it.
 
 Native qualification tests report explicit skips without operator-provided native
 paths. They are documented in [runtime tests](../tests/mcp/README.md).
+
+## 2b. Local gateway run (no root; documented non-production run mode)
+
+The gateway is env-driven and runs from the checkout as an unprivileged user. This
+mode exercises the real HTTP MCP server without any production approval; it emits
+`0.2.0-p2c-candidate` health data and must not be represented as a production
+deployment.
+
+1. Provision a private env file (mode 0600, **outside** the checkout) from
+   `config/p2c/gateway-restricted.env.example`, replacing every `<...>` value.
+   Key minimum for a gateway-only run: `MCP_BRIDGE_API_KEY` (generate with
+   `python -c 'import secrets; print(secrets.token_urlsafe(32))'`), the
+   `AEE_MCP_*` block verbatim from the example, and `A3_JOB_STORE_DIR` pointing
+   outside the checkout (job state must not dirty the tree).
+2. Generate the dispatch workspace manifest for your chosen allowed root with the
+   packager's own generator (any path→sha256 map of the working tree works):
+   `aee.mcp_runtime.packaging.make_manifest(root, git_commit)`.
+3. Run it under a dedicated user service (distinct unit name, e.g.
+   `aee-v2-local-gateway`): `ExecStart=.../.venv/bin/python mcp_gateway.py` with
+   that EnvironmentFile; do not enable it at boot until the operator decides.
+4. Verify with [agent operations](agent-operations.md): `/health`, MCP
+   `initialize`, `tools/list` (exactly five tools), auth negatives.
+
+Without the broker, dispatch **admits and enforces** jobs but a real Codex run
+fails `OUTPUT_LIMIT_EXCEEDED` (SIGXFSZ): codex's own session-state writes exceed
+the default `Limits.file_bytes` of 64 KiB, which only the broker-relayed path
+([§2c](#2c-broker-qualified-local-dispatch-no-root-needed)) raises to 4 MiB. Treat a
+queued-but-failed job as **not** completed dispatch.
+
+## 2c. Broker-qualified local dispatch (no root needed)
+
+Real dispatch E2E requires the inference broker: it holds the model credential in
+a private file and hands each job a per-job UDS to the fixed OpenAI Responses
+endpoint. Same host, no root:
+
+1. **Operator provisions the credential** (never via chat/reports/commits): place
+   the OpenAI API key in a directory-restricted path, mode 0600, e.g.
+   `~/.private/aee/openai-api-key`. Record the path only.
+2. Start the broker with a private socket directory and the credential:
+   `.venv/bin/python -m aee.mcp_runtime.broker --directory <private-socket-dir>
+   --gateway-uid <your-numeric-uid> --credential-file <credential-path>`
+   under its own user unit (distinct name, e.g. `aee-v2-local-broker`),
+   `Restart=on-failure`, bounded `MemoryMax`.
+3. Extend the gateway env with `AEE_BROKER_CONTROL=<socket-dir>/control.sock` and
+   restart only the gateway unit.
+4. Dispatch a bounded read-only job per [agent operations](agent-operations.md).
+   With the broker socket present, job tempfs/file limits are relaxed to the
+   measured codex runtime needs (4 MiB RLIMIT_FSIZE) and the job can complete.
+5. Keep both units *not enabled at boot* unless the operator decides otherwise;
+   stop/disable for full rollback. This mode is **local-qualified dispatch, not
+   production**: no operator telemetry, no native-receipt corroboration, no
+   cgroup containment proof (§3–4 production adds those).
+
+## 5. Host evidence notes (provenance)
+
+When deploying pinned binaries, always re-hash after download and record the
+source URL and attestations with the deployment evidence. The `provider_contract.py`
+native Codex/companion digests correspond to the official
+`openai/codex` release `rust-v0.159.2` musl artifacts (verify with `sha256sum`
+after extraction; the release publishes sigstore attestations for each asset).
+`config/p2c/sandbox-profile.json` additionally pins an exact Bubblewrap `0.12.0`
+binary digest whose upstream provenance is **not documented in this repository**;
+`bwrap-x86_64-unknown-linux-musl` shipped with `openai/codex` releases hashes
+differently, so production sandbox admission requires the operator to supply the
+exact artifact recorded at review time (or a re-pinned policy after an explicit
+review).
 
 ## 3. Build, verify and plan an immutable release
 

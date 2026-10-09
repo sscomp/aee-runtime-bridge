@@ -7,6 +7,11 @@ Plugin distribution. Instructions were checked against the official
 [Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 and [custom MCP server guide](https://developers.openai.com/api/docs/guides/custom-mcp-server).
 
+Complete step-by-step expansions of this summary: [end-to-end tunnel
+guide](openai-secure-mcp-tunnel.md) and the [Plugin
+walkthrough](chatgpt-plugin-deployment.md) — both carry the current
+**NOT YET TESTED (Stage 3B)** labels.
+
 ## Tunnel setup
 
 The operator obtains a tunnel ID and runtime control-plane key in Platform,
