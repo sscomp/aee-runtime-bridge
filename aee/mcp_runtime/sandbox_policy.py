@@ -8,7 +8,7 @@ from .resource_policy import resource_record
 from .store import JobError
 
 PROFILE_PATH = Path(__file__).resolve().parents[2] / 'config/p2c/sandbox-profile.json'
-PROFILE_SHA256 = '03b4157a3239c32e508511344784e99d7185183210e595a66ca5c67465752cd7'
+PROFILE_SHA256 = '25055189bc2812380b51fbb4a0f3d80766f509fe891a8a58f635bd5896770ae0'
 FAILURE_REVISION = 'codex-native-otlp-r3-1'
 
 

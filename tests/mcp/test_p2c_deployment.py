@@ -22,6 +22,21 @@ from aee.mcp_runtime.store import JobError, JobStore
 ROOT=Path(__file__).resolve().parents[2]
 
 
+class P2CPinIntegrity(unittest.TestCase):
+    def test_sandbox_pin_matches_profile_bytes_and_cross_references(self):
+        profile=json.loads(SANDBOX_PROFILE.read_text())
+        self.assertEqual(profile['bwrap_path'], '/usr/bin/bwrap')
+        self.assertRegex(profile['bwrap_sha256'], r'^[a-f0-9]{64}$')
+        self.assertRegex(hashlib.sha256(SANDBOX_PROFILE.read_bytes()).hexdigest(), r'^[a-f0-9]{64}$')
+        self.assertEqual(profile['requires_resource_revision'], resource_record()['id'])
+        self.assertEqual(profile['failure_semantics'], FAILURE_REVISION)
+        self.assertEqual(sandbox_record(),
+                         {'id': profile['revision'],
+                          'sha256': hashlib.sha256(SANDBOX_PROFILE.read_bytes()).hexdigest(),
+                          'failure_semantics': FAILURE_REVISION})
+        self.assertTrue(profile['bwrap_provenance']['release'].startswith('https://github.com/openai/codex/releases/tag/'))
+
+
 class P2CDeployment(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -1,10 +1,19 @@
 {
-  "revision": "codex-readonly-r3-1",
+  "revision": "codex-readonly-r3-2",
   "ownership": "AEE-private-job-namespaces-and-admitted-readonly-view; Codex-native-tool-bubblewrap-and-seccomp",
   "proc": "fresh-job-PID-namespace-proc-with-native-userns-map-writes; never-host-proc-bind",
   "bwrap_path": "/usr/bin/bwrap",
-  "bwrap_version": "bubblewrap 0.12.0",
-  "bwrap_sha256": "7c44fa8e7326e62e81ab3f70ff682bfc0eb3b447b39cf9fbb779a31948364762",
+  "bwrap_version": "vendored-bubblewrap-0.11.2 (openai/codex PACKAGE_STRING 'bubblewrap built for Codex')",
+  "bwrap_sha256": "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c",
+  "bwrap_provenance": {
+    "release": "https://github.com/openai/codex/releases/tag/rust-v0.159.2",
+    "asset": "bwrap-x86_64-unknown-linux-musl.tar.gz",
+    "tarball_sha256": "b813b85bb35b81173a0157aef51390ca89b00c6ffe0049a054a573493345b769",
+    "upstream_source": "bubblewrap 0.11.2 vendored at codex-rs/vendor/bubblewrap in openai/codex rust-v0.159.2",
+    "build": "codex-rs/bwrap (build.rs + config.h PACKAGE_STRING 'bubblewrap built for Codex'), built musl-static by .github/workflows/rust-release.yml",
+    "signature": "bwrap-x86_64-unknown-linux-musl.sigstore; signer https://github.com/openai/codex/.github/workflows/rust-release.yaml@refs/tags/rust-v0.159.2 (GitHub-hosted OIDC)",
+    "operators_hash_after_download": true
+  },
   "requires_resource_revision": "codex-readonly-r2-1",
   "failure_semantics": "codex-native-otlp-r3-1",
   "tool_failures": "sticky-fail-closed-no-recovery-override",

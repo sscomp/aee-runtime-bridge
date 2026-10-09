@@ -49,9 +49,11 @@ systemctl list-unit-files 'aee*'
 
 Stop if a dependency is missing, an existing installation is present, or ports
 are occupied. Obtain operator direction for host package provisioning; do not
-replace another installation. The production sandbox pins Bubblewrap 0.12.0 at
-`/usr/bin/bwrap` and its SHA in `config/p2c/sandbox-profile.json`; a distribution's
-other build may run offline fixtures but cannot pass production admission.
+replace another installation. The production sandbox pins the `openai/codex`
+release `bwrap` build at `/usr/bin/bwrap` with its SHA in
+`config/p2c/sandbox-profile.json` (see [provenance notes](#5-host-evidence-notes-provenance));
+a distribution's other bubblewrap build may run offline fixtures but cannot pass
+production admission.
 
 Clone using the README command. Until this candidate is merged, explicitly
 checkout `feat/stage2c-canonical-v2`. The operator then chooses a reviewed commit;
@@ -141,12 +143,20 @@ source URL and attestations with the deployment evidence. The `provider_contract
 native Codex/companion digests correspond to the official
 `openai/codex` release `rust-v0.159.2` musl artifacts (verify with `sha256sum`
 after extraction; the release publishes sigstore attestations for each asset).
-`config/p2c/sandbox-profile.json` additionally pins an exact Bubblewrap `0.12.0`
-binary digest whose upstream provenance is **not documented in this repository**;
-`bwrap-x86_64-unknown-linux-musl` shipped with `openai/codex` releases hashes
-differently, so production sandbox admission requires the operator to supply the
-exact artifact recorded at review time (or a re-pinned policy after an explicit
-review).
+
+`config/p2c/sandbox-profile.json` pins the release-shipped sandbox binary from
+the same `rust-v0.159.2` release: asset `bwrap-x86_64-unknown-linux-musl.tar.gz`
+(sha256 `b813b85bb35b81173a0157aef51390ca89b00c6ffe0049a054a573493345b769`),
+whose extracted binary hashes
+`77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c` and prints
+`bubblewrap built for Codex`. It is the vendored bubblewrap 0.11.2
+(`codex-rs/vendor/bubblewrap`) built for Codex by the release workflow; each
+release asset carries a sigstore attestation signed by
+`.github/workflows/rust-release.yaml@refs/tags/rust-v0.159.2`. Re-pin only with
+a reviewed artifact from a **documented official source**; never edit the digest
+to make a validation green. Installing this binary at `/usr/bin/bwrap` is a
+privileged, operator-approved step (back up the distribution's original first;
+reinstall the distribution package to roll back).
 
 ## 3. Build, verify and plan an immutable release
 
