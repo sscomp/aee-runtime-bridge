@@ -9,6 +9,7 @@ network seccomp sandbox. Missing, conflicting or over-limit evidence fails shut.
 import hashlib
 import http.server
 import json
+import os
 import re
 import threading
 
@@ -18,6 +19,39 @@ MAX_TOTAL = 16 * 1024**2
 MAX_CALLS = 128
 ID = re.compile(r'[A-Za-z0-9_-]{1,100}')
 TOOLS = {'exec', 'wait', 'exec_command', 'write_stdin', 'view_image', 'apply_patch', 'curr_time'}
+
+# Bounded transport-phase diagnostics (Stage 3B R2 transport-capture design):
+# fixed enum fields and size buckets only; emitted into the receipt solely on
+# the incomplete branch and solely when AEE_TRANSPORT_DIAGNOSTICS=1. They are
+# never an input to the ``complete`` decision and never carry raw payload,
+# identifiers or exception text.
+TRANSPORT_SCHEMA_VERSION = 1
+TRANSPORT_MAX_EVENTS = 16
+_SIZE_BUCKETS = ((4 * 1024, '0-4KiB'), (64 * 1024, '4-64KiB'), (512 * 1024, '64-512KiB'),
+                 (MAX_BODY, '512KiB-2MiB'))
+
+
+def size_bucket(size):
+    for limit, name in _SIZE_BUCKETS:
+        if size <= limit:
+            return name
+    return '>2MiB'
+
+
+def count_bucket(count):
+    if count <= 0:
+        return '0'
+    if count <= 16:
+        return '1-16'
+    if count <= 64:
+        return '17-64'
+    if count <= 256:
+        return '65-256'
+    return '>256'
+
+
+class _FlaggedRejection(ValueError):
+    """Stage rejection whose transport event already emitted (internal marker)."""
 
 
 def attributes(items):
@@ -85,6 +119,41 @@ class Evidence:
         self.total = self.requests = self.roots = 0
         self.calls, self.ready, self.logs, self.traces = {}, {}, {}, {}
         self.conversations = set()
+        self.transport_events = []
+        self.transport_totals = {'accepted_requests': 0, 'rejected_requests': 0,
+                                 'codex_exec_seen': 0, 'codex_exec_counted': 0,
+                                 'invalid_sites': {'framing': 0, 'budget': 0, 'parse': 0,
+                                                   'validation': 0, 'transport': 0}}
+
+    def transport_event(self, phase, outcome, reason_code=None, size=None, records=None,
+                        root_present=None):
+        """Record one bounded transport-phase event; enums and buckets only.
+
+        Never raw text, identifiers, payload or exception messages; capped list;
+        pure observation on the receipt path, never a decision input.
+        """
+        with self.lock:
+            if outcome == 'accepted':
+                self.transport_totals['accepted_requests'] += 1
+            elif outcome == 'rejected':
+                self.transport_totals['rejected_requests'] += 1
+                site = {'framing': 'framing', 'budget': 'budget', 'parse': 'parse',
+                        'ingest': 'validation', 'transport': 'transport'}.get(phase)
+                if site is not None:
+                    self.transport_totals['invalid_sites'][site] += 1
+            if len(self.transport_events) >= TRANSPORT_MAX_EVENTS:
+                return
+            event = {'event_sequence': len(self.transport_events) + 1,
+                     'phase': phase, 'outcome': outcome}
+            if reason_code is not None:
+                event['reason_code'] = reason_code
+            if size is not None:
+                event['payload_size_bucket'] = size_bucket(size)
+            if records is not None:
+                event['records_bucket'] = count_bucket(records)
+            if root_present is not None:
+                event['root_span_present'] = root_present
+            self.transport_events.append(event)
 
     def put(self, target, key, value):
         if key in target and target[key] != value:
@@ -122,34 +191,65 @@ class Evidence:
             self.total += len(payload)
             if self.requests > 256 or self.total > MAX_TOTAL:
                 self.invalid = True
+                self.transport_event('budget', 'rejected',
+                                     reason_code='REQUEST_BUDGET' if self.requests > 256 else 'TOTAL_BUDGET',
+                                     size=len(payload))
                 raise ValueError()
+            # Diagnostics only: stage/reason tracking changes no raise sites, no
+            # accepted/rejected conditions, and no exception classes caught.
+            stage = 'parse'
+            state = {'records': None, 'seen_roots': 0, 'counted_roots': 0}
             try:
                 body = json.loads(payload)
+                stage = 'body_shape'
                 if not isinstance(body, dict):
                     raise ValueError()
+                state['records'] = 0
                 if path == '/v1/logs':
                     for resource in body['resourceLogs']:
+                        stage = 'logs_structure'
                         for scope in resource['scopeLogs']:
                             for item in scope['logRecords']:
                                 a = attributes(item.get('attributes', []))
-                                if a.get('event.name') == 'codex.tool_result':
+                                event_name = a.get('event.name')
+                                if event_name == 'codex.tool_result':
+                                    stage = 'tool_result_log'
                                     self.tool(a, log=True)
-                                elif a.get('event.name') == 'codex.conversation_starts':
+                                    state['records'] += 1
+                                elif event_name == 'codex.conversation_starts':
+                                    stage = 'conversation_record'
                                     self.conversations.add(bounded_id(a['conversation.id']))
+                                    state['records'] += 1
                 elif path == '/v1/traces':
                     for resource in body['resourceSpans']:
+                        stage = 'traces_structure'
                         for scope in resource['scopeSpans']:
                             for span in scope['spans']:
+                                stage = 'traces_span'
                                 if span.get('name') == 'codex.exec':
+                                    state['seen_roots'] += 1
+                                    self.transport_totals['codex_exec_seen'] += 1
                                     if int(span['endTimeUnixNano']) <= int(span['startTimeUnixNano']):
-                                        raise ValueError()
+                                        self.transport_event('ingest', 'rejected',
+                                                             reason_code='SPAN_ORDER_INVALID',
+                                                             size=len(payload),
+                                                             records=state['records'],
+                                                             root_present='rejected_order')
+                                        raise _FlaggedRejection()
                                     self.roots += 1
+                                    self.transport_totals['codex_exec_counted'] += 1
+                                    state['counted_roots'] += 1
+                                    state['records'] += 1
+                                stage = 'traces_span_events'
                                 for item in span.get('events', []):
                                     a = attributes(item.get('attributes', []))
                                     event = a.get('event.name')
                                     if event == 'codex.tool_result':
+                                        stage = 'tool_result_event'
                                         self.tool(a, log=False)
+                                        state['records'] += 1
                                     elif event in {'codex.tool_call_received', 'codex.tool_result_ready'}:
+                                        stage = 'tool_call_event'
                                         call, name, conversation = tool_identity(a)
                                         source = a['tool_source']
                                         if source not in {'direct', 'code_mode'}:
@@ -157,11 +257,29 @@ class Evidence:
                                         self.put(self.calls if event == 'codex.tool_call_received' else self.ready,
                                                  call, {'tool_name': name, 'conversation': conversation,
                                                         'source': source})
+                                        state['records'] += 1
                 else:
+                    stage = 'unknown_path'
                     raise ValueError()
-            except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
+            except (ValueError, TypeError, KeyError, OverflowError, AttributeError) as error:
                 self.invalid = True
+                if isinstance(error, _FlaggedRejection):
+                    raise ValueError() from None
+                if stage in ('parse', 'body_shape'):
+                    self.transport_event('parse', 'rejected',
+                                         reason_code='PARSE_NOT_JSON' if stage == 'parse' else 'BODY_NOT_OBJECT',
+                                         size=len(payload))
+                else:
+                    self.transport_event('ingest', 'rejected', reason_code=stage.upper(),
+                                         size=len(payload), records=state['records'],
+                                         root_present=('seen_unresolved' if state['seen_roots']
+                                                       and path == '/v1/traces' else None))
                 raise ValueError() from None
+            root_present = None
+            if path == '/v1/traces':
+                root_present = 'accepted' if state['counted_roots'] else 'absent'
+            self.transport_event('ingest', 'accepted', size=len(payload),
+                                 records=state['records'], root_present=root_present)
 
     def receipt(self):
         """Emit the AEE receipt; name each violated aggregate predicate if incomplete.
@@ -241,6 +359,18 @@ class Evidence:
                        'conversation': next(iter(self.conversations), None), 'tools': tools}
             if not complete:
                 receipt['incomplete_reasons'] = reasons
+                if os.environ.get('AEE_TRANSPORT_DIAGNOSTICS', '') == '1':
+                    # Additive, bounded, enum-and-bucket-only phase record; the
+                    # finalize event closes the ordering question (it names the
+                    # last observed phase relative to receipt emission). Nothing
+                    # here can change ``complete`` or any predicate outcome.
+                    self.transport_event('finalize', 'observed')
+                    receipt['transport_diagnostics'] = {
+                        'schema_version': TRANSPORT_SCHEMA_VERSION,
+                        'totals': {'requests_total': self.requests,
+                                   **self.transport_totals},
+                        'events': list(self.transport_events),
+                    }
             return receipt
 
 
@@ -269,23 +399,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b'{}')
 
     def do_POST(self):
+        evidence = self.server.evidence
         try:
             values = self.headers.get_all('Content-Length', [])
-            if (self.path not in {'/v1/logs', '/v1/traces'} or len(values) != 1
-                    or not values[0].isdigit() or self.headers.get('Transfer-Encoding')
-                    or self.headers.get('Content-Encoding')
-                    or not self.headers.get('Content-Type', '').startswith('application/json')):
+            # Same rejection set and order as the former compound predicate; the
+            # sequential split only attaches the stage-specific reason code.
+            if self.path not in {'/v1/logs', '/v1/traces'}:
+                reason = 'PATH_UNRECOGNIZED'
+            elif len(values) != 1 or not values[0].isdigit():
+                reason = 'CONTENT_LENGTH_INVALID'
+            elif self.headers.get('Transfer-Encoding') or self.headers.get('Content-Encoding'):
+                reason = 'ENCODING_REJECTED'
+            elif not self.headers.get('Content-Type', '').startswith('application/json'):
+                reason = 'CONTENT_TYPE_REJECTED'
+            else:
+                reason = None
+            if reason is not None:
+                evidence.transport_event('framing', 'rejected', reason_code=reason)
                 raise ValueError()
             size = int(values[0])
-            if not 0 < size <= MAX_BODY:
+            if size <= 0:
+                evidence.transport_event('framing', 'rejected', reason_code='EMPTY_BODY', size=size)
+                raise ValueError()
+            if size > MAX_BODY:
+                evidence.transport_event('framing', 'rejected', reason_code='SIZE_OVER', size=size)
                 raise ValueError()
             payload = self.rfile.read(size)
             if len(payload) != size:
+                evidence.transport_event('framing', 'rejected', reason_code='BODY_TRUNCATED', size=size)
                 raise ValueError()
-            self.server.evidence.accept(self.path, payload)
+            evidence.accept(self.path, payload)
             self.reply(200)
-        except (ValueError, OSError):
-            self.server.evidence.invalid = True
+        except OSError:
+            evidence.transport_event('transport', 'rejected', reason_code='IO_ERROR')
+            evidence.invalid = True
+            self.reply(400)
+        except ValueError:
+            evidence.invalid = True
             self.reply(400)
 
     def do_GET(self):

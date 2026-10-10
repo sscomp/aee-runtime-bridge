@@ -86,6 +86,36 @@ def augmented_evidence_failure(failure, receipt, thread, broker_receipt):
             observed_direct = {tool['call_id']: tool['tool_name'] for tool in cells
                                if tool.get('source') == 'direct'
                                and isinstance(tool.get('call_id'), str)}
+        # The collector's additive transport-phase diagnostics (bounded enum and
+        # bucket fields, emitted only on the incomplete receipt branch under
+        # AEE_TRANSPORT_DIAGNOSTICS=1): mirrored like collector_reasons — scalar
+        # fields only, events capped at 16, nothing raw.
+        transport = receipt.get('transport_diagnostics')
+        if isinstance(transport, dict):
+            mirror = {}
+            version = transport.get('schema_version')
+            if type(version) is int:
+                mirror['schema_version'] = version
+            totals = transport.get('totals')
+            if isinstance(totals, dict):
+                clean = {key: value for key, value in totals.items()
+                         if type(key) is str and type(value) in (int, float)}
+                sites = totals.get('invalid_sites')
+                if isinstance(sites, dict):
+                    clean['invalid_sites'] = {key: value for key, value in sites.items()
+                                              if type(key) is str and type(value) is int}
+                if clean:
+                    mirror['totals'] = clean
+            events = transport.get('events')
+            if isinstance(events, list):
+                kept = [{key: value for key, value in event.items()
+                         if type(key) is str and type(value) in (str, int, float)}
+                        for event in events[:16] if isinstance(event, dict)]
+                kept = [event for event in kept if event]
+                if kept:
+                    mirror['events'] = kept
+            if mirror:
+                summary['transport_diagnostics'] = mirror
     if isinstance(broker_receipt, dict):
         summary['broker_valid'] = broker_receipt.get('valid') if type(
             broker_receipt.get('valid')) is bool else None
