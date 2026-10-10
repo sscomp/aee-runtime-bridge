@@ -55,17 +55,21 @@ def validate_native_receipt(receipt, thread, broker_receipt=None, *, accepted=Fa
     receipt validator runs on preserved, bounded proof at each success boundary.
     """
     from .native_telemetry import REVISION, MAX_CALLS, TOOLS, ID
-    def incomplete():
+    def incomplete(condition):
+        # Attribution-only label naming the triggered validation condition;
+        # classification and the fail-closed raise are unchanged.
         reject('TOOL_EVIDENCE_INCOMPLETE', 'Native tool completion evidence is missing or inconsistent',
-               exit_code=0, failure={'contract': REVISION, 'evidence_complete': False})
-    if (not isinstance(thread, str) or not ID.fullmatch(thread)
-            or not isinstance(receipt, dict) or receipt.get('revision') != REVISION
+               exit_code=0, failure={'contract': REVISION, 'evidence_complete': False,
+                                     'condition': condition})
+    if not isinstance(thread, str) or not ID.fullmatch(thread):
+        incomplete('thread_missing_or_malformed')
+    if (not isinstance(receipt, dict) or receipt.get('revision') != REVISION
             or receipt.get('type') != 'aee.native_tool_receipt'
             or receipt.get('complete') is not True or receipt.get('conversation') != thread
             or not isinstance(receipt.get('tools'), list) or len(receipt['tools']) > MAX_CALLS):
-        incomplete()
+        incomplete('receipt_missing_or_malformed')
     if any(k in receipt for k in ('failure', 'error', 'error_code', 'interrupted')):
-        incomplete()
+        incomplete('receipt_lifecycle_fields_present')
     direct, failures, ids = {}, 0, set()
     for index, tool in enumerate(receipt['tools'], 1):
         if (not isinstance(tool, dict) or tool.get('conversation') != thread
@@ -75,20 +79,20 @@ def validate_native_receipt(receipt, thread, broker_receipt=None, *, accepted=Fa
                 or not isinstance(tool.get('source'), str) or tool['source'] not in {'direct', 'code_mode'}
                 or not isinstance(tool.get('call_id'), str) or not ID.fullmatch(tool['call_id'])
                 or tool['call_id'] in ids):
-            incomplete()
+            incomplete('tool_record_malformed')
         for flag in ('readonly_violation', 'unverified_completion'):
             if flag in tool and type(tool[flag]) is not bool:
-                incomplete()
+                incomplete('tool_flag_not_boolean')
         ids.add(tool['call_id'])
         if tool['source'] == 'direct':
             direct[tool['call_id']] = tool['tool_name']
         failed = (not tool['success'] or tool.get('readonly_violation', False)
                   or any(k in tool for k in ('failure', 'error', 'error_code', 'interrupted')))
         if tool.get('unverified_completion'):
-            incomplete()
+            incomplete('unverified_completion_cell')
         if tool['tool_name'] in {'exec_command', 'write_stdin'} and tool['success']:
             if type(tool.get('exit_code')) is not int:
-                incomplete()
+                incomplete('exit_code_missing')
             failed = failed or tool['exit_code'] != 0
         failures += bool(failed)
     if broker_receipt is not None:
@@ -99,7 +103,7 @@ def validate_native_receipt(receipt, thread, broker_receipt=None, *, accepted=Fa
                 or broker_receipt['expected_calls'] != direct):
             if accepted:
                 reject('REQUIRED_OPERATION_INCOMPLETE', 'Expected native operations are not proven complete')
-            incomplete()
+            incomplete('broker_receipt_invalid')
     if failures:
         reject('REQUIRED_TOOL_FAILED', 'A required native tool or Code Mode cell failed', exit_code=0,
                failure={'contract': REVISION, 'evidence_complete': True,

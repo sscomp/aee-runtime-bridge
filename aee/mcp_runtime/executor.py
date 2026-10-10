@@ -29,13 +29,19 @@ def augmented_evidence_failure(failure, receipt, thread, broker_receipt):
 
     Same principle as the fail-shot diagnostics: classification is unchanged,
     but the evidence-complete=false path keeps enough sanitized state to
-    attribute which pairing condition failed after sandbox teardown.
+    attribute which pairing condition failed after sandbox teardown. All fields
+    come from the real observed receipt/broker receipt — receipt and thread
+    presence, the observed tool cells (sequence, name, source, success,
+    call_id, exit_code, unverified flags), mirrored validator counts for
+    missing completion/exit-code cells, and the broker's expected-call
+    declaration versus the observed direct calls (correlation failure).
     """
     if not isinstance(failure, dict):
         failure = {}
     failure.setdefault('evidence_complete', False)
     summary = {'receipt_present': receipt is not None,
                'thread_present': isinstance(thread, str) and bool(thread)}
+    observed_direct = None
     if isinstance(receipt, dict):
         summary['receipt_complete'] = receipt.get('complete') if type(
             receipt.get('complete')) is bool else None
@@ -43,15 +49,36 @@ def augmented_evidence_failure(failure, receipt, thread, broker_receipt):
         if isinstance(tools, list):
             summary['tool_count'] = len(tools)
             fields = ('sequence', 'tool_name', 'source', 'success', 'exit_code',
-                      'unverified_completion', 'readonly_violation')
-            summary['tools'] = [{key: tool[key] for key in fields if key in tool
-                                 and isinstance(tool[key], (bool, int, str))}
-                                for tool in tools[:128] if isinstance(tool, dict)]
+                      'unverified_completion', 'readonly_violation', 'call_id')
+            cells = [{key: tool[key] for key in fields if key in tool
+                      and isinstance(tool[key], (bool, int, str))}
+                     for tool in tools[:128] if isinstance(tool, dict)]
+            summary['tools'] = cells
+            # Mirrors of the validator's own conditions, derived from the same
+            # observed cells (counts only, no new data sources).
+            summary['unverified_cells'] = sum(
+                1 for tool in cells if tool.get('unverified_completion') is True)
+            summary['missing_exit_code'] = sum(
+                1 for tool in cells if tool.get('success') is True
+                and tool.get('tool_name') in {'exec_command', 'write_stdin'}
+                and type(tool.get('exit_code')) is not int)
+            observed_direct = {tool['call_id']: tool['tool_name'] for tool in cells
+                               if tool.get('source') == 'direct'
+                               and isinstance(tool.get('call_id'), str)}
     if isinstance(broker_receipt, dict):
         summary['broker_valid'] = broker_receipt.get('valid') if type(
             broker_receipt.get('valid')) is bool else None
         summary['broker_response_complete'] = broker_receipt.get('response_complete') if type(
             broker_receipt.get('response_complete')) is bool else None
+        expected_calls = broker_receipt.get('expected_calls')
+        if isinstance(expected_calls, dict):
+            summary['broker_expected_calls'] = {key: value for key, value in
+                                                expected_calls.items()
+                                                if isinstance(key, str) and isinstance(value, str)}
+            if observed_direct is not None:
+                summary['observed_direct_calls'] = observed_direct
+                summary['broker_declaration_mismatch'] = (
+                    summary['broker_expected_calls'] != observed_direct)
     failure['receipt_state'] = summary
     return failure
 

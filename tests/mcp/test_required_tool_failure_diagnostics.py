@@ -139,6 +139,7 @@ class EvidenceValidationDiagnostics(unittest.TestCase):
         self.assertEqual(state["tools"][0]["tool_name"], "exec_command")
         self.assertEqual(state["tools"][0]["exit_code"], 0)
         self.assertNotIn("conversation", state["tools"][0])
+        self.assertEqual(failure["condition"], "receipt_missing_or_malformed")
         raw = json.dumps(failure)
         self.assertLessEqual(len(raw), 20000)
 
@@ -155,6 +156,93 @@ class EvidenceValidationDiagnostics(unittest.TestCase):
         state = error.exception.failure["receipt_state"]
         self.assertFalse(state["receipt_present"])
         self.assertTrue(state["thread_present"])
+
+    def test_unverified_completion_cell_is_labeled(self):
+        from aee.mcp_runtime.native_telemetry import REVISION
+        receipt = json.dumps({
+            'type': 'aee.native_tool_receipt', 'revision': REVISION, 'complete': True,
+            'conversation': 'thr_evidence_4',
+            'tools': [{'sequence': 1, 'tool_name': 'exec', 'source': 'direct',
+                       'success': True, 'call_id': 'call_' + 'a' * 10,
+                       'unverified_completion': True, 'conversation': 'thr_evidence_4'}],
+        })
+        events = [
+            '{"type":"thread.started","thread_id":"thr_evidence_4"}',
+            '{"type":"turn.started"}',
+            '{"type":"turn.completed"}',
+            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+        ]
+        with self.assertRaises(JobError) as error:
+            final_agent_message(self.stream(events), Limits(), require_receipt=True)
+        self.assertEqual(error.exception.code, "TOOL_EVIDENCE_INCOMPLETE")
+        failure = error.exception.failure
+        self.assertEqual(failure["condition"], "unverified_completion_cell")
+        state = failure["receipt_state"]
+        self.assertEqual(state["unverified_cells"], 1)
+        self.assertEqual(state["missing_exit_code"], 0)
+        self.assertTrue(state["receipt_complete"])
+
+    def test_missing_exit_code_is_labeled(self):
+        from aee.mcp_runtime.native_telemetry import REVISION
+        receipt = json.dumps({
+            'type': 'aee.native_tool_receipt', 'revision': REVISION, 'complete': True,
+            'conversation': 'thr_evidence_5',
+            'tools': [{'sequence': 1, 'tool_name': 'exec_command', 'source': 'code_mode',
+                       'success': True, 'call_id': 'call_' + 'b' * 10,
+                       'conversation': 'thr_evidence_5'}],
+        })
+        events = [
+            '{"type":"thread.started","thread_id":"thr_evidence_5"}',
+            '{"type":"turn.started"}',
+            '{"type":"turn.completed"}',
+            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+        ]
+        with self.assertRaises(JobError) as error:
+            final_agent_message(self.stream(events), Limits(), require_receipt=True)
+        self.assertEqual(error.exception.code, "TOOL_EVIDENCE_INCOMPLETE")
+        failure = error.exception.failure
+        self.assertEqual(failure["condition"], "exit_code_missing")
+        state = failure["receipt_state"]
+        self.assertEqual(state["missing_exit_code"], 1)
+        self.assertEqual(state["unverified_cells"], 0)
+        self.assertNotIn("exit_code", state["tools"][0])
+
+    def test_broker_declaration_mismatch_is_labeled(self):
+        from aee.mcp_runtime.native_telemetry import REVISION
+        receipt = json.dumps({
+            'type': 'aee.native_tool_receipt', 'revision': REVISION, 'complete': True,
+            'conversation': 'thr_evidence_6',
+            'tools': [{'sequence': 1, 'tool_name': 'exec_command', 'source': 'direct',
+                       'success': True, 'exit_code': 0, 'call_id': 'call_' + 'a' * 10,
+                       'conversation': 'thr_evidence_6'}],
+        })
+        events = [
+            '{"type":"thread.started","thread_id":"thr_evidence_6"}',
+            '{"type":"turn.started"}',
+            '{"type":"turn.completed"}',
+            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+        ]
+        broker_receipt = {'valid': True, 'response_complete': True,
+                          'expected_calls': {'call_' + 'b' * 10: 'exec_command'}}
+        with self.assertRaises(JobError) as error:
+            final_agent_message(self.stream(events), Limits(), require_receipt=True,
+                                broker_receipt=broker_receipt)
+        self.assertEqual(error.exception.code, "TOOL_EVIDENCE_INCOMPLETE")
+        failure = error.exception.failure
+        self.assertEqual(failure["condition"], "broker_receipt_invalid")
+        state = failure["receipt_state"]
+        self.assertTrue(state["broker_valid"])
+        self.assertTrue(state["broker_response_complete"])
+        self.assertTrue(state["broker_declaration_mismatch"])
+        self.assertEqual(state["broker_expected_calls"],
+                         {'call_' + 'b' * 10: 'exec_command'})
+        self.assertEqual(state["observed_direct_calls"],
+                         {'call_' + 'a' * 10: 'exec_command'})
+        raw = json.dumps(failure)
+        self.assertLessEqual(len(raw), 20000)
 
     def test_valid_receipt_with_broker_receipt_succeeds_unchanged(self):
         from aee.mcp_runtime.native_telemetry import REVISION
