@@ -24,6 +24,38 @@ class ExecutionResult:
     outcome: dict | None = None
 
 
+def augmented_evidence_failure(failure, receipt, thread, broker_receipt):
+    """Scalar-only state of a failing native receipt validation; never raw text.
+
+    Same principle as the fail-shot diagnostics: classification is unchanged,
+    but the evidence-complete=false path keeps enough sanitized state to
+    attribute which pairing condition failed after sandbox teardown.
+    """
+    if not isinstance(failure, dict):
+        failure = {}
+    failure.setdefault('evidence_complete', False)
+    summary = {'receipt_present': receipt is not None,
+               'thread_present': isinstance(thread, str) and bool(thread)}
+    if isinstance(receipt, dict):
+        summary['receipt_complete'] = receipt.get('complete') if type(
+            receipt.get('complete')) is bool else None
+        tools = receipt.get('tools')
+        if isinstance(tools, list):
+            summary['tool_count'] = len(tools)
+            fields = ('sequence', 'tool_name', 'source', 'success', 'exit_code',
+                      'unverified_completion', 'readonly_violation')
+            summary['tools'] = [{key: tool[key] for key in fields if key in tool
+                                 and isinstance(tool[key], (bool, int, str))}
+                                for tool in tools[:128] if isinstance(tool, dict)]
+    if isinstance(broker_receipt, dict):
+        summary['broker_valid'] = broker_receipt.get('valid') if type(
+            broker_receipt.get('valid')) is bool else None
+        summary['broker_response_complete'] = broker_receipt.get('response_complete') if type(
+            broker_receipt.get('response_complete')) is bool else None
+    failure['receipt_state'] = summary
+    return failure
+
+
 def bounded_failure(event=None, *, thread=None):
     """Scalar-only summary of the failing native event; never retains free text.
 
@@ -77,7 +109,11 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
             thread = event.get('thread_id')
         if event.get('type') == 'aee.native_tool_receipt':
             if receipt is not None:
-                raise JobError('TOOL_EVIDENCE_INCOMPLETE', 'Executor emitted duplicate receipts', exit_code=0)
+                raise JobError('TOOL_EVIDENCE_INCOMPLETE', 'Executor emitted duplicate receipts',
+                               exit_code=0, failure=augmented_evidence_failure(
+                                   {'evidence_source': 'native-jsonl',
+                                    'reason': 'duplicate_native_receipt'}, receipt, thread,
+                                   broker_receipt))
             receipt = event
         if event.get("type") == "item.completed":
             item = event.get("item", {})
@@ -93,7 +129,12 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
     if not completed or not message or not message.strip():
         raise JobError("EXECUTION_FAILED", "Executor produced no final agent message")
     if require_receipt or receipt is not None:
-        native_receipt(receipt, thread, broker_receipt)
+        try:
+            native_receipt(receipt, thread, broker_receipt)
+        except JobError as error:
+            raise JobError(error.code, error.message, exit_code=error.exit_code,
+                           failure=augmented_evidence_failure(error.failure, receipt, thread,
+                                                              broker_receipt)) from None
     if len(message.encode()) > limits.result_bytes:
         raise JobError("OUTPUT_LIMIT_EXCEEDED", "Final message exceeds payload byte limit")
     return message

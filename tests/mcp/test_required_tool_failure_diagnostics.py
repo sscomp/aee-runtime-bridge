@@ -104,5 +104,78 @@ class RequiredToolFailureDiagnostics(unittest.TestCase):
         self.assertEqual(final_agent_message(self.stream(events), Limits()), "all good")
 
 
+class EvidenceValidationDiagnostics(unittest.TestCase):
+    """TOOL_EVIDENCE_INCOMPLETE keeps scalar-only receipt state for attribution."""
+
+    @staticmethod
+    def stream(events):
+        return ("\n".join(events) + "\n").encode()
+
+    def test_incomplete_receipt_retains_bounded_receipt_state(self):
+        from aee.mcp_runtime.native_telemetry import REVISION
+        receipt = json.dumps({
+            'type': 'aee.native_tool_receipt', 'revision': REVISION, 'complete': False,
+            'conversation': 'thr_evidence_1',
+            'tools': [{'sequence': 1, 'tool_name': 'exec_command', 'source': 'code_mode',
+                       'success': True, 'exit_code': 0, 'conversation': 'thr_evidence_1'}],
+        })
+        events = [
+            '{"type":"thread.started","thread_id":"thr_evidence_1"}',
+            '{"type":"turn.started"}',
+            '{"type":"turn.completed"}',
+            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+        ]
+        with self.assertRaises(JobError) as error:
+            final_agent_message(self.stream(events), Limits(), require_receipt=True)
+        self.assertEqual(error.exception.code, "TOOL_EVIDENCE_INCOMPLETE")
+        failure = error.exception.failure
+        self.assertFalse(failure["evidence_complete"])
+        state = failure["receipt_state"]
+        self.assertTrue(state["receipt_present"])
+        self.assertTrue(state["thread_present"])
+        self.assertFalse(state["receipt_complete"])
+        self.assertEqual(state["tool_count"], 1)
+        self.assertEqual(state["tools"][0]["tool_name"], "exec_command")
+        self.assertEqual(state["tools"][0]["exit_code"], 0)
+        self.assertNotIn("conversation", state["tools"][0])
+        raw = json.dumps(failure)
+        self.assertLessEqual(len(raw), 20000)
+
+    def test_missing_receipt_is_attributed(self):
+        events = [
+            '{"type":"thread.started","thread_id":"thr_evidence_2"}',
+            '{"type":"turn.started"}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+            '{"type":"turn.completed"}',
+        ]
+        with self.assertRaises(JobError) as error:
+            final_agent_message(self.stream(events), Limits(), require_receipt=True)
+        self.assertEqual(error.exception.code, "TOOL_EVIDENCE_INCOMPLETE")
+        state = error.exception.failure["receipt_state"]
+        self.assertFalse(state["receipt_present"])
+        self.assertTrue(state["thread_present"])
+
+    def test_valid_receipt_with_broker_receipt_succeeds_unchanged(self):
+        from aee.mcp_runtime.native_telemetry import REVISION
+        receipt = json.dumps({
+            'type': 'aee.native_tool_receipt', 'revision': REVISION, 'complete': True,
+            'conversation': 'thr_evidence_3',
+            'tools': [{'sequence': 1, 'tool_name': 'curr_time', 'source': 'direct',
+                       'success': True, 'call_id': 'call_' + 'a' * 10,
+                       'conversation': 'thr_evidence_3'}],
+        })
+        events = [
+            '{"type":"thread.started","thread_id":"thr_evidence_3"}',
+            '{"type":"turn.started"}',
+            '{"type":"turn.completed"}',
+            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+        ]
+        # No broker receipt: accepted=False path validates lifecycle only.
+        self.assertEqual(
+            final_agent_message(self.stream(events), Limits(), require_receipt=True), "done")
+
+
 if __name__ == "__main__":
     unittest.main()
