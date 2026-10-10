@@ -33,6 +33,9 @@ manifest exists for isolated tests; it is not a production installation path.
 
 Completed jobs require the `aee-completed-v1` proof at write, read and MCP result
 boundaries. The record SHA detects accidental modifications; it is not protection
-against an attacker who can rewrite both record and digest. Code Mode accepted
-success is currently unsupported when expected inner operations cannot be
-independently corroborated. See [limitations](troubleshooting.md).
+against an attacker who can rewrite both record and digest. Since the R3
+revision, an accepted success records an `operation_attestation` grade: a Code
+Mode execution is accepted only when the pinned binary's own machine-verified
+completion evidence is present and the broker-declared outer calls cross-match;
+anything without that evidence still fails closed
+(`REQUIRED_OPERATION_UNVERIFIABLE`). See [limitations](troubleshooting.md).

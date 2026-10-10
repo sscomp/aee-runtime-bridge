@@ -58,9 +58,13 @@ loopback ports 8790/8791 free, and an operator-provisioned OpenAI API key file
    manifest accepted by the running services. → [deployment §4](deployment.md#4-operator-qualification-and-installation)
 10. **Completed-job smoke + persistence.** Run the completed-job smoke test
     ([deployment §4c](deployment.md#4c-completed-job-smoke-test-real-http-mcp-production-seal)):
-    negatives, answer-only read-only dispatch, poll to persisted `completed` with
-    the `aee-completed-v1` seal, gateway restart re-fetch. Enable units and
-    re-validate cold boot ([§4b](deployment.md#4b-service-lifecycle-and-boot-persistence-cold-boot-validated)).
+    negatives, answer-only read-only dispatch, and at least one **tool-using**
+    read-only dispatch that performs an actual exec operation; both must poll to
+    a persisted `completed` with the `aee-completed-v1` seal (the tool-using
+    record additionally carries an `operation_attestation` grade). Then gateway
+    restart, re-fetch, and verify `validate_success` still accepts the records.
+    Enable units and re-validate cold boot
+    ([§4b](deployment.md#4b-service-lifecycle-and-boot-persistence-cold-boot-validated)).
     Exit condition: smoke PASS before → PASS after restart → PASS after reboot.
 11. **Legacy cutover (only if a legacy bridge exists).** Retire the legacy units
     only after step 10 passes; see

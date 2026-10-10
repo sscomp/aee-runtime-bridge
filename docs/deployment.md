@@ -292,13 +292,24 @@ instead of re-testing dispatch on a degraded gateway.
 ## 4c. Completed-job smoke test (real HTTP MCP, production seal)
 
 Run after every deployment change or reboot. This is the dispatch route the
-completed-result contract currently accepts end to end — a **read-only,
-answer-only** dispatch (no tool calls) through the real HTTP MCP surface, whose
-persisted record carries the `aee-completed-v1` seal checked by
-`result_contract.validate_success`. Tool-using dispatches exercise
-`TOOL_EVIDENCE_INCOMPLETE` / contract fail-closed paths and prove containment but
-do not produce a completed record; see [agent operations](agent-operations.md)
-for scripted positives/negatives.
+completed-result contract accepts end to end — a **read-only** dispatch through
+the real HTTP MCP surface, whose persisted record carries the `aee-completed-v1`
+seal checked by `result_contract.validate_success`. Since the R3 review there
+are two accepted shapes:
+
+- **answer-only** dispatch (no tool calls): as before, the record validates with
+  no `operation_attestation` field (backward compatible with pre-R3 records).
+- **tool-using** dispatch (one actual read-only tool operation): the native
+  receipt now carries the pinned binary's own machine-verified completion
+  evidence (inner `exec_command`, code_mode, machine-decoded exit code) next to
+  the broker-declared outer call, and the record gains an
+  `operation_attestation` (`verified` when inner executions pair 1:1 with
+  declared outer calls, `partial` when some machine-verified operations are
+  observed without their inner itemization). Nothing without such evidence is
+  claimed: code-mode `exec`/`wait` without a decoded completion header, failed
+  declared calls, missing broker corroboration, or count drift still fail
+  closed with `REQUIRED_OPERATION_UNVERIFIABLE` / `REQUIRED_TOOL_FAILED` /
+  `TOOL_EVIDENCE_INCOMPLETE`.
 
 ```bash
 # auth negatives first (expect 401): no bearer and a wrong bearer
@@ -306,7 +317,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8791/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}'
 # then, with the real bearer: initialize → tools/list (exactly five, no aee_exec)
-# → aee_dispatch (answer-only read-only task, allowed root as working_directory)
-# → poll aee_job_status to completed → aee_job_result (status completed, exit 0)
-# full scripted sequence: see agent-operations.md and the R2 report smoke notes
+# → aee_dispatch (read-only task, allowed root as working_directory; answer-only
+#   or a task that performs one actual read-only exec)
+# → poll aee_job_status to completed → aee_job_result (status completed, exit 0;
+#   a tool-using result also carries operation_attestation in its evidence)
+# full scripted sequence: see agent-operations.md and the R2/R3 reports
 ```

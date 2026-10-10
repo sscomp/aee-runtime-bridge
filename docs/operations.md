@@ -61,6 +61,15 @@ bit-for-bit. After a restart/reboot, re-fetch them over the HTTP MCP and confirm
 `status: completed` with the `aee-completed-v1` result-contract seal
 ([deployment](deployment.md) §4c).
 
+Since the R3 contract revision, a tool-using completed record also carries
+`operation_attestation` in its evidence — `verified` (inner machine-verified
+executions pair 1:1 with broker-declared outer calls) or `partial` (machine-
+verified operations observed without full inner itemization; only the sandbox
+bounds what ran). The field is additive and omitted for answer-only records, so
+pre-R3 persisted records validate unchanged under both old and new code, as
+verified on the live job store at each rollout
+([deployment](deployment.md) §4c).
+
 ## Credential handling
 
 Gateway bearer and broker model credential are file-based, outside any
