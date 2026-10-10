@@ -24,6 +24,34 @@ class ExecutionResult:
     outcome: dict | None = None
 
 
+def bounded_failure(event=None, *, thread=None):
+    """Scalar-only summary of the failing native event; never retains free text.
+
+    Companion to the fail-shot REQUIRED_TOOL_FAILED semantics: classification is
+    unchanged (any nonzero command exit still fails the job), but the failure
+    record names the failing event so attribution survives sandbox teardown.
+    Keys are short scalars only — no command text, output or arguments.
+    """
+    failure = {'evidence_source': 'native-jsonl', 'recovery_permitted': False}
+    if isinstance(thread, str) and thread:
+        failure['thread_id'] = thread[:100]
+    if isinstance(event, dict):
+        summary = {}
+        item = event.get('item') if isinstance(event.get('item'), dict) else None
+        source = item if item is not None else event
+        if item is not None:
+            if isinstance(item.get('type'), str):
+                summary['item_type'] = item['type'][:100]
+            if isinstance(item.get('status'), str):
+                summary['item_status'] = item['status'][:100]
+        elif isinstance(event.get('type'), str):
+            summary['event_type'] = event['type'][:100]
+        exit_code = source.get('exit_code')
+        summary['exit_code'] = exit_code if isinstance(exit_code, int) else None
+        failure['failing_event'] = summary
+    return failure
+
+
 def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt=None):
     message = None
     completed = False
@@ -37,7 +65,8 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
         if not isinstance(event, dict):
             raise JobError("EXECUTION_FAILED", "Executor emitted invalid event data")
         if event.get("type") in {"turn.failed", "error"}:
-            raise JobError("EXECUTION_FAILED", "Executor reported a failed turn")
+            raise JobError("EXECUTION_FAILED", "Executor reported a failed turn",
+                           failure=bounded_failure(event, thread=thread))
         if event.get("type") == "turn.completed":
             completed = True
         if event.get('type') == 'turn.started':
@@ -56,7 +85,7 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
                     (item.get('type') == 'error' and started) or item.get('status') in {'failed', 'declined'}
                     or (item.get('type') == 'command_execution' and item.get('exit_code') not in {None, 0})):
                 raise JobError('REQUIRED_TOOL_FAILED', 'Native executor reported a failed required operation',
-                               exit_code=0, failure={'evidence_source': 'native-jsonl', 'recovery_permitted': False})
+                               exit_code=0, failure=bounded_failure(event, thread=thread))
             if isinstance(item, dict) and item.get("type") == "agent_message":
                 value = item.get("text")
                 if isinstance(value, str):
