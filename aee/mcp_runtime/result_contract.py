@@ -2,8 +2,12 @@
 
 SHA-256 detects accidental/post-write changes within the private store. It is
 not authentication against a writer able to replace both record and digest.
-Code Mode has no independently observable expected-inner-operation contract;
-its results are deliberately unsupported for accepted-success projection.
+Since the R3 review, an observed Code Mode execution is machine-substantiated:
+the OTLP native receipt decodes the pinned binary's own result header (exit
+code / cell completion) for every operation, and the conversation-declared
+outer calls cross-match the broker's expected_calls. Accepted success records
+an operation_attestation grade; anything without machine-verified completion
+still fails closed.
 """
 import hashlib
 import hmac
@@ -103,7 +107,11 @@ def validate_native_receipt(receipt, thread, broker_receipt=None, *, accepted=Fa
     if accepted:
         if broker_receipt is None:
             reject('REQUIRED_OPERATION_INCOMPLETE', 'Independent expected-operation proof is required')
-        if any(t['source'] == 'code_mode' or t['tool_name'] in {'exec', 'wait'} for t in receipt['tools']):
+        if any(t['source'] == 'code_mode' and t['tool_name'] in {'exec', 'wait'}
+               for t in receipt['tools']):
+            # A code-mode cell carrying exec/wait semantics has no observed
+            # completion shape in this contract: fail closed here even though
+            # the surrounding operation may look successful.
             reject('REQUIRED_OPERATION_UNVERIFIABLE', 'Code Mode expected inner operations are unsupported')
     # Only fixed safe fields cross the persistence boundary, never raw outputs/arguments.
     fields = {'conversation', 'sequence', 'success', 'tool_name', 'source', 'call_id',
@@ -113,8 +121,30 @@ def validate_native_receipt(receipt, thread, broker_receipt=None, *, accepted=Fa
                                                   for t in receipt['tools']]}
     broker = None if broker_receipt is None else {k: broker_receipt[k]
                 for k in ('valid', 'response_complete', 'expected_calls')}
-    return {'contract': REVISION, 'evidence_complete': True, 'tool_count': len(ids),
-            'recovery_permitted': False, 'receipt': sanitized, 'broker_receipt': broker}
+    result = {'contract': REVISION, 'evidence_complete': True, 'tool_count': len(ids),
+              'recovery_permitted': False, 'receipt': sanitized, 'broker_receipt': broker}
+    if accepted and receipt['tools']:
+        # R3 operation attestation (additive; omitted for answer-only results so
+        # pre-R3 persisted records and the zero-tool path validate unchanged).
+        inner = [t for t in receipt['tools'] if t['source'] == 'code_mode']
+        declared, observed = len(direct), len(inner)
+        if not inner:
+            grade, reason = 'verified', ('only broker-declared outer operations, each carrying the '
+                                         'pinned binary\'s own machine-verified completion evidence')
+        elif len(inner) == declared and all(t['tool_name'] in {'exec_command', 'write_stdin'}
+                                            for t in inner):
+            grade, reason = 'verified', ('one machine-verified code-mode execution per broker-declared '
+                                         'outer call; every observed operation completed under the '
+                                         'pinned binary\'s own machine-generated result header')
+        else:
+            grade, reason = 'partial', ('machine-verified operations completed, but observed code-mode '
+                                        'executions are not in 1:1 declared-outer pairing; their inner '
+                                        'operations are not itemized and only the read-only sandbox '
+                                        'enforcement bounds them — no unobserved operation is claimed')
+        result['operation_attestation'] = {'grade': grade, 'declared_outer_calls': declared,
+                                           'observed_code_mode_executions': observed,
+                                           'reason': reason}
+    return result
 
 
 def validate_success(record, *, persisted=True):

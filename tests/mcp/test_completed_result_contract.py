@@ -34,6 +34,12 @@ def completed_with_command():
         'source': 'direct', 'conversation': 'fixture-thread', 'sequence': 1, 'success': True, 'exit_code': 0}]
     proof['tool_count'] = 1
     proof['broker_receipt']['expected_calls'] = {'required-command': 'exec_command'}
+    # Must match validate_native_receipt's R3 attestation exactly (grade rules
+    # live there); proof == checked comparison on reopen depends on it.
+    proof['operation_attestation'] = {
+        'grade': 'verified', 'declared_outer_calls': 1, 'observed_code_mode_executions': 0,
+        'reason': "only broker-declared outer operations, each carrying the pinned "
+                  "binary's own machine-verified completion evidence"}
     return fields
 
 
@@ -64,7 +70,9 @@ class CompletedResultContract(unittest.TestCase):
                  ('genuine_interrupted', 'interrupted', 'EXECUTION_INTERRUPTED'),
                  ('historical_fail_open_equivalent', 'historical', 'INVALID_TERMINAL_STATE'),
                  ('unsupported_integrity', 'unsupported', 'PERSISTED_INTEGRITY_FAILED'),
-                 ('code_mode_unverifiable', 'code_mode', 'REQUIRED_OPERATION_UNVERIFIABLE'),
+                 ('tool_using_verified_inner', 'inner_verified', None),
+                 ('code_mode_inner_partial', 'code_mode', None),
+                 ('code_mode_cell_exec', 'code_mode_cell', 'REQUIRED_OPERATION_UNVERIFIABLE'),
                  ('missing_broker_proof', 'no_broker', 'REQUIRED_OPERATION_INCOMPLETE'),
                  ('missing_result', 'no_result', 'RESULT_INCOMPLETE'),
                  ('tamper_and_redigest', 'redigest', None)]
@@ -102,9 +110,34 @@ class CompletedResultContract(unittest.TestCase):
             elif change == 'historical':
                 record['exit_code'] = 7
                 record['execution']['native_tool_failure'] = {'tool_failures': 1}
+            elif change == 'inner_verified':
+                # Real pinned-codex shape: the SSE-declared outer exec plus the
+                # machine-verified inner code-mode execution of the same work.
+                proof['receipt']['tools'].append({
+                    'call_id': 'exec-inner-1', 'tool_name': 'exec_command', 'source': 'code_mode',
+                    'conversation': 'fixture-thread', 'sequence': 2, 'success': True, 'exit_code': 0})
+                proof['tool_count'] = 2
+                proof['operation_attestation'] = {
+                    'grade': 'verified', 'declared_outer_calls': 1, 'observed_code_mode_executions': 1,
+                    'reason': 'one machine-verified code-mode execution per broker-declared '
+                              'outer call; every observed operation completed under the '
+                              "pinned binary's own machine-generated result header"}
             elif change == 'code_mode':
                 proof['receipt']['tools'][0]['source'] = 'code_mode'
                 proof['broker_receipt']['expected_calls'] = {}
+                # Accepted with a partial grade: machine-verified but nothing was
+                # declared on the conversation surface against it.
+                proof['operation_attestation'] = {
+                    'grade': 'partial', 'declared_outer_calls': 0, 'observed_code_mode_executions': 1,
+                    'reason': 'machine-verified operations completed, but observed code-mode '
+                              'executions are not in 1:1 declared-outer pairing; their inner '
+                              'operations are not itemized and only the read-only sandbox '
+                              'enforcement bounds them — no unobserved operation is claimed'}
+            elif change == 'code_mode_cell':
+                proof['receipt']['tools'].append({
+                    'call_id': 'cell-exec', 'tool_name': 'exec', 'source': 'code_mode',
+                    'conversation': 'fixture-thread', 'sequence': 2, 'success': True})
+                proof['tool_count'] = 2
             elif change == 'no_broker': proof['broker_receipt'] = None
             elif change == 'no_result': record['summary'] = None
             elif change == 'redigest': record['summary'] = 'Writer changed content and recomputed digest'

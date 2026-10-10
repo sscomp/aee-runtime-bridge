@@ -14,7 +14,7 @@ raw model traffic, tunnel profiles or internal host inventories.
 | `BUSY` | Poll the admitted job; verify the owning process/lease; do not delete a live lock |
 | `JOB_NOT_COMPLETE` | Poll with a finite deadline; inspect terminal failure, not just HTTP status |
 | Completed label rejected | Missing/tampered integrity or incomplete native/broker proof is a failure; never repair by relabeling |
-| Code Mode accepted success rejected | Expected inner-operation proof is unsupported; use supported direct operations or await reviewed implementation |
+| Code Mode accepted success rejected | Since R3, accepted success needs each observed code-mode execution decoded from the pinned binary's own result header with broker cross-matched declared calls, still failing closed (`REQUIRED_OPERATION_UNVERIFIABLE`) for code-mode `exec`/`wait` or anything without machine-verified completion; check the receipt and [deployment §4c](deployment.md#4c-completed-job-smoke-test-real-http-mcp-production-seal) |
 | Tunnel absent from ChatGPT | Check workspace association, tunnel permissions and healthy client; follow official linked guides |
 
 `journalctl -u aee-p2c-broker -u aee-p2c-gateway@restricted` is an operator-only

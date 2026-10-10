@@ -81,7 +81,11 @@ def validate_request(method, path, headers, payload):
             validate_codex_tools(item.get("tools"))
         if item.get("type") in {"function_call", "custom_tool_call"}:
             allowed = {"wait", "request_user_input_async"} if item["type"] == "function_call" else {"exec"}
-            if item.get("namespace") != "functions" or item.get("name") not in allowed:
+            # Real api.openai.com Responses history omits `namespace` on the
+            # client's own custom tool call items; R1 qualification fixtures
+            # carry `functions`. Only both spellings pass, and the name
+            # allowlist (read-only `exec`) is unchanged.
+            if item.get("name") not in allowed or item.get("namespace", "functions") != "functions":
                 raise PolicyError("REQUEST_DENIED")
         if "content" in item:
             content = item["content"]

@@ -1,8 +1,9 @@
-"""Reviewed R1 contract; schema or executor drift requires another review."""
+"""Reviewed R1 contract, scope re-reviewed in R3 after a live tool-using E2E;
+schema or executor drift requires another review."""
 import hashlib
 import json
 
-CONTRACT_ID = "codex-0.159.2-responses-lite-single-agent-r1"
+CONTRACT_ID = "codex-0.159.2-responses-lite-single-agent-r3"
 NATIVE_VERSION = "codex-cli 0.159.2"
 NATIVE_SHA256 = "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e"
 COMPANION_SHA256 = "5b2c075ac2380fa04d76d7313fbc044d29c8d0a0d0b9138415acd4610211ca03"
@@ -18,7 +19,7 @@ SINGLE_AGENT_OVERRIDES = (
 def contract_record():
     return {"id": CONTRACT_ID, "additional_tools_sha256": TOOLS_SHA256,
             "single_agent_overrides": list(SINGLE_AGENT_OVERRIDES),
-            "verification_scope": "installed-native-through-broker-synthetic-SSE-text-completion"}
+            "verification_scope": "installed-native-through-broker-attested-read-only-tool-dispatch"}
 
 
 def matches_reviewed_executor(version, native_digest, companion_digest):

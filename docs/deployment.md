@@ -5,6 +5,32 @@ existing offline `aee.mcp_runtime.packaging` entrypoint and supplied systemd uni
 `install.sh` remains the compatibility HTTP/profile installer. No source checkout,
 package build or CI result constitutes permission to deploy a host.
 
+The sequence has five tiers; stop at the tier your authorization allows:
+
+- **§0–2 Local validation** (no root, no credentials) — proves the repository
+  installs and the MCP protocol surface is intact. **Verified working on a fresh
+  host with these exact commands** (see §5 evidence note).
+- **§2c Broker-qualified local dispatch** (no root, needs an OpenAI API key
+  provisioned by the operator) — real read-only Codex jobs on a running gateway.
+  **Verified working on a fresh host.**
+- **§3–4 Production deployment** (root) — immutable release layout, system
+  accounts, pinned binaries, operator review gate. Adds native telemetry receipts,
+  cgroup containment checks and broker corroboration on top of §2c.
+
+## 0. Host tooling (user-level, reversible, no root)
+
+```bash
+command -v git curl gcc prlimit bwrap || true
+# Missing uv? Install it user-level; it manages its own CPython 3.13:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+```
+
+`uv venv --python 3.13` fetches and runs a uv-managed CPython 3.13 when the host
+Python differs — no system Python change is needed. Rollback: delete `~/.local/bin/uv*`
+and `~/.local/share/uv`.
+
 ## 1. Inspect the host and choose a reviewed commit
 
 Use a fresh Linux x86_64 host with systemd/cgroup v2, CPython 3.13.x, `uv`, Git,
@@ -23,9 +49,11 @@ systemctl list-unit-files 'aee*'
 
 Stop if a dependency is missing, an existing installation is present, or ports
 are occupied. Obtain operator direction for host package provisioning; do not
-replace another installation. The production sandbox pins Bubblewrap 0.12.0 at
-`/usr/bin/bwrap` and its SHA in `config/p2c/sandbox-profile.json`; a distribution's
-other build may run offline fixtures but cannot pass production admission.
+replace another installation. The production sandbox pins the `openai/codex`
+release `bwrap` build at `/usr/bin/bwrap` with its SHA in
+`config/p2c/sandbox-profile.json` (see [provenance notes](#5-host-evidence-notes-provenance));
+a distribution's other bubblewrap build may run offline fixtures but cannot pass
+production admission.
 
 Clone using the README command. Until this candidate is merged, explicitly
 checkout `feat/stage2c-canonical-v2`. The operator then chooses a reviewed commit;
@@ -55,6 +83,80 @@ operator's `/tmp` data to satisfy it.
 
 Native qualification tests report explicit skips without operator-provided native
 paths. They are documented in [runtime tests](../tests/mcp/README.md).
+
+## 2b. Local gateway run (no root; documented non-production run mode)
+
+The gateway is env-driven and runs from the checkout as an unprivileged user. This
+mode exercises the real HTTP MCP server without any production approval; it emits
+`0.2.0-p2c-candidate` health data and must not be represented as a production
+deployment.
+
+1. Provision a private env file (mode 0600, **outside** the checkout) from
+   `config/p2c/gateway-restricted.env.example`, replacing every `<...>` value.
+   Key minimum for a gateway-only run: `MCP_BRIDGE_API_KEY` (generate with
+   `python -c 'import secrets; print(secrets.token_urlsafe(32))'`), the
+   `AEE_MCP_*` block verbatim from the example, and `A3_JOB_STORE_DIR` pointing
+   outside the checkout (job state must not dirty the tree).
+2. Generate the dispatch workspace manifest for your chosen allowed root with the
+   packager's own generator (any path→sha256 map of the working tree works):
+   `aee.mcp_runtime.packaging.make_manifest(root, git_commit)`.
+3. Run it under a dedicated user service (distinct unit name, e.g.
+   `aee-v2-local-gateway`): `ExecStart=.../.venv/bin/python mcp_gateway.py` with
+   that EnvironmentFile; do not enable it at boot until the operator decides.
+4. Verify with [agent operations](agent-operations.md): `/health`, MCP
+   `initialize`, `tools/list` (exactly five tools), auth negatives.
+
+Without the broker, dispatch **admits and enforces** jobs but a real Codex run
+fails `OUTPUT_LIMIT_EXCEEDED` (SIGXFSZ): codex's own session-state writes exceed
+the default `Limits.file_bytes` of 64 KiB, which only the broker-relayed path
+([§2c](#2c-broker-qualified-local-dispatch-no-root-needed)) raises to 4 MiB. Treat a
+queued-but-failed job as **not** completed dispatch.
+
+## 2c. Broker-qualified local dispatch (no root needed)
+
+Real dispatch E2E requires the inference broker: it holds the model credential in
+a private file and hands each job a per-job UDS to the fixed OpenAI Responses
+endpoint. Same host, no root:
+
+1. **Operator provisions the credential** (never via chat/reports/commits): place
+   the OpenAI API key in a directory-restricted path, mode 0600, e.g.
+   `~/.private/aee/openai-api-key`. Record the path only.
+2. Start the broker with a private socket directory and the credential:
+   `.venv/bin/python -m aee.mcp_runtime.broker --directory <private-socket-dir>
+   --gateway-uid <your-numeric-uid> --credential-file <credential-path>`
+   under its own user unit (distinct name, e.g. `aee-v2-local-broker`),
+   `Restart=on-failure`, bounded `MemoryMax`.
+3. Extend the gateway env with `AEE_BROKER_CONTROL=<socket-dir>/control.sock` and
+   restart only the gateway unit.
+4. Dispatch a bounded read-only job per [agent operations](agent-operations.md).
+   With the broker socket present, job tempfs/file limits are relaxed to the
+   measured codex runtime needs (4 MiB RLIMIT_FSIZE) and the job can complete.
+5. Keep both units *not enabled at boot* unless the operator decides otherwise;
+   stop/disable for full rollback. This mode is **local-qualified dispatch, not
+   production**: no operator telemetry, no native-receipt corroboration, no
+   cgroup containment proof (§3–4 production adds those).
+
+## 5. Host evidence notes (provenance)
+
+When deploying pinned binaries, always re-hash after download and record the
+source URL and attestations with the deployment evidence. The `provider_contract.py`
+native Codex/companion digests correspond to the official
+`openai/codex` release `rust-v0.159.2` musl artifacts (verify with `sha256sum`
+after extraction; the release publishes sigstore attestations for each asset).
+
+`config/p2c/sandbox-profile.json` pins the release-shipped sandbox binary from
+the same `rust-v0.159.2` release: asset `bwrap-x86_64-unknown-linux-musl.tar.gz`
+(sha256 `b813b85bb35b81173a0157aef51390ca89b00c6ffe0049a054a573493345b769`),
+whose extracted binary hashes
+`77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c` and prints
+`bubblewrap built for Codex`. It is the vendored bubblewrap 0.11.2
+(`codex-rs/vendor/bubblewrap`) built for Codex by the release workflow; each
+release asset carries a sigstore attestation signed by
+`.github/workflows/rust-release.yaml@refs/tags/rust-v0.159.2`. Re-pin only with
+a reviewed artifact from a **documented official source**; never edit the digest
+to make a validation green. Installing this binary at `/usr/bin/bwrap` is a
+privileged, operator-approved step (back up the distribution's original first;
+reinstall the distribution package to roll back).
 
 ## 3. Build, verify and plan an immutable release
 
@@ -140,3 +242,84 @@ These commands are planned target-host steps, **not executed by publication CI**
 An auth/config/gate failure is a stop condition. Validate MCP using
 [agent operations](agent-operations.md), then connect [ChatGPT](chatgpt-mcp.md).
 See [rollback](troubleshooting.md) before enabling services at boot.
+
+## 4a. Model credential presentation on modern systemd (verified pattern)
+
+`aee-p2c-broker.service` ships `LoadCredential=openai-api-key:/etc/aee/secrets/openai-api-key`.
+On systemd 257 (`systemd --version`) this host presented the credential mount as
+`0440` owned by uid 0, which can never satisfy the broker's unchanged mode policy
+(`mode & 0o077 == 0` with owner uid 0 or the broker's own uid — an owner-only
+0600 file). The reviewed pattern used on the deployed host keeps the secret value
+identical and bypasses only the presentation mechanism:
+
+- `/etc/aee/secrets/openai-api-key` is a broker-owned, mode 0600 regular file
+  (`chown aee-broker:aee-inference; chmod 600`), and `/etc/aee/secrets` stays
+  `root:aee-inference` mode 0710.
+- A verified drop-in (
+  `/etc/systemd/system/aee-p2c-broker.service.d/credential-path.conf`) overrides
+  only `ExecStart=` so `--credential-file` points at that path directly.
+- The broker's credential policy code is untouched: an over-permissive or
+  group-readable file is still refused at start-up.
+- After any change: `systemd-analyze verify`, `systemctl daemon-reload`, restart
+  both units, confirm `/health`. Rollback is restoring the shipped `ExecStart=`
+  and removing the drop-in.
+
+Probe your own host's presentation before choosing (`mode`/`uid` only — never the
+value): run a transient unit with `User=aee-broker` and `LoadCredential=...` that
+prints `os.stat('/run/credentials/<unit>/openai-api-key')` mode and uid.
+
+## 4b. Service lifecycle and boot persistence (cold-boot validated)
+
+Production units are SYSTEM units: `aee-p2c-broker.service`,
+`aee-p2c-gateway@restricted.service` (the gateway unit `Requires=`/`BindsTo=` the
+broker and pins `aee-runtime.slice` resource limits matching
+`config/p2c/resource-profile.json`). After a reviewed install:
+
+```bash
+# boot persistence (example names — match installed units)
+sudo systemctl enable aee-p2c-broker.service aee-p2c-gateway@restricted.service
+# cold-boot validation after an operator-approved reboot:
+systemctl is-active aee-p2c-broker.service aee-p2c-gateway@restricted.service
+systemctl is-enabled aee-p2c-broker.service aee-p2c-gateway@restricted.service
+curl -sS -o /dev/null -w 'HEALTH %{http_code}\n' http://127.0.0.1:8791/health
+ss -ltn                     # restricted lister stays on 127.0.0.1:8791 only
+```
+
+Stop conditions stay honest: if a post-reboot health/listener check fails, treat
+boot persistence as NOT achieved and return to [troubleshooting](troubleshooting.md)
+instead of re-testing dispatch on a degraded gateway.
+
+## 4c. Completed-job smoke test (real HTTP MCP, production seal)
+
+Run after every deployment change or reboot. This is the dispatch route the
+completed-result contract accepts end to end — a **read-only** dispatch through
+the real HTTP MCP surface, whose persisted record carries the `aee-completed-v1`
+seal checked by `result_contract.validate_success`. Since the R3 review there
+are two accepted shapes:
+
+- **answer-only** dispatch (no tool calls): as before, the record validates with
+  no `operation_attestation` field (backward compatible with pre-R3 records).
+- **tool-using** dispatch (one actual read-only tool operation): the native
+  receipt now carries the pinned binary's own machine-verified completion
+  evidence (inner `exec_command`, code_mode, machine-decoded exit code) next to
+  the broker-declared outer call, and the record gains an
+  `operation_attestation` (`verified` when inner executions pair 1:1 with
+  declared outer calls, `partial` when some machine-verified operations are
+  observed without their inner itemization). Nothing without such evidence is
+  claimed: code-mode `exec`/`wait` without a decoded completion header, failed
+  declared calls, missing broker corroboration, or count drift still fail
+  closed with `REQUIRED_OPERATION_UNVERIFIABLE` / `REQUIRED_TOOL_FAILED` /
+  `TOOL_EVIDENCE_INCOMPLETE`.
+
+```bash
+# auth negatives first (expect 401): no bearer and a wrong bearer
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8791/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}'
+# then, with the real bearer: initialize → tools/list (exactly five, no aee_exec)
+# → aee_dispatch (read-only task, allowed root as working_directory; answer-only
+#   or a task that performs one actual read-only exec)
+# → poll aee_job_status to completed → aee_job_result (status completed, exit 0;
+#   a tool-using result also carries operation_attestation in its evidence)
+# full scripted sequence: see agent-operations.md and the R2/R3 reports
+```

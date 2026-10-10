@@ -30,6 +30,10 @@ Offline tests/builds are safe preparation; production installation is separate.
    summary, ordered timestamps and `aee-completed-v1` native/broker completion
    proof. Preserve structured failures; a final sentence or zero exit alone is
    not proof. Check lease release, private store modes and unchanged source.
+   Since the R3 contract revision, a second positive with one actual read-only
+   tool operation must also complete, its record carrying
+   `operation_attestation` (`verified` on 1:1 inner/outer pairing) in the
+   native/broker proof; see [deployment §4c](deployment.md#4c-completed-job-smoke-test-real-http-mcp-production-seal).
 7. Check negative agent/mode/profile/traversal inputs are rejected before launch.
    Run destructive probes only in an isolated qualification fixture, never on
    production. Then perform [planned ChatGPT E2E](chatgpt-mcp.md).

@@ -57,9 +57,14 @@ class ResponseReceipt:
         kind = item.get('type')
         if kind in {'custom_tool_call', 'function_call'}:
             call, name = item.get('call_id'), item.get('name')
+            # Real api.openai.com Responses output items omit `namespace` on
+            # custom_tool_call items (the request-side counterpart in
+            # broker.validate_request accepts both spellings for the same
+            # reason). Missing defaults to `functions`; any explicit other
+            # namespace still invalidates the lease receipt.
             if (not isinstance(call, str) or not ID.fullmatch(call)
                     or name not in {'exec', 'wait', 'request_user_input_async'}
-                    or item.get('namespace') != 'functions'):
+                    or item.get('namespace', 'functions') != 'functions'):
                 raise ValueError()
             with self.lease.lock:
                 if (len(self.lease.expected_calls) >= 128 and call not in self.lease.expected_calls
