@@ -155,7 +155,8 @@ def sandbox_command(executable, workspace, arguments, limits=Limits(), *, broker
         if sandbox_revision is not None:
             telemetry = Path(__file__).with_name('native_telemetry.py')
             command.extend(['--ro-bind', str(telemetry), '/runner/native_telemetry.py',
-                            '--setenv', 'AEE_NATIVE_TOOL_RECEIPT', '1'])
+                            '--setenv', 'AEE_NATIVE_TOOL_RECEIPT', '1',
+                            '--setenv', 'AEE_TRANSPORT_DIAGNOSTICS', '1'])
         companion = Path(executable).with_name("codex-code-mode-host")
         if companion.exists():
             command.extend(["--ro-bind", str(companion), "/runner/codex-code-mode-host"])
