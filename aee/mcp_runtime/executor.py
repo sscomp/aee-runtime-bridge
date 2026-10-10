@@ -54,6 +54,27 @@ def augmented_evidence_failure(failure, receipt, thread, broker_receipt):
                       and isinstance(tool[key], (bool, int, str))}
                      for tool in tools[:128] if isinstance(tool, dict)]
             summary['tools'] = cells
+            # The collector's own violated-predicate mirror, when it shipped one
+            # (additive ``incomplete_reasons`` on the incomplete receipt branch):
+            # scalar fields pass through; missing/detail lists are string-or-int
+            # and capped. Hashed call identities only — no conversation ids.
+            reasons = receipt.get('incomplete_reasons')
+            if isinstance(reasons, list):
+                collected = []
+                for item in reasons[:8]:
+                    if not isinstance(item, dict):
+                        continue
+                    clean = {key: value for key, value in item.items()
+                             if type(key) is str and type(value) in (str, int, float)}
+                    for list_key in ('missing', 'detail'):
+                        nested = item.get(list_key)
+                        if isinstance(nested, list) and all(
+                                type(entry) in (str, int, float) for entry in nested):
+                            clean[list_key] = nested[:16]
+                    if clean:
+                        collected.append(clean)
+                if collected:
+                    summary['collector_reasons'] = collected
             # Mirrors of the validator's own conditions, derived from the same
             # observed cells (counts only, no new data sources).
             summary['unverified_cells'] = sum(

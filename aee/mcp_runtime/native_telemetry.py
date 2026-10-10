@@ -6,6 +6,7 @@ Only the immutable relay emits this AEE receipt after native shutdown/flush.
 The collector has no broker/upstream route and is unreachable by native tools'
 network seccomp sandbox. Missing, conflicting or over-limit evidence fails shut.
 """
+import hashlib
 import http.server
 import json
 import re
@@ -37,6 +38,11 @@ def bounded_id(value):
     if not isinstance(value, str) or not ID.fullmatch(value):
         raise ValueError()
     return value
+
+
+def hashed_element(value, limit=16):
+    """Safe bounded hash of a call identity; never the raw identifier."""
+    return hashlib.sha256(value.encode()).hexdigest()[:limit]
 
 
 def tool_identity(a):
@@ -158,10 +164,48 @@ class Evidence:
                 raise ValueError() from None
 
     def receipt(self):
+        """Emit the AEE receipt; name each violated aggregate predicate if incomplete.
+
+        ``complete`` is computed exactly as before (same predicates, same order,
+        same short-circuit expression) — the ``incomplete_reasons`` mirror is
+        additive only (emitted on the incomplete branch), never an input to the
+        decision, and call identities are hashed (sha256 prefix), never raw.
+        """
         with self.lock:
             keys = set(self.calls)
+            ready_keys, log_keys, trace_keys = set(self.ready), set(self.logs), set(self.traces)
             complete = (not self.invalid and self.roots == 1 and len(self.conversations) == 1
-                        and keys == set(self.ready) == set(self.logs) == set(self.traces))
+                        and keys == ready_keys == log_keys == trace_keys)
+            reasons = []
+
+            def reason(predicate_id, observed, expected=None):
+                if len(reasons) < 8:
+                    item = {'predicate_id': predicate_id, 'observed': observed}
+                    if expected is not None:
+                        item['expected'] = expected
+                    reasons.append(item)
+
+            if self.invalid:
+                reason('collector_invalid', True, False)
+            if self.roots != 1:
+                reason('root_exec_spans', self.roots, 1)
+            if len(self.conversations) != 1:
+                reason('conversation_count', len(self.conversations), 1)
+            if not (keys == ready_keys and log_keys == ready_keys and trace_keys == ready_keys):
+                # Same boolean as the chained equality above; enumerated per set
+                # under a union reference so each absent membership is visible.
+                union = keys | ready_keys | log_keys | trace_keys
+                for name, members in (('calls', keys), ('tool_result_ready', ready_keys),
+                                      ('tool_result_logs', log_keys),
+                                      ('tool_result_traces', trace_keys)):
+                    missing = union - members
+                    if missing:
+                        if len(reasons) < 8:
+                            reasons.append({'predicate_id': 'four_set_membership:' + name,
+                                            'observed': len(members), 'expected': len(union),
+                                            'missing': sorted(hashed_element(element)
+                                                              for element in missing)[:16]})
+                        complete = False
             sequences = []
             tools = []
             for call, record in sorted(self.logs.items(), key=lambda pair: pair[1]['sequence']):
@@ -171,12 +215,33 @@ class Evidence:
                         or self.calls.get(call, {}).get('conversation') != record['conversation']
                         or record['conversation'] not in self.conversations):
                     complete = False
+                    if len(reasons) < 8:
+                        detail = [name for name, violated in (
+                            ('trace_record_mismatch', self.traces.get(call) != base),
+                            ('ready_calls_record_mismatch',
+                             self.ready.get(call) != self.calls.get(call)),
+                            ('calls_tool_name_mismatch',
+                             self.calls.get(call, {}).get('tool_name') != record['tool_name']),
+                            ('calls_conversation_mismatch',
+                             self.calls.get(call, {}).get('conversation') != record['conversation']),
+                            ('conversation_unregistered',
+                             record['conversation'] not in self.conversations)) if violated]
+                        reasons.append({'predicate_id': 'per_call_pairing',
+                                        'observed': hashed_element(call), 'expected': 'aligned',
+                                        'detail': detail})
                 sequences.append(record['sequence'])
                 tools.append({**record, 'source': self.calls.get(call, {}).get('source')})
             if sequences != list(range(1, len(tools) + 1)):
                 complete = False
-            return {'type': 'aee.native_tool_receipt', 'revision': REVISION, 'complete': complete,
-                    'conversation': next(iter(self.conversations), None), 'tools': tools}
+                if len(reasons) < 8:
+                    reasons.append({'predicate_id': 'sequence_contiguity',
+                                    'observed': len(sequences), 'expected': '1..N',
+                                    'detail': sorted(sequences)[:16]})
+            receipt = {'type': 'aee.native_tool_receipt', 'revision': REVISION, 'complete': complete,
+                       'conversation': next(iter(self.conversations), None), 'tools': tools}
+            if not complete:
+                receipt['incomplete_reasons'] = reasons
+            return receipt
 
 
 class Collector(http.server.HTTPServer):
