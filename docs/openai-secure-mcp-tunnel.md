@@ -1,8 +1,12 @@
 # OpenAI Secure MCP Tunnel — end-to-end setup guide
 
-Stage 3B guide. **Status label: NOT YET TESTED — the full tunnel E2E has not been
-run on any host yet.** Every command below is a documented, operator-executed
-step; nothing in this repository registers, connects or authorizes a tunnel.
+Stage 3B guide. **Status label: EXECUTED ON PRODUCTION A2 — the tunnel + Plugin
+E2E has been run on Omarchy-A2 with a host-distinct tunnel and connector
+("Omarchy-A2"); ChatGPT-side dispatch, polling and result retrieval were
+exercised for real (completed jobs and a deterministic fail-shot case — see the
+attribution runbook in [troubleshooting](troubleshooting.md)).** Everything below
+remains operator-executed; nothing in this repository registers, connects or
+authorizes a tunnel.
 
 The Secure MCP Tunnel exposes a running restricted AEE v2 MCP gateway to ChatGPT
 over **outbound HTTPS only**: the `tunnel-client` you run dials OpenAI's control
@@ -23,6 +27,10 @@ A shorter summary also lives in [ChatGPT setup](chatgpt-mcp.md).
 | 2 | Dispatch actually completes (broker-qualified local dispatch or production) — otherwise ChatGPT can list tools but every job fails | [host setup §2c](deployment.md) |
 | 3 | An OpenAI Platform account with permission to manage Secure MCP Tunnels, and an associated ChatGPT workspace | operator, in OpenAI Platform |
 | 4 | An operator-reviewed `tunnel-client` binary (released from the official `openai/tunnel-client` project) | operator judgment, as with the Codex pin |
+
+On Omarchy-A2 the A2-executed pin is `tunnel-client` **v0.0.16**, verified against
+the release's `SHA256SUMS` and sigstore provenance before install. Pin and verify
+your own binary the same way.
 
 Do not proceed on a gateway that passes `/health` yet fails the MCP handshake —
 the tunnel will happily forward traffic to a broken surface.
@@ -46,13 +54,15 @@ walkthrough](chatgpt-plugin-deployment.md)).
 tunnel-client --version
 tunnel-client init --help
 tunnel-client init --profile aee-restricted --tunnel-id "$AEE_TUNNEL_ID" \
-  --mcp-server-url http://127.0.0.1:8791/mcp --health-listen-addr 127.0.0.1:8080
+  --mcp-server-url http://127.0.0.1:8791/mcp --health-listen-addr 127.0.0.1:8792
 ```
 
-Flags were checked against tunnel-client `0.0.15`; verify them with the installed
-client's `--help` before use. `--mcp-server-url` must be the restricted surface
-(`:8791/mcp`), never the local/full `:8790`. Keep the health/UI listener on
-loopback and avoid ports already bound (`ss -ltn 'sport = :8080'` first).
+Flags were checked against tunnel-client `0.0.15`–`0.0.16`; verify them with the
+installed client's `--help` before use. `--mcp-server-url` must be the restricted
+surface (`:8791/mcp`), never the local/full `:8790`. Keep the health/UI listener
+on loopback and avoid ports already bound — `8080` is commonly occupied (on A2
+it is), which is why the executed host uses `127.0.0.1:8792`
+(`ss -ltn 'sport = :8792'` first).
 
 `init` writes the local profile; verify afterwards that no literal secret landed
 in it. If your version stores secrets in the profile file, place the file in a
@@ -70,21 +80,30 @@ The client needs two distinct secrets at run time:
 ```bash
 tunnel-client run --profile aee-restricted \
   --control-plane.api-key env:CONTROL_PLANE_API_KEY \
-  --mcp.extra-headers 'Authorization: Bearer env:AEE_MCP_FORWARD_KEY' \
-  --mcp.discovery-extra-headers 'Authorization: Bearer env:AEE_MCP_FORWARD_KEY'
+  --mcp.extra-headers 'Authorization: env:AEE_MCP_FORWARD_AUTH' \
+  --mcp.discovery-extra-headers 'Authorization: env:AEE_MCP_FORWARD_AUTH'
 ```
 
-Check the installed client's exact secret-reference syntax first (`run --help`);
-env references above are the documented shape at the version checked. The value
-of `AEE_MCP_FORWARD_KEY` has to be provided by the same protected environment
-mechanism as `CONTROL_PLANE_API_KEY` — same channel, two separate values.
+**Header secret-reference semantics (verified against `v0.0.16` source): a
+header value resolves a secret only when the *entire* value is a reference.**
+`Authorization: Bearer env:VAR` would forward the literal string
+`Bearer env:VAR`; the correct form is `Authorization: env:AEE_MCP_FORWARD_AUTH`
+with the environment value containing the full `Bearer <key>` string. Confirm
+against your installed version (`run --help`) — the reference must be a
+whole-value `env:VAR` or `file:/path`. `AEE_MCP_FORWARD_AUTH` must be provided
+by the same protected mechanism as `CONTROL_PLANE_API_KEY` — same channel, two
+separate values.
+
+Run it as a systemd **user** service with `loginctl enable-linger` so it persists
+after logout (executed on A2: unit `aee-a2-tunnel.service`, `Restart=on-failure`,
+`EnvironmentFile` holding the two secrets mode-0600 in a 0700 directory).
 
 While it runs, the client reports health on loopback endpoints only
 (`/healthz`, `/readyz`; optionally `/metrics` and a local UI). Confirm:
 
 ```bash
-curl --fail --silent --output /dev/null http://127.0.0.1:8080/healthz
-curl --fail --silent --output /dev/null http://127.0.0.1:8080/readyz
+curl --fail --silent --output /dev/null http://127.0.0.1:8792/healthz
+curl --fail --silent --output /dev/null http://127.0.0.1:8792/readyz
 ```
 
 A green transport is not an MCP acceptance test — ChatGPT could still be
@@ -120,17 +139,24 @@ and re-run local-only acceptance before retrying.
   logging on the ChatGPT side.
 - Rollback order: remove the Plugin (ChatGPT) → stop `tunnel-client` → revoke or
   park the tunnel in Platform. The gateway keeps running for local clients.
-- Because this E2E has not been validated, treat every command as the operator's
-  first run: run with restricted secrets only, and prefer stopping over weakening
-  gateway authentication if auth modes conflict (see the walkthrough note on
-  OAuth vs no-auth vs mixed application authentication).
+- ChatGPT custom-MCP-server authentication: the gateway is a static bearer
+  target, not an OAuth server. The executed A2 flow used the **no-auth** Plugin
+  mode (ChatGPT trusts the tunnel; the tunnel injects the forwarded bearer).
+  Never weaken gateway auth to fit an OAuth-only mode
+  ([walkthrough §2](chatgpt-plugin-deployment.md)).
+- Still treat first runs on new hosts as fresh: run with restricted secrets only,
+  and prefer stopping over weakening gateway authentication if auth modes
+  conflict.
 
 ## 6. Status summary
 
 | Item | Status |
 |---|---|
 | Official-docs basis of this guide | verified against `developers.openai.com` guides listed above |
-| Local dispatch E2E without tunnel | documented in [host setup](deployment.md); label depends on which route was run |
-| Tunnel + Plugin E2E | **NOT YET TESTED — Stage 3B outstanding** |
+| Local dispatch E2E without tunnel | verified on A2 (`/opt/aee/current/source` release `5b3a23b8…`; completed jobs with attestation) |
+| Tunnel + Plugin E2E | **executed on Omarchy-A2, `tunnel-client` v0.0.16**: connector "Omarchy-A2" listed tools, dispatched, polled and retrieved results; one ChatGPT-path job failed fail-shot (`REQUIRED_TOOL_FAILED`) and was attributed — see [troubleshooting](troubleshooting.md) |
 
-No tunnel was registered, connected or authorized by writing this guide.
+Node identity note: the job-id prefix `A3JOB-` and the gateway's internal
+self-label are legacy naming from the shared AEE codebase; jobs so numbered
+execute on the node that owns the tunnel. Verify with `aee_status` (hostname)
+and the job's `working_directory` resolving to that node's release path.

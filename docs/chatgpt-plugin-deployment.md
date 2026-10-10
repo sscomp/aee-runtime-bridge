@@ -1,11 +1,43 @@
 # ChatGPT Plugin deployment (custom MCP server)
 
-Stage 3B walkthrough. **Status label: NOT YET TESTED — an independent
-host/account Plugin E2E has not been run yet; publication CI is offline.** The
-official steps summarized here were checked against the [custom MCP server
+Stage 3B walkthrough. **Status label: EXECUTED ON PRODUCTION A2 — a private
+Plugin/connector ("Omarchy-A2") over an A2-distinct Secure MCP Tunnel was
+created and exercised end-to-end: tool discovery, read-only dispatch, job
+polling and result retrieval all ran for real (completed jobs and a
+deterministic fail-shot case are documented in
+[troubleshooting](troubleshooting.md)).** The official steps summarized here
+were checked against the [custom MCP server
 guide](https://developers.openai.com/api/docs/guides/custom-mcp-server) and the
 [Secure MCP tunnel
 guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
+
+## 1a. Dispatch contract the Plugin exposes (Codex read-only only)
+
+The restricted surface supports exactly `agent="codex"` and `mode="read_only"`.
+Everything else is rejected by schema, by design:
+
+- `agent="claude"` → `INVALID_AGENT`; `mode="read_write"` → `INVALID_MODE`.
+  `aee_agents` reporting Claude Code as installed/available is *filesystem
+  discovery only*, not an authorized dispatch target — do not treat it as a
+  capability.
+- Only the profile `codex-readonly-high` (model `gpt-6.1-sol`, reasoning
+  `high`, sandbox `read-only`, approval `never`) is registered.
+- The working directory must be an approved immutable snapshot under the
+  dispatch allowlist — on production A2 that is `/opt/aee/current/source`.
+  `/home/...` paths are invisible to the gateway by design
+  (`ProtectHome=yes`) and are never a fix target.
+- Identity note: job IDs use the legacy `A3JOB-` prefix and the gateway
+  self-labels legacy-names in metadata; this does **not** imply execution on
+  any node other than the one owning the tunnel. Confirm via `aee_status`
+  hostname and the job's resolved `working_directory`.
+
+**Task authoring matters.** Native enforcement fails a job
+(`REQUIRED_TOOL_FAILED`, exit-free fail-shot) when any command execution the
+agent runs exits nonzero — including benign negative queries (`grep -q` with no
+match, `diff` on differing files, `git …` against a snapshot with no `.git`).
+Write tasks whose commands exit zero: use plain `ls`/`cat`, and guard
+existence checks like `ls <file> || printf 'ABSENT\n'`. See
+[troubleshooting](troubleshooting.md) for the attribution runbook.
 
 Goal: a **private** custom Plugin in the operator's ChatGPT workspace that talks
 MCP over the Secure MCP Tunnel to the restricted five-tool AEE v2 gateway. This
@@ -89,5 +121,7 @@ leakage, and update the gateway env + tunnel forwarding reference together.
 
 ## 7. Status
 
-Planned Stage 3, **not yet passed**: no Plugin creation, tunnel connection or
-ChatGPT dispatch has been executed by publication work.
+Executed on production A2 (connector "Omarchy-A2", `tunnel-client` v0.0.16):
+Plugin creation, tunnel connection, discovery, dispatch, polling and result
+retrieval were all run for real. Historical reports stay in the operator's
+local evidence directory, not in the canonical happy path.
