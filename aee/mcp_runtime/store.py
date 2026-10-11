@@ -7,6 +7,7 @@ restart reconciliation. No retries, queue or database are introduced.
 """
 from __future__ import annotations
 
+import copy
 import fcntl
 import json
 import os
@@ -28,6 +29,18 @@ MAX_RECORD_BYTES = 65536
 MAX_TASK_CHARS = 8000
 MAX_SUMMARY_CHARS = 4000
 MAX_LOG_CHARS = 2000
+
+# K02-R1: an oversized terminal-failed record used to abort at the store-record
+# boundary; lease release + reconciliation then rewrote it failed/
+# EXECUTION_INTERRUPTED, losing failure attribution. The store-side reducer
+# below (tiers 1-3) only ever applies to terminal unsuccessful statuses
+# (never completed, never active), is deterministic, bounded, and preserves
+# error_code/error/status/timestamps verbatim. The record-serialize byte cap
+# itself is unchanged.
+TERMINAL_REDUCE_STATUSES = TERMINAL - {"completed"}
+MAX_DROPPED_KEY_NAMES = 8
+MAX_DROPPED_KEY_CHARS = 48
+MAX_TRUNCATION_MARKER_BYTES = 700
 
 # R5-R2: bounded scalar diagnostics attached at the exact OUTPUT_LIMIT_EXCEEDED
 # emission sites, so a future reproduction names the boundary (executor
@@ -67,6 +80,112 @@ def output_limit_context(boundary, stage, unit, *, limit=None, observed=None,
     return context
 
 
+# K02-R1: single source of truth for the sanitized JobError.context keys; the
+# tier-1 diagnostic retention guard accepts exactly these (no new allowlist).
+DIAGNOSTIC_KEYS = frozenset({'schema', 'failure_boundary', 'measurement_stage',
+                             'measurement_unit', 'source_stream', 'limit_bytes',
+                             'observed_bytes', 'limit_chars', 'observed_chars',
+                             'limit_entries', 'observed_entries', 'observed_measured'})
+# A retained tier-1 diagnostic/failure detail is only bounded scalars, and a
+# truncation marker only ever names dropped ``execution`` keys: a key name is
+# kept verbatim only when it is short and character-safe, and never when it is
+# secret-shaped (values would be a disclosure; names are refused as well -
+# a sentinel-bearing key name is exactly the leak test T3/9 guards against).
+_MARKER_SAFE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,48}")
+_MARKER_HIDDEN_NAME = re.compile(
+    r"(?i)api[_-]?key|token|secret|password|credential|bearer|authorization")
+
+
+def _validated_store_diagnostics(value):
+    """Tier-1 retention guard for ``execution.output_limit_diagnostics``.
+
+    Accepts exactly the sanitized scalar shape the single JobError context
+    guard already emits (DIAGNOSTIC_KEYS, bounded values); anything else is
+    not retained and falls through to the tier-2 truncation marker.
+    """
+    if not isinstance(value, dict) or set(value) - DIAGNOSTIC_KEYS:
+        return None
+    for item in value.values():
+        if not (item is None or isinstance(item, (int, bool))
+                or isinstance(item, str) and len(item) <= 48):
+            return None
+    return dict(value)
+
+
+def _validated_failure_detail(value):
+    """Tier-1 retention guard for ``execution.native_tool_failure``.
+
+    The documented raise-site shape is a flat bounded scalar dict (contract /
+    evidence_complete / condition / tool_failures / recovery_permitted);
+    nested or unbounded content is not retained.
+    """
+    if not isinstance(value, dict):
+        return None
+    for key, item in value.items():
+        if (not isinstance(key, str) or len(key) > 48 or not _MARKER_SAFE_NAME.fullmatch(key)
+                or not (item is None or isinstance(item, (int, bool))
+                        or isinstance(item, str) and len(item) <= 48)):
+            return None
+    return dict(value)
+
+
+def _sanitized_dropped_names(keys):
+    """Bounded, sanitized key names for the truncation marker.
+
+    Returns (names, omitted): names kept verbatim are deduplicated, sorted,
+    character-safe, at most 48 chars and not secret-shaped; everything else
+    (non-string, malformed, secret-shaped, or beyond MAX_DROPPED_KEY_NAMES)
+    is only counted, never spelled out.
+    """
+    names, omitted = [], 0
+    for key in sorted(keys, key=str):
+        if (isinstance(key, str) and len(key) <= MAX_DROPPED_KEY_CHARS
+                and _MARKER_SAFE_NAME.fullmatch(key)
+                and not _MARKER_HIDDEN_NAME.search(key)
+                and key not in names):
+            names.append(key)
+        else:
+            omitted += 1
+    bounded = names[:MAX_DROPPED_KEY_NAMES]
+    omitted += len(names) - len(bounded)
+    return bounded, omitted
+
+
+def _candidate_with_execution(data, execution):
+    """Copy of ``data`` with the execution value replaced; the caller's
+    dictionaries (including any shared execution mapping) are never mutated."""
+    candidate = copy.deepcopy(data)
+    candidate['execution'] = execution
+    return candidate
+
+
+def _truncation_marker(overflow_bytes, dropped_names, omitted):
+    """Bounded, schema-valid truncation-evidence execution marker (K02-R1)."""
+    marker = {'terminal_write_truncated': True,
+              'record_json_utf8_overflow_bytes': overflow_bytes,
+              'execution_keys_dropped': dropped_names}
+    if omitted:
+        marker['execution_keys_omitted_count'] = omitted
+    return marker
+
+
+def _bounded_marker(overflow_bytes, dropped_names, omitted):
+    """Truncation marker with a hard measured bound (MAX_TRUNCATION_MARKER_BYTES).
+
+    The name list is the only sizeable part; if the bounded marker would still
+    exceed its target it is rebuilt without names (counts only). Returns None
+    only if even that bound cannot be met, which today's constants make
+    unreachable — a None result fails the whole write closed.
+    """
+    marker = _truncation_marker(overflow_bytes, dropped_names, omitted)
+    if len(json.dumps(marker, ensure_ascii=False).encode()) <= MAX_TRUNCATION_MARKER_BYTES:
+        return marker
+    marker = _truncation_marker(overflow_bytes, [], omitted + len(dropped_names))
+    if len(json.dumps(marker, ensure_ascii=False).encode()) <= MAX_TRUNCATION_MARKER_BYTES:
+        return marker
+    return None
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -84,10 +203,7 @@ class JobError(Exception):
             # None (unknown/unmeasured) is kept — it distinguishes a null
             # observation from a fabricated zero or from omission.
             self.context = {key: value for key, value in context.items()
-                            if key in {'schema', 'failure_boundary', 'measurement_stage',
-                                       'measurement_unit', 'source_stream', 'limit_bytes',
-                                       'observed_bytes', 'limit_chars', 'observed_chars',
-                                       'limit_entries', 'observed_entries', 'observed_measured'}
+                            if key in DIAGNOSTIC_KEYS
                             and (value is None or isinstance(value, (int, bool))
                                  or isinstance(value, str) and len(value) <= 48)}
         super().__init__(self.message)
@@ -243,11 +359,43 @@ class JobStore:
                                'store_record_serialize', 'record_json_utf8', 'utf8_bytes',
                                limit=MAX_RECORD_BYTES, observed=record_bytes, measured=True))
 
-    def _write(self, data):
+    def _write(self, data, _reduction_tier=0, _first_overflow=None, _original_keys=None):
+        """Atomic durable write of one record.
+
+        K02-R1: if a terminal unsuccessful (failed / timed_out / cancelled)
+        record exceeds MAX_RECORD_BYTES at the whole-record serialization
+        boundary (``store_record_serialize``), one deterministic bounded
+        reduction attempt is made per tier and the write is retried on the
+        reduced copy: tier 1 keeps validated execution diagnostics plus bounded
+        truncation evidence, tier 2 substitutes the full truncation-evidence
+        marker, tier 3 keeps only the minimal marker. ``error_code`` / ``error``
+        / terminal ``status`` / timestamps are never rewritten by a reduction,
+        the first measured overflow is carried through the tiers, and any other
+        failure (field contract, artifacts, integrity, the completed path)
+        re-raises exactly as before — fail closed.
+        """
         if data.get('status') == 'completed':
             validate_success(data, persisted=False)
-        seal_record(data)
-        self._bounded(data)
+        try:
+            seal_record(data)
+            self._bounded(data)
+        except JobError as error:
+            context = error.context if isinstance(error.context, dict) else {}
+            first_overflow = _first_overflow
+            if (first_overflow is None and type(context.get('observed_bytes')) is int
+                    and context.get('observed_measured')):
+                first_overflow = context['observed_bytes']
+            candidate = self._reduced_terminal_failure(data, error, _reduction_tier,
+                                                       first_overflow, _original_keys)
+            if candidate is not None:
+                original_keys = _original_keys
+                if original_keys is None:
+                    execution = data.get('execution')
+                    original_keys = list(execution.keys()) if isinstance(execution, dict) else []
+                return self._write(candidate, _reduction_tier=_reduction_tier + 1,
+                                   _first_overflow=first_overflow,
+                                   _original_keys=original_keys)
+            raise
         payload = json.dumps(data, ensure_ascii=False).encode()
         fd, tmp = tempfile.mkstemp(dir=self._root, prefix=".tmp-", suffix=".json")
         try:
@@ -267,6 +415,7 @@ class JobStore:
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
+        return data
 
     def _records(self):
         try:
@@ -298,6 +447,59 @@ class JobStore:
                 return self._reconcile_unleased()
             finally:
                 os.close(fd)
+
+    def _reduced_terminal_failure(self, data, error, tier, first_overflow, original_keys=None):
+        """K02-R1 deterministic bounded shrink for one terminal-unsuccessful
+        record that overflowed the whole-record serialization boundary.
+
+        Returns a reduced *copy* to retry the write with, or None to re-raise
+        the original failure unchanged (fail closed). ``tier`` is the number of
+        reductions already attempted (0 for the initial write); each tier is
+        attempted at most once. The caller's dictionaries are never mutated.
+        ``original_keys`` carries the pre-reduction execution key names so the
+        tier-2 marker always names what was dropped from the *original* record.
+        """
+        if (tier not in (0, 1, 2)
+                or data.get('status') not in TERMINAL_REDUCE_STATUSES
+                or error.code != 'OUTPUT_LIMIT_EXCEEDED'
+                or not isinstance(error.context, dict)
+                or error.context.get('failure_boundary') != 'store_record_serialize'
+                or type(first_overflow) is not int):
+            return None
+        execution = data.get('execution')
+        keys = list(execution.keys()) if isinstance(execution, dict) else []
+        if original_keys is None:
+            original_keys = keys
+        if tier == 0:
+            # Tier 1: keep only validated, bounded diagnostics; every dropped
+            # original key stays durably named as truncation evidence.
+            retained = {}
+            for name, validate in (('output_limit_diagnostics', _validated_store_diagnostics),
+                                   ('native_tool_failure', _validated_failure_detail)):
+                if name in keys:
+                    value = validate(execution[name])
+                    if value is not None:
+                        retained[name] = value
+            names, omitted = _sanitized_dropped_names(
+                [key for key in original_keys if key not in retained])
+            evidence = _bounded_marker(first_overflow, names, omitted)
+            if evidence is None:
+                return None
+            candidate = copy.deepcopy(data)
+            evidence.update(retained)
+            candidate['execution'] = evidence
+            return candidate
+        names, omitted = _sanitized_dropped_names(original_keys)
+        marker = _bounded_marker(first_overflow, names, omitted)
+        if marker is None:
+            return None
+        if tier == 1:
+            return _candidate_with_execution(data, marker)
+        # Tier 3 (minimal terminal fallback): schema-valid, field-bounded;
+        # keeps the measured overflow and the explicit truncation flag only.
+        return _candidate_with_execution(
+            data, {'terminal_write_truncated': True,
+                   'record_json_utf8_overflow_bytes': first_overflow})
 
     @staticmethod
     def _new_job_id():
@@ -358,7 +560,10 @@ class JobStore:
             for key in ["summary", "log_excerpt", "error"]:
                 if isinstance(data.get(key), str):
                     data[key] = self._redact(data[key])
-            self._write(data)
+            # K02-R1: _write may internally retry on a reduced copy for a
+            # terminal-unsuccessful overflow; persist what was actually
+            # written, so the caller sees the reduced record too.
+            data = self._write(data)
             if target in TERMINAL:
                 os.close(self._leases.pop(job_id))
             return data
