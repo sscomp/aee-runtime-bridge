@@ -8,7 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from .store import JobError
+from .store import JobError, output_limit_context
 
 
 @dataclass(frozen=True)
@@ -98,7 +98,14 @@ def run_bounded(argv, *, env, stdin=b"", limits=Limits(), cwd=None, on_start=Non
                     stream.close()
                     continue
                 if len(output[name]) + len(chunk) > caps[name]:
-                    raise JobError("OUTPUT_LIMIT_EXCEEDED", "Executor output exceeded byte limit")
+                    # K01: each cumulative raw stream cap is independent; the
+                    # context is the only stream-specific discriminator.
+                    raise JobError("OUTPUT_LIMIT_EXCEEDED", "Executor output exceeded byte limit",
+                                   context=output_limit_context(
+                                       'executor_capture_' + name, 'raw_stream', 'raw_bytes',
+                                       limit=caps[name],
+                                       observed=len(output[name]) + len(chunk), measured=True,
+                                       stream=name))
                 output[name].extend(chunk)
                 tail.extend(chunk)
                 del tail[:-limits.log_chars * 4]
@@ -119,7 +126,13 @@ def run_bounded(argv, *, env, stdin=b"", limits=Limits(), cwd=None, on_start=Non
             except subprocess.TimeoutExpired:
                 continue
         if code in {-signal.SIGXFSZ, 128 + signal.SIGXFSZ}:
-            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Executor file size limit exceeded")
+            # The OS-observed attempt size is not recoverable here; the limit is
+            # the caller-configured value (resource policy may have lowered the
+            # effective prlimit), so nothing measured is fabricated.
+            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Executor file size limit exceeded",
+                           context=output_limit_context(
+                               'executor_file_size_limit', 'os_write', 'raw_bytes',
+                               limit=limits.file_bytes))
         if code in {-signal.SIGXCPU, 128 + signal.SIGXCPU}:
             raise JobError("RESOURCE_LIMIT_EXCEEDED", "Executor CPU limit exceeded")
         return ProcessResult(code, bytes(output["stdout"]), bytes(output["stderr"]), bytes(tail))

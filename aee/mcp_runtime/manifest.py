@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 
 from .sandbox import MAX_FILE_BYTES, MAX_MANIFEST_BYTES, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_FILES, safe_relative
-from .store import JobError
+from .store import JobError, output_limit_context
 
 
 def git_source_modes(workspace, revision="HEAD"):
@@ -55,18 +55,31 @@ def make_manifest(workspace, revision="HEAD"):
             header = process.stdout.readline().decode().split()
             size = int(header[2])
             if header[1] != "blob" or size > MAX_FILE_BYTES:
-                raise JobError("OUTPUT_LIMIT_EXCEEDED", "Reviewed file exceeds snapshot limit")
+                raise JobError("OUTPUT_LIMIT_EXCEEDED", "Reviewed file exceeds snapshot limit",
+                               context=output_limit_context(
+                                   'manifest_file', 'manifest_entries', 'raw_bytes',
+                                   limit=MAX_FILE_BYTES, observed=size, measured=True))
             data = process.stdout.read(size)
             if len(data) != size or process.stdout.read(1) != b"\n":
                 raise JobError("ISOLATION_UNAVAILABLE", "Incomplete Git object")
             total += size
             if total > MAX_WORKSPACE_BYTES:
-                raise JobError("OUTPUT_LIMIT_EXCEEDED", "Reviewed tree exceeds snapshot limit")
+                raise JobError("OUTPUT_LIMIT_EXCEEDED", "Reviewed tree exceeds snapshot limit",
+                               context=output_limit_context(
+                                   'manifest_tree', 'manifest_entries', 'raw_bytes',
+                                   limit=MAX_WORKSPACE_BYTES, observed=total, measured=True))
             entries[name] = hashlib.sha256(data).hexdigest()
             if len(entries) > MAX_WORKSPACE_FILES:
-                raise JobError("OUTPUT_LIMIT_EXCEEDED", "Manifest contains too many files")
-        if len(json.dumps(entries).encode()) > MAX_MANIFEST_BYTES:
-            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Manifest exceeds supported size")
+                raise JobError("OUTPUT_LIMIT_EXCEEDED", "Manifest contains too many files",
+                               context=output_limit_context(
+                                   'manifest_files', 'manifest_entries', 'count',
+                                   limit=MAX_WORKSPACE_FILES, observed=len(entries), measured=True))
+        manifest_bytes = len(json.dumps(entries).encode())
+        if manifest_bytes > MAX_MANIFEST_BYTES:
+            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Manifest exceeds supported size",
+                           context=output_limit_context(
+                               'manifest_serialized', 'manifest_json_utf8', 'utf8_bytes',
+                               limit=MAX_MANIFEST_BYTES, observed=manifest_bytes, measured=True))
         return entries
     finally:
         process.stdin.close()

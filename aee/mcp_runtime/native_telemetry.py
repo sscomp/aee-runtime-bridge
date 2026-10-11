@@ -368,6 +368,7 @@ class Evidence:
                     receipt['transport_diagnostics'] = {
                         'schema_version': TRANSPORT_SCHEMA_VERSION,
                         'totals': {'requests_total': self.requests,
+                                   'total_payload_bytes': self.total,
                                    **self.transport_totals},
                         'events': list(self.transport_events),
                     }

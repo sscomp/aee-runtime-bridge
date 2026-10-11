@@ -561,6 +561,10 @@ def run_codex_job(job_id: str, task: str, working_directory: str, *, cancel_even
         failure_execution = locals().get('execution')
         if isinstance(failure_execution, dict) and error.failure is not None:
             failure_execution['native_tool_failure'] = error.failure
+        if isinstance(failure_execution, dict) and isinstance(error.context, dict):
+            # R5-R2 additive output-limit boundary diagnostics; bounded
+            # scalars only, and never present on completed records.
+            failure_execution['output_limit_diagnostics'] = error.context
         fields = {'execution': failure_execution} if isinstance(failure_execution, dict) else {}
         JOB_STORE.update(job_id, status=status, finished_at=_now_iso(), exit_code=error.exit_code,
                          error_code=error.code, error=redact(error.message), **fields)

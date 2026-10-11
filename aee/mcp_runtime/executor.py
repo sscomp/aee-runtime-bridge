@@ -9,7 +9,7 @@ from pathlib import Path
 from .process import Limits, run_bounded
 from .profiles import codex_arguments, executable_digest
 from .sandbox import read_manifest, sandbox_command, snapshot_workspace
-from .store import JobError
+from .store import JobError, output_limit_context
 from .result_contract import validate_native_receipt as native_receipt, SUCCESS_VERSION
 
 
@@ -213,8 +213,12 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
             raise JobError(error.code, error.message, exit_code=error.exit_code,
                            failure=augmented_evidence_failure(error.failure, receipt, thread,
                                                               broker_receipt)) from None
-    if len(message.encode()) > limits.result_bytes:
-        raise JobError("OUTPUT_LIMIT_EXCEEDED", "Final message exceeds payload byte limit")
+    final_bytes = len(message.encode())
+    if final_bytes > limits.result_bytes:
+        raise JobError("OUTPUT_LIMIT_EXCEEDED", "Final message exceeds payload byte limit",
+                       context=output_limit_context(
+                           'native_final_message', 'final_message_utf8', 'utf8_bytes',
+                           limit=limits.result_bytes, observed=final_bytes, measured=True))
     return message
 
 
@@ -274,6 +278,10 @@ def execute_codex(identity, profile, task, working_directory, manifest, *, limit
         summary = redact(message)[:limits.summary_chars]
         log = redact(result.log_tail.decode(errors="replace"))[-limits.log_chars:]
         payload = {"summary": summary, "log_excerpt": log, "artifacts": [], "snapshot": snapshot}
-        if len(json.dumps(payload, ensure_ascii=False).encode()) > limits.result_bytes:
-            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Result payload exceeds byte limit")
+        payload_bytes = len(json.dumps(payload, ensure_ascii=False).encode())
+        if payload_bytes > limits.result_bytes:
+            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Result payload exceeds byte limit",
+                           context=output_limit_context(
+                               'success_payload_json', 'payload_json_utf8', 'utf8_bytes',
+                               limit=limits.result_bytes, observed=payload_bytes, measured=True))
         return ExecutionResult(summary, log, len(message) > limits.summary_chars, result.returncode, snapshot, evidence, outcome)

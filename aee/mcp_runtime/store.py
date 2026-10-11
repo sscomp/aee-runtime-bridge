@@ -29,17 +29,67 @@ MAX_TASK_CHARS = 8000
 MAX_SUMMARY_CHARS = 4000
 MAX_LOG_CHARS = 2000
 
+# R5-R2: bounded scalar diagnostics attached at the exact OUTPUT_LIMIT_EXCEEDED
+# emission sites, so a future reproduction names the boundary (executor
+# capture, final message/payload serialization, store record/field, snapshot,
+# manifest) without retaining any raw payload, prompt or credential. Each
+# field is an integer, a boolean, or a short fixed-string from the enums
+# below; "measured" distinguishes a direct observation from a configured or
+# unknown value, and nulls are never fabricated into zeros. Additive only:
+# no raise site, message, limit or failure classification changes.
+DIAGNOSTIC_SCHEMA = 'aee-output-limit-diagnostics-v1'
+BOUNDARIES = {'executor_capture_stdout', 'executor_capture_stderr', 'executor_file_size_limit',
+              'native_final_message', 'success_payload_json',
+              'store_field_contract', 'store_artifacts_contract', 'store_record_serialize',
+              'workspace_snapshot_file', 'workspace_snapshot_total',
+              'manifest_file', 'manifest_tree', 'manifest_files', 'manifest_serialized'}
+STAGES = {'raw_stream', 'os_write', 'final_message_utf8', 'payload_json_utf8',
+          'record_json_utf8', 'store_field_contract', 'manifest_entries',
+          'manifest_json_utf8', 'workspace_copy'}
+UNITS = {'raw_bytes', 'utf8_bytes', 'chars', 'count'}
+
+
+def output_limit_context(boundary, stage, unit, *, limit=None, observed=None,
+                         measured=False, stream=None):
+    """Build the bounded context dict for one OUTPUT_LIMIT_EXCEEDED site."""
+    context = {'schema': DIAGNOSTIC_SCHEMA,
+               'failure_boundary': boundary if boundary in BOUNDARIES else 'unclassified_boundary',
+               'measurement_stage': stage if stage in STAGES else 'unclassified_stage',
+               'measurement_unit': unit if unit in UNITS else None,
+               'source_stream': stream if stream in {'stdout', 'stderr'} else None,
+               'limit_bytes': limit if isinstance(limit, int) and unit in {'raw_bytes', 'utf8_bytes'} else None,
+               'observed_bytes': observed if isinstance(observed, int) and unit in {'raw_bytes', 'utf8_bytes'} else None,
+               'limit_chars': limit if isinstance(limit, int) and unit == 'chars' else None,
+               'observed_chars': observed if isinstance(observed, int) and unit == 'chars' else None,
+               'limit_entries': limit if isinstance(limit, int) and unit == 'count' else None,
+               'observed_entries': observed if isinstance(observed, int) and unit == 'count' else None,
+               'observed_measured': bool(measured)}
+    return context
+
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 
 class JobError(Exception):
-    def __init__(self, code, message, *, exit_code=None, failure=None):
+    def __init__(self, code, message, *, exit_code=None, failure=None, context=None):
         self.code = code
         self.message = str(message)[:500]
         self.exit_code = exit_code
         self.failure = failure
+        self.context = None
+        if isinstance(context, dict):
+            # Sanitize, never mask: only known scalar keys survive, bounded so
+            # the failure record cannot itself overflow the store contract.
+            # None (unknown/unmeasured) is kept — it distinguishes a null
+            # observation from a fabricated zero or from omission.
+            self.context = {key: value for key, value in context.items()
+                            if key in {'schema', 'failure_boundary', 'measurement_stage',
+                                       'measurement_unit', 'source_stream', 'limit_bytes',
+                                       'observed_bytes', 'limit_chars', 'observed_chars',
+                                       'limit_entries', 'observed_entries', 'observed_measured'}
+                            and (value is None or isinstance(value, (int, bool))
+                                 or isinstance(value, str) and len(value) <= 48)}
         super().__init__(self.message)
 
 
@@ -177,11 +227,21 @@ class JobStore:
         for key, cap in limits.items():
             value = data.get(key)
             if value is not None and (not isinstance(value, str) or len(value) > cap):
-                raise JobError("OUTPUT_LIMIT_EXCEEDED", "Stored field exceeds contract limit")
+                raise JobError("OUTPUT_LIMIT_EXCEEDED", "Stored field exceeds contract limit",
+                               context=output_limit_context(
+                                   'store_field_contract', 'store_field_contract', 'chars',
+                                   limit=cap, observed=len(value) if isinstance(value, str) else None,
+                                   measured=isinstance(value, str)))
         if data.get("artifacts") != []:
-            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Artifacts are not supported by this profile")
-        if len(json.dumps(data, ensure_ascii=False).encode()) > MAX_RECORD_BYTES:
-            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Job record exceeds size limit")
+            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Artifacts are not supported by this profile",
+                           context=output_limit_context(
+                               'store_artifacts_contract', 'store_field_contract', 'chars'))
+        record_bytes = len(json.dumps(data, ensure_ascii=False).encode())
+        if record_bytes > MAX_RECORD_BYTES:
+            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Job record exceeds size limit",
+                           context=output_limit_context(
+                               'store_record_serialize', 'record_json_utf8', 'utf8_bytes',
+                               limit=MAX_RECORD_BYTES, observed=record_bytes, measured=True))
 
     def _write(self, data):
         if data.get('status') == 'completed':

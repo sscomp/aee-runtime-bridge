@@ -15,7 +15,7 @@ import stat
 from pathlib import Path, PurePosixPath
 
 from .process import Limits
-from .store import JobError
+from .store import JobError, output_limit_context
 
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_WORKSPACE_FILES = 10000
@@ -82,8 +82,19 @@ def snapshot_workspace(source, entries, destination, *, source_modes=None):
                         raise ValueError("not a private regular source file")
                     data = stream.read(MAX_FILE_BYTES + 1)
                 total += len(data)
-                if len(data) > MAX_FILE_BYTES or total > MAX_WORKSPACE_BYTES:
-                    raise JobError("OUTPUT_LIMIT_EXCEEDED", "Workspace snapshot exceeds size limit")
+                # Two distinct pre-native boundaries: one oversized file, or a
+                # cumulative workspace total. The original error code and
+                # message are shared; only the context separates them.
+                if len(data) > MAX_FILE_BYTES:
+                    raise JobError("OUTPUT_LIMIT_EXCEEDED", "Workspace snapshot exceeds size limit",
+                                   context=output_limit_context(
+                                       'workspace_snapshot_file', 'workspace_copy', 'raw_bytes',
+                                       limit=MAX_FILE_BYTES, observed=len(data), measured=True))
+                if total > MAX_WORKSPACE_BYTES:
+                    raise JobError("OUTPUT_LIMIT_EXCEEDED", "Workspace snapshot exceeds size limit",
+                                   context=output_limit_context(
+                                       'workspace_snapshot_total', 'workspace_copy', 'raw_bytes',
+                                       limit=MAX_WORKSPACE_BYTES, observed=total, measured=True))
                 if hashlib.sha256(data).hexdigest() != digest:
                     raise JobError("ISOLATION_UNAVAILABLE", "Source differs from reviewed manifest")
                 target = destination / name

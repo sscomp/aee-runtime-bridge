@@ -168,6 +168,7 @@ def validate_success(record, *, persisted=True):
     if not isinstance(execution, dict):
         reject('RESULT_INCOMPLETE', 'Completed job lacks execution proof')
     if any(key in execution for key in ('native_tool_failure', 'failure', 'error', 'error_code',
+                                        'output_limit_diagnostics',
                                         'interrupted', 'fatal_error', 'timed_out', 'cancelled')):
         reject('INVALID_TERMINAL_STATE', 'Completed job contains execution failure metadata')
     if record.get('artifacts') != [] or type(record.get('truncated')) is not bool:
