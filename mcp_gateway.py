@@ -568,8 +568,23 @@ def run_codex_job(job_id: str, task: str, working_directory: str, *, cancel_even
         fields = {'execution': failure_execution} if isinstance(failure_execution, dict) else {}
         JOB_STORE.update(job_id, status=status, finished_at=_now_iso(), exit_code=error.exit_code,
                          error_code=error.code, error=redact(error.message), **fields)
-    except Exception:
-        log.warning("event=job_failed job_id=%s error_code=EXECUTION_FAILED", job_id)
+    except Exception as exc:
+        # D1 minimum exception instrumentation: journal-only bounded class name
+        # and sanitized errno. Never logs str(exc), repr(exc), or any payload.
+        safe_type = type(exc).__name__[:64]
+        if not (safe_type.isascii() and safe_type.isidentifier()):
+            safe_type = "Unknown"
+        try:
+            errno_value = getattr(exc, "errno", None)
+        except Exception:
+            errno_value = None  # diagnostics must not raise; keep fallback fixed
+        safe_errno = errno_value if (
+            type(errno_value) is int and 0 <= errno_value <= 65535
+        ) else "none"
+        log.warning(
+            "event=job_failed job_id=%s error_code=EXECUTION_FAILED exc_type=%s"
+            " exc_errno=%s", job_id, safe_type, safe_errno,
+        )
         JOB_STORE.update(job_id, status="failed", finished_at=_now_iso(),
                          error_code="EXECUTION_FAILED", error="Isolated executor failed")
     finally:
