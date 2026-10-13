@@ -216,6 +216,106 @@ def owner_identity():
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
 
 
+# P3 Gate B1: one side-effect-free read path for sealed job records. JobStore
+# construction deliberately has write side effects (mkdir/chmod 0700, lock
+# files, reconcile); inspection callers must never reach it. This function
+# shares the exact production record contract with JobStore._read below - no
+# duplicate parser, no mutated expectations - while performing zero filesystem
+# writes of its own.
+_JOB_ID = re.compile(r"A3JOB-[0-9]{8}-[0-9a-f]{32}")
+
+
+def _job_record_path(root, job_id):
+    if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
+        raise JobError("JOB_NOT_FOUND", "Job not found")
+    return Path(root) / (job_id + ".json")
+
+
+def read_job_record(root, job_id):
+    """Read one sealed record from ``root`` without any store side effects.
+
+    Same contract, validation order and failure taxonomy as the production
+    read boundary (JobStore._read): job-id grammar, O_NOFOLLOW regular-file
+    open, size cap, strict JSON (duplicate keys and constants rejected), the
+    full field contract, size bounds, SHA-256 integrity proof and the success
+    contract for completed records. No mkdir, no chmod, no lock files and no
+    reconcile; the record is rejected fail-closed on any contract violation.
+    """
+    root = Path(root)
+    if root.is_symlink():
+        raise JobError("JOB_STORE_CORRUPT", "Job store root cannot be a symlink")
+    try:
+        fd = os.open(_job_record_path(root, job_id),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError("not regular")
+            payload = stream.read(MAX_RECORD_BYTES + 1)
+        if len(payload) > MAX_RECORD_BYTES:
+            raise ValueError("oversized")
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('duplicate field')
+                result[key] = value
+            return result
+        def invalid_constant(value):
+            raise ValueError('invalid JSON constant')
+        data = json.loads(payload, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+        if (not isinstance(data, dict) or data.get("job_id") != job_id or
+                data.get("status") not in ACTIVE | TERMINAL or
+                data.get("agent") != "codex" or data.get("mode") != "read_only"):
+            raise ValueError("invalid contract")
+        for key in ["created_at", "updated_at", "working_directory", "task"]:
+            if not isinstance(data.get(key), str):
+                raise ValueError("invalid field")
+        for key in ["started_at", "finished_at", "summary", "log_excerpt", "error", "error_code"]:
+            if key not in data or (data[key] is not None and not isinstance(data[key], str)):
+                raise ValueError("invalid optional field")
+        if data.get("artifacts") != [] or not isinstance(data.get("truncated"), bool):
+            raise ValueError("invalid result metadata")
+        if (data.get("exit_code") is not None and type(data["exit_code"]) is not int):
+            raise ValueError("invalid exit code")
+        if data['status'] in ACTIVE and not isinstance(data.get('owner'), dict):
+            raise ValueError('legacy active owner')
+        _bounded(data)
+        verify_integrity(data)
+        if data['status'] == 'completed':
+            validate_success(data)
+        return data
+    except FileNotFoundError:
+        raise JobError("JOB_NOT_FOUND", "Job not found") from None
+    except JobError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        raise JobError("JOB_STORE_CORRUPT", "Malformed or unavailable job record") from None
+
+
+def _bounded(data):
+    """Record field/size contract shared by reads and writes (was JobStore._bounded)."""
+    limits = {"task": MAX_TASK_CHARS, "summary": MAX_SUMMARY_CHARS,
+              "log_excerpt": MAX_LOG_CHARS, "error": 500, "working_directory": 4096}
+    for key, cap in limits.items():
+        value = data.get(key)
+        if value is not None and (not isinstance(value, str) or len(value) > cap):
+            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Stored field exceeds contract limit",
+                           context=output_limit_context(
+                               'store_field_contract', 'store_field_contract', 'chars',
+                               limit=cap, observed=len(value) if isinstance(value, str) else None,
+                               measured=isinstance(value, str)))
+    if data.get("artifacts") != []:
+        raise JobError("OUTPUT_LIMIT_EXCEEDED", "Artifacts are not supported by this profile",
+                       context=output_limit_context(
+                           'store_artifacts_contract', 'store_field_contract', 'chars'))
+    record_bytes = len(json.dumps(data, ensure_ascii=False).encode())
+    if record_bytes > MAX_RECORD_BYTES:
+        raise JobError("OUTPUT_LIMIT_EXCEEDED", "Job record exceeds size limit",
+                       context=output_limit_context(
+                           'store_record_serialize', 'record_json_utf8', 'utf8_bytes',
+                           limit=MAX_RECORD_BYTES, observed=record_bytes, measured=True))
+
+
 class JobStore:
     _REGISTRY_LOCK = ".registry.lock"
 
@@ -224,7 +324,24 @@ class JobStore:
         if self._root.is_symlink():
             raise JobError("JOB_STORE_CORRUPT", "Job store cannot be a symlink")
         self._root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(self._root, 0o700)
+        # P3 Gate B1: bind the real directory with O_NOFOLLOW|O_DIRECTORY so
+        # the chmod target is pinned to the checked inode, and never silently
+        # chmod a directory owned by another identity into a private store -
+        # that unowned-side-effect was the confirmed 0750 -> 0700 readback
+        # drift root cause. Legitimate adopters (gateway StateDirectory,
+        # migration staging) own their store root, so they are unaffected.
+        try:
+            fd = os.open(self._root, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError:
+            raise JobError("JOB_STORE_CORRUPT", "Job store root is not a usable directory") from None
+        try:
+            info = os.fstat(fd)
+            if info.st_uid != os.getuid():
+                raise JobError("JOB_STORE_BOUNDARY",
+                               "Job store directory is owned by another identity; refusing implicit chmod")
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
         self._redact = redact
         self._lock = threading.RLock()
         self._leases = {}
@@ -286,78 +403,10 @@ class JobStore:
         return fd
 
     def _job_path(self, job_id):
-        if not isinstance(job_id, str) or not re.fullmatch(r"A3JOB-[0-9]{8}-[0-9a-f]{32}", job_id):
-            raise JobError("JOB_NOT_FOUND", "Job not found")
-        return self._root / (job_id + ".json")
+        return _job_record_path(self._root, job_id)
 
     def _read(self, job_id):
-        try:
-            fd = os.open(self._job_path(job_id), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
-            with os.fdopen(fd, "rb") as stream:
-                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                    raise ValueError("not regular")
-                payload = stream.read(MAX_RECORD_BYTES + 1)
-            if len(payload) > MAX_RECORD_BYTES:
-                raise ValueError("oversized")
-            def unique_object(pairs):
-                result = {}
-                for key, value in pairs:
-                    if key in result:
-                        raise ValueError('duplicate field')
-                    result[key] = value
-                return result
-            def invalid_constant(value):
-                raise ValueError('invalid JSON constant')
-            data = json.loads(payload, object_pairs_hook=unique_object, parse_constant=invalid_constant)
-            if (not isinstance(data, dict) or data.get("job_id") != job_id or
-                    data.get("status") not in ACTIVE | TERMINAL or
-                    data.get("agent") != "codex" or data.get("mode") != "read_only"):
-                raise ValueError("invalid contract")
-            for key in ["created_at", "updated_at", "working_directory", "task"]:
-                if not isinstance(data.get(key), str):
-                    raise ValueError("invalid field")
-            for key in ["started_at", "finished_at", "summary", "log_excerpt", "error", "error_code"]:
-                if key not in data or (data[key] is not None and not isinstance(data[key], str)):
-                    raise ValueError("invalid optional field")
-            if data.get("artifacts") != [] or not isinstance(data.get("truncated"), bool):
-                raise ValueError("invalid result metadata")
-            if (data.get("exit_code") is not None and type(data["exit_code"]) is not int):
-                raise ValueError("invalid exit code")
-            if data['status'] in ACTIVE and not isinstance(data.get('owner'), dict):
-                raise ValueError('legacy active owner')
-            self._bounded(data)
-            verify_integrity(data)
-            if data['status'] == 'completed':
-                validate_success(data)
-            return data
-        except FileNotFoundError:
-            raise JobError("JOB_NOT_FOUND", "Job not found") from None
-        except JobError:
-            raise
-        except (OSError, ValueError, TypeError, KeyError, RecursionError):
-            raise JobError("JOB_STORE_CORRUPT", "Malformed or unavailable job record") from None
-
-    def _bounded(self, data):
-        limits = {"task": MAX_TASK_CHARS, "summary": MAX_SUMMARY_CHARS,
-                  "log_excerpt": MAX_LOG_CHARS, "error": 500, "working_directory": 4096}
-        for key, cap in limits.items():
-            value = data.get(key)
-            if value is not None and (not isinstance(value, str) or len(value) > cap):
-                raise JobError("OUTPUT_LIMIT_EXCEEDED", "Stored field exceeds contract limit",
-                               context=output_limit_context(
-                                   'store_field_contract', 'store_field_contract', 'chars',
-                                   limit=cap, observed=len(value) if isinstance(value, str) else None,
-                                   measured=isinstance(value, str)))
-        if data.get("artifacts") != []:
-            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Artifacts are not supported by this profile",
-                           context=output_limit_context(
-                               'store_artifacts_contract', 'store_field_contract', 'chars'))
-        record_bytes = len(json.dumps(data, ensure_ascii=False).encode())
-        if record_bytes > MAX_RECORD_BYTES:
-            raise JobError("OUTPUT_LIMIT_EXCEEDED", "Job record exceeds size limit",
-                           context=output_limit_context(
-                               'store_record_serialize', 'record_json_utf8', 'utf8_bytes',
-                               limit=MAX_RECORD_BYTES, observed=record_bytes, measured=True))
+        return read_job_record(self._root, job_id)
 
     def _write(self, data, _reduction_tier=0, _first_overflow=None, _original_keys=None):
         """Atomic durable write of one record.
@@ -378,7 +427,7 @@ class JobStore:
             validate_success(data, persisted=False)
         try:
             seal_record(data)
-            self._bounded(data)
+            _bounded(data)
         except JobError as error:
             context = error.context if isinstance(error.context, dict) else {}
             first_overflow = _first_overflow

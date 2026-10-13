@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 from .packaging import safe_output
-from .store import JobStore, JobError, now, ACTIVE, TERMINAL
+from .store import JobStore, JobError, read_job_record, now, ACTIVE, TERMINAL
 from .result_contract import seal_record
 
 ID = re.compile(r'A3JOB-[0-9]{8}-[a-f0-9]{32}')
@@ -58,9 +58,9 @@ def inspect_records(source):
         except (ValueError,UnicodeError):
             raise JobError('MIGRATION_INVALID','Invalid source record') from None
         # Validate original content before any trusted state transformation.
-        reader = object.__new__(JobStore)
-        reader._root = source
-        reader._read(p.stem)
+        # P3 Gate B1: the formal side-effect-free read API (was an untyped
+        # object.__new__(JobStore) stand-in for the same read boundary).
+        read_job_record(source, p.stem)
         records[p.name]=payload
     return records
 
