@@ -94,12 +94,15 @@ class StreamCaptureDiagnostics(unittest.TestCase):
         self.assertEqual(context["observed_bytes"], 1025)
 
     def test_context_never_carries_payload_or_secret_text(self):
-        token = "sk-synthetic-credential-token-raw"
+        # Synthetic fixture (WO-B-R1 R-a): placeholder-prefixed token, no real
+        # credential; the "sk-" prefix was dropped so the secret scanner's
+        # documented placeholder exemption applies instead of openai_key.
+        token = "synthetic-credential-token-raw"
         with self.assertRaises(JobError) as error:
             self.run_child("import sys;sys.stdout.write('%s') ; sys.stdout.flush()" % (token * 200),
                            Limits(timeout=10, stdout_bytes=1024, stderr_bytes=1024))
         raw = json.dumps(error.exception.context)
-        self.assertNotIn("sk-synthetic", raw)
+        self.assertNotIn("synthetic-credential", raw)
         self.assertNotIn(token, raw)
 
 
