@@ -105,6 +105,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        # Full history for the historical-reader compat test, which reads
+        # base 370c024 modules via `git show 370c024:<path>` (E-1, run 38927256173).
+        with:
+          fetch-depth: 0
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
