@@ -181,6 +181,24 @@ def validate_success(record, *, persisted=True):
             raise ValueError()
     except (KeyError, TypeError, ValueError):
         reject('RESULT_INCOMPLETE', 'Completed job lacks consistent lifecycle timestamps')
+    proof = execution.get('adapter_proof')
+    if proof is not None:
+        # Multi-agent recovery: jobs run by the generic adapter contract
+        # (mcp_runtime/job_adapters) prove completion with adapter-shaped,
+        # bounds-checked fields instead of the codex native receipt.
+        if not isinstance(proof, dict) or proof.get('adapter') != record.get('agent'):
+            reject('TOOL_EVIDENCE_INCOMPLETE', 'Completed job lacks consistent adapter proof')
+        if any(k in proof for k in ('failure', 'error', 'error_code', 'interrupted',
+                                    'fatal_error', 'timed_out', 'cancelled')):
+            reject('INVALID_TERMINAL_STATE', 'Completed final turn contains failure metadata')
+        if (type(proof.get('exit_code')) is not int or proof['exit_code'] != record['exit_code']
+                or proof.get('turn_completed') is not True
+                or proof.get('read_only_enforcement') in {'UNSUPPORTED', None, ''}):
+            reject('INVALID_TERMINAL_STATE', 'Completed job lacks a consistent successful final turn')
+        if not isinstance(proof.get('working_directory'), str) \
+                or proof['working_directory'] != record.get('working_directory'):
+            reject('INVALID_TERMINAL_STATE', 'Completed adapter proof contradicts the job workdir')
+        return True
     outcome = execution.get('result_contract')
     if (not isinstance(outcome, dict) or outcome.get('version') != SUCCESS_VERSION
             or type(outcome.get('process_exit_code')) is not int or outcome['process_exit_code'] != record['exit_code']

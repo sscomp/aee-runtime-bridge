@@ -51,7 +51,8 @@ class BootstrapBaseline(unittest.TestCase):
     def test_local_tool_surface_and_dispatch_schema(self):
         tools = {t.name: t for t in self.gateway.mcp._tool_manager.list_tools()}
         self.assertEqual(set(tools), {"aee_status", "aee_agents", "aee_exec",
-                                     "aee_dispatch", "aee_job_status", "aee_job_result"})
+                                      "aee_dispatch", "aee_job_cancel",
+                                      "aee_job_status", "aee_job_result"})
         self.assertEqual(set(tools["aee_dispatch"].parameters["required"]),
                          {"agent", "working_directory"})
 
@@ -60,16 +61,25 @@ class BootstrapBaseline(unittest.TestCase):
         name = "aee_p2a_restricted_gateway"
         with patch.dict(os.environ, {"A3_JOB_STORE_DIR": self.temp.name,
                                     "AEE_MCP_SURFACE": "restricted",
-                                    "AEE_MCP_EXPOSED_TOOLS": "aee_status,aee_agents,aee_dispatch,aee_job_status,aee_job_result"}):
+                                    "AEE_MCP_EXPOSED_TOOLS": "aee_status,aee_agents,aee_dispatch,aee_job_cancel,aee_job_status,aee_job_result"}):
             gateway = load_module(name, ROOT / "mcp_gateway.py")
         self.addCleanup(sys.modules.pop, name, None)
         gateway._apply_tool_exposure_filter()
         self.assertEqual({t.name for t in gateway.mcp._tool_manager.list_tools()},
-                         {"aee_status", "aee_agents", "aee_dispatch", "aee_job_status", "aee_job_result"})
+                         {"aee_status", "aee_agents", "aee_dispatch", "aee_job_cancel",
+                          "aee_job_status", "aee_job_result"})
 
     def test_invalid_agents_and_modes_never_launch(self):
-        with patch.object(self.gateway, "_start_job_worker") as worker:
-            for agent in ["hermes", "claude", "nmap"]:
+        # Multi-agent recovery: claude/pi/hermes are now admitted adapters
+        # (they fail later at dispatch on absent binary or unsupported
+        # enforcement); only unknown agent names and bad modes are rejected
+        # at admission. Adapter binaries are forced to absent paths so a
+        # host that happens to have them installed cannot mask the test.
+        with patch.object(self.gateway, "_start_job_worker") as worker, \
+                patch.dict(os.environ, {k: "/synthetic/absent" for k in
+                                        ("A3_ADAPTER_CLAUDE_BIN", "A3_ADAPTER_PI_BIN",
+                                         "A3_ADAPTER_HERMES_BIN")}):
+            for agent in ["nmap"]:
                 with self.assertRaises(self.gateway._JobError) as error:
                     self.gateway.dispatch_job(agent, "x", str(ROOT), "read_only")
                 self.assertEqual(error.exception.code, "INVALID_AGENT")

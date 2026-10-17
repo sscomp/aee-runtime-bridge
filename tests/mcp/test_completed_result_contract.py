@@ -201,7 +201,7 @@ class CompletedResultContract(unittest.TestCase):
         namespace = {'JOB_STORE': store, '_JobError': JobError, 'Dict': dict, 'Any': object,
             'time': time, 'datetime': datetime, 'timezone': timezone, 'log': logging.getLogger('fixture-worker'),
             'os': SimpleNamespace(getenv=lambda k: str(root / 'fixture-control')),
-            '_dispatch_pool': {}, 'select_profile': select_profile, 'ExecutorIdentity': ExecutorIdentity,
+            '_dispatch_pool': {}, '_cancel_events': {}, 'select_profile': select_profile, 'ExecutorIdentity': ExecutorIdentity,
             'resolve_codex': lambda p: identity, 'A3_CODEX_BIN': str(binary), 'execute_codex': execute_codex,
             'A3_LIMITS': Limits(), 'A3_WORKSPACE_MANIFEST': str(manifest), 'redact': lambda s: s,
             'deployment_policy': lambda: {'fixture': True}, 'require_deployment_ready': lambda p: None,

@@ -54,7 +54,7 @@ try:
 except Exception:
     AEE_PRODUCT_VERSION = "unknown"
 
-RESTRICTED_TOOLS = frozenset({"aee_status", "aee_agents", "aee_dispatch",
+RESTRICTED_TOOLS = frozenset({"aee_status", "aee_agents", "aee_dispatch", "aee_job_cancel",
                               "aee_job_status", "aee_job_result"})
 AEE_MCP_SURFACE = os.getenv("AEE_MCP_SURFACE", "restricted" if AEE_MCP_PORT == 8791 else "local")
 if AEE_MCP_SURFACE not in {"local", "restricted"}:
@@ -104,8 +104,10 @@ A3_CODEX_MAX_SUMMARY = int(os.getenv("A3_CODEX_MAX_SUMMARY", "4000"))    # chars
 A3_CODEX_MAX_LOG = int(os.getenv("A3_CODEX_MAX_LOG", "2000"))           # chars
 A3_CODEX_MAX_OUTPUT_FILE = int(os.getenv("A3_CODEX_MAX_OUTPUT_FILE", "65536"))
 
-# Bootstrap job contract: read-only Codex only.
-A3_ALLOWED_AGENTS = {"codex"}
+# Bootstrap job contract: read_only only; agents come from the generic
+# adapter registry (multi-agent recovery work order: codex is an adapter,
+# not the mandatory sole backend).
+from aee.mcp_runtime.store import AGENT_NAMES as A3_ALLOWED_AGENTS, ACTIVE as ACTIVE_STATES
 A3_ALLOWED_MODES = {"read_only"}
 
 # ---------------------------------------------------------------------------
@@ -280,6 +282,10 @@ _AGENT_COMMANDS: Dict[str, List[str]] = {
         "claude",
         str(Path.home() / ".local/bin/claude"),
     ],
+    "pi": [
+        "pi",
+        str(Path.home() / ".local/bin/pi"),
+    ],
 }
 
 
@@ -340,7 +346,21 @@ def discover_agent(name: str) -> Dict[str, Any]:
 
 
 def discover_agents() -> List[Dict[str, Any]]:
-    return [discover_agent(n) for n in ("hermes", "codex", "claude")]
+    """Read-only discovery for the aee_agents surface (multi-agent recovery).
+
+    Every adapter-registry agent is listed — installed binaries with
+    path/version, absent ones with installed=False — plus the adapter's
+    declared read_only enforcement semantics, so a caller can see WHY an
+    agent cannot be dispatched (ADAPTER_UNSUPPORTED shows openly).
+    """
+    agents = [discover_agent(n) for n in ("hermes", "codex", "claude", "pi")]
+    for entry in agents:
+        spec = adapter_specs().get(entry.get("agent"))
+        if spec is not None:
+            entry["read_only_enforcement"] = spec.read_only_enforcement
+            entry["enforcement_note"] = spec.enforcement_note
+            entry["dispatchable"] = spec.read_only_enforcement != "UNSUPPORTED"
+    return agents
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +516,11 @@ from aee.mcp_runtime.process import Limits
 from aee.mcp_runtime.profiles import (
     ExecutorIdentity, execution_metadata, select_profile,
 )
-from aee.mcp_runtime.runtime import resolve_executor as resolve_codex, deployment_policy, require_deployment_ready
+from aee.mcp_runtime.runtime import resolve_executor as resolve_codex, deployment_policy, require_deployment_ready, deployment_gate_approved
+from aee.mcp_runtime.job_adapters import (
+    adapter_execution_metadata, adapter_identity, adapter_specs, refuse_unsupported,
+    resolve_adapter, execute_adapter_job,
+)
 from aee.mcp_runtime.broker_client import control as broker_control
 from aee.mcp_runtime.sandbox import read_manifest
 
@@ -595,16 +619,86 @@ def run_codex_job(job_id: str, task: str, working_directory: str, *, cancel_even
                 log.error("event=broker_revoke_failed job_id=%s", job_id)
         JOB_STORE.release(job_id)
         _dispatch_pool.pop(job_id, None)
+        _cancel_events.pop(job_id, None)
+
+
+def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_event=None) -> None:
+    """Execute one adapter-routed job (multi-agent recovery contract).
+
+    Same worker lifecycle as run_codex_job — persist running, bounded
+    execution, terminal update with adapter proof, redacted bounded
+    failure mapping — but the executor comes from the job_adapters
+    registry instead of the approved codex/broker contract.
+    """
+    worker_started = time.monotonic()
+    execution = None
+    try:
+        record = JOB_STORE.get(job_id)
+        execution = record.get("execution")
+        if not isinstance(execution, dict) or not isinstance(execution.get("adapter"), dict):
+            raise _JobError("EXECUTION_FAILED", "Job record lacks adapter execution proof")
+        agent_name = execution["adapter"].get("adapter") or record.get("agent")
+        spec, executable = resolve_adapter(agent_name)
+        if spec.read_only_enforcement == "UNSUPPORTED":
+            raise _JobError("ADAPTER_UNSUPPORTED",
+                            f"agent '{spec.name}' cannot enforce read_only on this host")
+        JOB_STORE.update(job_id, status="running", started_at=_now_iso(), execution=execution)
+        log.info("event=job_started job_id=%s adapter=%s", job_id, spec.name)
+        outcome = execute_adapter_job(spec, executable, execution, task, working_directory,
+                                      limits=A3_LIMITS, cancel_event=cancel_event)
+        execution["adapter_proof"] = {
+            "adapter": spec.name,
+            "read_only_enforcement": spec.read_only_enforcement,
+            "enforcement_note": spec.enforcement_note,
+            "exit_code": outcome["exit_code"],
+            "turn_completed": True,
+            "working_directory": working_directory,
+            "observed": {"version": execution["adapter"].get("version"),
+                         "executable_sha256": execution["adapter"].get("executable_sha256")},
+        }
+        JOB_STORE.update(job_id, status="completed", finished_at=_now_iso(),
+                         exit_code=outcome["exit_code"], summary=outcome["summary"],
+                         log_excerpt=outcome["log_excerpt"], artifacts=[],
+                         truncated=False, execution=execution)
+        log.info("event=job_completed job_id=%s duration_ms=%d", job_id,
+                 int((time.monotonic() - worker_started) * 1000))
+    except _JobError as error:
+        log.warning("event=job_failed job_id=%s error_code=%s duration_ms=%d", job_id, error.code,
+                    int((time.monotonic() - worker_started) * 1000))
+        status = {'EXECUTION_TIMEOUT': 'timed_out', 'EXECUTION_CANCELLED': 'cancelled'}.get(error.code, 'failed')
+        fields = {'execution': execution} if isinstance(execution, dict) else {}
+        JOB_STORE.update(job_id, status=status, finished_at=_now_iso(), exit_code=error.exit_code,
+                         error_code=error.code, error=redact(error.message), **fields)
+    except Exception as exc:
+        safe_type = type(exc).__name__[:64]
+        if not (safe_type.isascii() and safe_type.isidentifier()):
+            safe_type = "Unknown"
+        log.warning(
+            "event=job_failed job_id=%s error_code=EXECUTION_FAILED exc_type=%s",
+            job_id, safe_type,
+        )
+        JOB_STORE.update(job_id, status="failed", finished_at=_now_iso(),
+                         error_code="EXECUTION_FAILED", error="Isolated executor failed")
+    finally:
+        JOB_STORE.release(job_id)
+        _dispatch_pool.pop(job_id, None)
+        _cancel_events.pop(job_id, None)
 
 
 _dispatch_pool: Dict[str, threading.Thread] = {}
+_cancel_events: Dict[str, threading.Event] = {}
 
 
-def _start_job_worker(job_id: str, task: str, working_directory: str) -> None:
+def _start_job_worker(job_id: str, task: str, working_directory: str, *,
+                      production_codex: bool = False) -> None:
     """Spawn the executor thread; single-flight by design (bootstrap)."""
+    target = run_codex_job if production_codex else run_agent_job
+    cancel_event = threading.Event()
+    _cancel_events[job_id] = cancel_event
     t = threading.Thread(
-        target=run_codex_job,
+        target=target,
         args=(job_id, task, working_directory),
+        kwargs={"cancel_event": cancel_event},
         name=f"aee-job-{job_id}",
         daemon=True,
     )
@@ -621,14 +715,23 @@ def dispatch_job(
     execution_profile: Optional[str] = None, model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """A3 dispatch entrypoint — validate, persist, spawn, return immediately."""
+    """A3 dispatch entrypoint — validate, persist, spawn, return immediately.
+
+    Routing: when the deployment manifest is present AND approved, a codex
+    job keeps the production broker-mandated contract (unchanged). Every
+    other admitted agent — or codex when Stage-2 approval is absent — runs
+    through the generic adapter registry with per-adapter read-only
+    semantics. Authentication and working-directory/mode validation are
+    unchanged on every branch.
+    """
     agent_clean = (agent or "").strip().lower()
     if agent_clean not in A3_ALLOWED_AGENTS:
         raise _JobError(
             "INVALID_AGENT",
-            f"agent '{redact(agent_clean[:60])}' is not supported in the A3 "
-            "bootstrap contract; expected 'codex'",
+            f"agent '{redact(agent_clean[:60])}' is not supported; "
+            "supported agents: " + ", ".join(sorted(A3_ALLOWED_AGENTS)),
         )
+    refuse_unsupported(agent_clean)
     mode_clean = (mode or "").strip().lower()
     if mode_clean not in A3_ALLOWED_MODES:
         raise _JobError(
@@ -639,18 +742,33 @@ def dispatch_job(
     if not task or not task.strip():
         raise _JobError("INVALID_TASK", "task must not be empty")
     workdir = _validate_working_directory(working_directory)
-    profile = select_profile(A3_EXECUTION_PROFILE if execution_profile is None else execution_profile,
-                             model, reasoning_effort)
-    read_manifest(A3_WORKSPACE_MANIFEST)
     policy = deployment_policy()
-    if policy:
-        require_deployment_ready(policy)
-    identity = resolve_codex(A3_CODEX_BIN)
-    execution = execution_metadata(profile, identity, requested_profile=execution_profile,
-                                   requested_model=model, requested_reasoning=reasoning_effort)
+    if agent_clean == "codex":
+        # Codex keeps its legacy contract in full: production manifests
+        # re-verify the review gate BEFORE admission (fail-closed), and a
+        # policy-absent host runs the isolated bootstrap contract.
+        production_codex = True
+        profile = select_profile(A3_EXECUTION_PROFILE if execution_profile is None else execution_profile,
+                                 model, reasoning_effort)
+        read_manifest(A3_WORKSPACE_MANIFEST)
+        if policy:
+            require_deployment_ready(policy)
+        identity = resolve_codex(A3_CODEX_BIN)
+        execution = execution_metadata(profile, identity, requested_profile=execution_profile,
+                                       requested_model=model, requested_reasoning=reasoning_effort)
+    else:
+        production_codex = False
+        refuse_unsupported(agent_clean)
+        if execution_profile is not None or model is not None or reasoning_effort is not None:
+            raise _JobError("INVALID_PROFILE",
+                            "execution_profile/model/reasoning_effort selectors apply only to the "
+                            "codex production contract")
+        # Adapter admissions resolve the installed binary now so an absent
+        # CLI fails before admission instead of inside the worker.
+        execution = adapter_execution_metadata(agent_clean)
     data = JOB_STORE.create(agent_clean, task, workdir, mode_clean, execution=execution)
     try:
-        _start_job_worker(data["job_id"], task, workdir)
+        _start_job_worker(data["job_id"], task, workdir, production_codex=production_codex)
     except Exception:
         JOB_STORE.update(data["job_id"], status="failed", finished_at=_now_iso(),
                          error_code="EXECUTION_FAILED", error="Worker could not start")
@@ -808,14 +926,15 @@ async def aee_dispatch(
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
 ) -> str:
-    """Dispatch a controlled, read-only job to the Codex agent on this node.
+    """Dispatch a controlled, read-only job to an installed agent adapter.
 
-    Bootstrap contract (A3): agent must be 'codex' and mode must be
-    'read_only'; every other agent or mode is rejected. working_directory
-    must be an existing directory under the dispatch allowlist. Execution
-    reads a reviewed source snapshot; host source files cannot be modified.
-    Model/reasoning selectors must match the named execution profile.
-    Returns immediately with a job_id; poll aee_job_status / aee_job_result.
+    Multi-agent recovery contract: agent is one of the registered
+    adapters (codex/claude/pi/hermes; pi/hermes only when installed and
+    read-only enforcement is supported) and mode must be 'read_only'.
+    working_directory must be an existing directory under the dispatch
+    allowlist. Approved codex jobs keep the production broker contract;
+    every other agent runs via a per-adapter read-only sandbox. Returns
+    immediately with a job_id; poll aee_job_status / aee_job_result.
     """
     # Back-compat: A1 callers passed `prompt` + optional `metadata`.
     task = task or prompt or ""
@@ -917,6 +1036,40 @@ async def aee_job_result(job_id: str) -> str:
     )
 
 
+@mcp.tool()
+async def aee_job_cancel(job_id: str) -> str:
+    """Request cancellation of an active dispatched AEE job.
+
+    Cooperative-cancel: the worker thread observes the cancel flag inside
+    its bounded run loop, raises EXECUTION_CANCELLED, and the executor's
+    whole process group is killed by the sandbox teardown. Terminal state
+    (cancelled) is persisted by the worker; poll aee_job_status.
+    """
+    try:
+        data = await asyncio.to_thread(JOB_STORE.get, job_id)
+    except _JobError as exc:
+        return json.dumps(job_error_payload(exc), ensure_ascii=False)
+    if data["status"] not in ACTIVE_STATES:
+        return json.dumps({
+            "ok": False,
+            "job_id": job_id,
+            "error_code": "JOB_NOT_ACTIVE",
+            "error": f"job is {data['status']}; cancel is only valid while queued/running",
+        }, ensure_ascii=False)
+    event = _cancel_events.get(job_id)
+    if event is None:
+        # Worker already finished or release raced the store read.
+        return json.dumps({
+            "ok": False,
+            "job_id": job_id,
+            "error_code": "JOB_NOT_ACTIVE",
+            "error": "job is no longer owned by a running worker",
+        }, ensure_ascii=False)
+    event.set()
+    return json.dumps({"ok": True, "job_id": job_id, "status": data["status"],
+                       "cancel": "requested"}, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Bearer auth middleware (Starlette-level, applied to the MCP ASGI app)
 # ---------------------------------------------------------------------------
@@ -1005,14 +1158,43 @@ def _apply_tool_exposure_filter() -> None:
     manager._aee_surface_guard = True
 
 
+def startup_gate_mode(policy) -> str:
+    """Startup/deployment policy decision for the gateway process.
+
+    Returns ``APPROVED`` when the manifest passed the reviewed gate (the
+    production codex/broker contract is then also required on startup),
+    ``OPEN_GENERIC`` when a well-formed manifest exists but Stage-2 is
+    not approved (gateway starts; generic adapter dispatch remains under
+    auth + per-job safety), and raises for a structurally invalid
+    manifest (deployment_policy already fail-closes those).
+    """
+    if policy is None:
+        return "OPEN_GENERIC"  # policy-absent isolated/bootstrap mode
+    return "APPROVED" if deployment_gate_approved(policy) else "OPEN_GENERIC"
+
+
 def main() -> None:
+    # Multi-agent recovery: basic gateway startup and generic adapter
+    # dispatch are no longer gated on Stage-2 deployment certification.
+    # ONLY the approved production codex/broker contract checks the gate;
+    # auth and per-job safety are enforced on every branch. An INVALID
+    # manifest (unparseable/structurally rejected) remains fail-closed:
+    # the host policy cannot be trusted for dispatch.
     policy = deployment_policy()
-    if policy:
+    mode = startup_gate_mode(policy)
+    if mode == "APPROVED":
         require_deployment_ready(policy)
         resolve_codex(A3_CODEX_BIN)
         read_manifest(A3_WORKSPACE_MANIFEST)
         if not os.getenv("AEE_BROKER_CONTROL") or AEE_MCP_HOST != "127.0.0.1":
             raise _JobError("RUNTIME_POLICY_INVALID", "Production broker and loopback binding are required")
+    elif mode != "OPEN_GENERIC":
+        raise _JobError("RUNTIME_POLICY_INVALID", "Deployment policy mode is invalid")
+    else:
+        log.warning(
+            "event=startup_deployment_gate_open "
+            "mode=generic-adapter-dispatch note=stage2-not-approved; "
+            "auth and per-job safety remain enforced")
     if AEE_MCP_REQUIRE_AUTH and not AEE_MCP_API_KEY:
         print(
             "FATAL: MCP_BRIDGE_API_KEY is not configured; refusing to start "

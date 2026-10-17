@@ -15,6 +15,8 @@ import httpx
 
 ROOT = Path(__file__).resolve().parents[2]
 FIVE = {"aee_status", "aee_agents", "aee_dispatch", "aee_job_status", "aee_job_result"}
+# Multi-agent recovery: the restricted surface gained aee_job_cancel (six-tool contract).
+SIX = FIVE | {"aee_job_cancel"}
 
 
 class HardenedProtocol(unittest.TestCase):
@@ -92,7 +94,7 @@ class HardenedProtocol(unittest.TestCase):
         async def checks(rpc):
             status, body = await rpc("tools/list")
             self.assertEqual(status, 200)
-            self.assertEqual({tool["name"] for tool in body["result"]["tools"]}, FIVE)
+            self.assertEqual({tool["name"] for tool in body["result"]["tools"]}, SIX)
             for tool in ["aee_exec", "aee_future_full_tool"]:
                 _, body = await rpc("tools/call", {"name": tool, "arguments": {}})
                 self.assertTrue(body["result"]["isError"])
@@ -117,8 +119,8 @@ class HardenedProtocol(unittest.TestCase):
             return "local fixture"
 
         local._apply_tool_exposure_filter()
-        self.assertEqual({t.name for t in local.mcp._tool_manager.list_tools()}, FIVE | {"aee_exec", "aee_future_full_tool"})
-        self.assertEqual({t.name for t in self.gateway.mcp._tool_manager.list_tools()}, FIVE)
+        self.assertEqual({t.name for t in local.mcp._tool_manager.list_tools()}, SIX | {"aee_exec", "aee_future_full_tool"})
+        self.assertEqual({t.name for t in self.gateway.mcp._tool_manager.list_tools()}, SIX)
 
     def test_auth_invalid_job_and_profile_errors_structured(self):
         async def checks(rpc):
@@ -128,7 +130,9 @@ class HardenedProtocol(unittest.TestCase):
             for tool in ["aee_job_status", "aee_job_result"]:
                 _, body = await rpc("tools/call", {"name": tool, "arguments": {"job_id": "../fixture"}})
                 self.assertEqual(self.payload(body)["error_code"], "JOB_NOT_FOUND")
-            for extra, code in [({"agent": "hermes"}, "INVALID_AGENT"),
+            # Multi-agent recovery: hermes is a registered adapter that cannot
+            # enforce read_only here, so admission refuses with ADAPTER_UNSUPPORTED.
+            for extra, code in [({"agent": "hermes"}, "ADAPTER_UNSUPPORTED"),
                                 ({"mode": "read_write"}, "INVALID_MODE"),
                                 ({"model": "other-model"}, "INVALID_EXECUTION_PROFILE"),
                                 ({"reasoning_effort": "--help"}, "INVALID_EXECUTION_PROFILE"),

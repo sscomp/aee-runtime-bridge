@@ -30,6 +30,12 @@ MAX_TASK_CHARS = 8000
 MAX_SUMMARY_CHARS = 4000
 MAX_LOG_CHARS = 2000
 
+# Single source of truth for admitted executor agents: the P2C gateway
+# dispatch path and aee.mcp_runtime.job_adapters both consult this set.
+# Multi-agent recovery work order: executors are adapters (codex, claude,
+# pi, hermes); none is the mandatory sole backend.
+AGENT_NAMES = frozenset({"codex", "claude", "pi", "hermes"})
+
 # K02-R1: an oversized terminal-failed record used to abort at the store-record
 # boundary; lease release + reconciliation then rewrote it failed/
 # EXECUTION_INTERRUPTED, losing failure attribution. The store-side reducer
@@ -265,7 +271,7 @@ def read_job_record(root, job_id):
         data = json.loads(payload, object_pairs_hook=unique_object, parse_constant=invalid_constant)
         if (not isinstance(data, dict) or data.get("job_id") != job_id or
                 data.get("status") not in ACTIVE | TERMINAL or
-                data.get("agent") != "codex" or data.get("mode") != "read_only"):
+                data.get("agent") not in AGENT_NAMES or data.get("mode") != "read_only"):
             raise ValueError("invalid contract")
         for key in ["created_at", "updated_at", "working_directory", "task"]:
             if not isinstance(data.get(key), str):
@@ -555,8 +561,9 @@ class JobStore:
         return f"A3JOB-{datetime.now(timezone.utc):%Y%m%d}-{secrets.token_hex(16)}"
 
     def create(self, agent, task, working_directory, mode, execution=None):
-        if agent != "codex" or mode != "read_only":
-            raise JobError("INVALID_AGENT" if agent != "codex" else "INVALID_MODE", "Unsupported executor contract")
+        if agent not in AGENT_NAMES or mode != "read_only":
+            raise JobError("INVALID_AGENT" if agent not in AGENT_NAMES else "INVALID_MODE",
+                           "Unsupported executor contract")
         if not isinstance(task, str) or not task.strip() or len(task) > MAX_TASK_CHARS:
             raise JobError("INVALID_TASK", "Task must be nonempty and at most 8000 characters")
         try:
@@ -566,7 +573,7 @@ class JobStore:
         with self._guard():
             fd = self._try_lease()
             if fd is None:
-                raise JobError("BUSY", "One Codex job is already active")
+                raise JobError("BUSY", "One job is already active")
             try:
                 self._reconcile_unleased()
                 stamp = now()
