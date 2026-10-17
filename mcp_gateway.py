@@ -84,18 +84,9 @@ A3_JOB_STORE_DIR = Path(os.getenv(
 # ONLY (work order A3 §Working Directory Security). Comma-separated roots.
 A3_DISPATCH_ALLOWED_ROOTS: List[str] = [
     p.strip()
-    for p in os.getenv(
-        "A3_DISPATCH_ALLOWED_ROOTS", str(Path(__file__).resolve().parent)
-    ).split(",")
+    for p in os.getenv("A3_DISPATCH_ALLOWED_ROOTS", "").split(",")
     if p.strip()
 ]
-
-# Directories that are NEVER valid as (or inside) a working directory,
-# even if they live under an allowed root.
-A3_DISPATCH_FORBIDDEN_PATH_RE = re.compile(
-    r"(?i)(/\.git(/|$)|/\.ssh(/|$)|/\.hermes(/|$)|/\.aws(/|$)|/\.gnupg(/|$)"
-    r"|/\.cache/claude|/\.codex/sessions|/\.config/chromium|credential)"
-)
 
 # Codex job hard limits.
 A3_CODEX_BIN = os.getenv("A3_CODEX_BIN", "codex")
@@ -454,11 +445,17 @@ from aee.mcp_runtime.store import JobError as _JobError, JobStore as _Persistent
 
 
 def _validate_working_directory(working_directory: str) -> str:
-    """Resolve + validate a dispatch working_directory (A3 security gate).
+    """Resolve + validate a dispatch working_directory (OS-identity model).
 
-    MUST be an existing directory, under an A3_DISPATCH_ALLOWED_ROOTS root,
-    not inside a forbidden (.git/.ssh/credential...) path, checked on the
-    REAL resolved path (symlinks resolved, traversal collapsed).
+    Per the operator's A2 recovery permission model: the working directory
+    is a job parameter, not an authorization boundary. The executor runs
+    under the gateway process's own OS user (no sudo/setuid/escalation),
+    so access is decided by that identity's actual OS permissions. Basic
+    filesystem validation only: the path must exist, be a directory,
+    resolve symlinks normally, and be enterable/readable as the executor
+    user. An optional deployment-level confinement still applies when the
+    operator configures A3_DISPATCH_ALLOWED_ROOTS; by default no path
+    roots are imposed. No privilege path is ever created for the job.
     Returns the resolved absolute path or raises _JobError.
     """
     raw = (working_directory or "").strip()
@@ -476,22 +473,22 @@ def _validate_working_directory(working_directory: str) -> str:
             "working_directory is not an existing directory",
         )
     resolved_s = str(resolved)
-    if A3_DISPATCH_FORBIDDEN_PATH_RE.search(resolved_s):
+    if A3_DISPATCH_ALLOWED_ROOTS:
+        for root in A3_DISPATCH_ALLOWED_ROOTS:
+            try:
+                resolved.relative_to(Path(root).resolve())
+                break
+            except ValueError:
+                continue
+        else:
+            raise _JobError(
+                "INVALID_WORKING_DIRECTORY",
+                "working_directory is outside the configured dispatch allowlist",
+            )
+    if not (os.access(resolved, os.R_OK) and os.access(resolved, os.X_OK)):
         raise _JobError(
             "INVALID_WORKING_DIRECTORY",
-            "working_directory resolves into a forbidden path "
-            "(.git/.ssh/credential/config area)",
-        )
-    for root in A3_DISPATCH_ALLOWED_ROOTS:
-        try:
-            resolved.relative_to(Path(root).resolve())
-            break
-        except ValueError:
-            continue
-    else:
-        raise _JobError(
-            "INVALID_WORKING_DIRECTORY",
-            "working_directory is outside the dispatch allowlist",
+            "working_directory is not enterable/readable as the executor OS user",
         )
     return resolved_s
 

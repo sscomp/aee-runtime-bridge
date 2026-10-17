@@ -8,6 +8,7 @@ Stage-2 startup decoupling. No real agent CLI is executed.
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -78,7 +79,11 @@ class AdapterContract(unittest.TestCase):
         self.stubs = Path(self.temp.name) / "stubs"
         self.stubs.mkdir()
         self.gateway.JOB_STORE = self.gateway.JobStore(Path(self.temp.name) / "jobs")
-        roots = patch.object(self.gateway, "A3_DISPATCH_ALLOWED_ROOTS", [str(Path(self.temp.name))])
+        # OS-identity permission model (operator A2 recovery decision): the
+        # working directory is a job parameter; by default no allowlist is
+        # imposed and OS access decides. A list may still be configured by
+        # an operator; dedicated tests below exercise that mode.
+        roots = patch.object(self.gateway, "A3_DISPATCH_ALLOWED_ROOTS", [])
         roots.start()
         self.addCleanup(roots.stop)
 
@@ -155,21 +160,95 @@ class AdapterContract(unittest.TestCase):
             self.assertEqual(error.exception.code, "INVALID_PROFILE")
             worker.assert_not_called()
 
-    def test_unauthorized_and_symlink_escape_paths_never_execute(self):
-        """F05: denial happens before admission; no worker, no job record."""
-        self.override_env("A3_ADAPTER_CLAUDE_BIN", str(self.stub("claude", "unused")))
-        outside = Path(self.temp.name) / "outside"
-        outside.mkdir()
-        escape = self.workdir / "escape"
-        escape.symlink_to(outside, target_is_directory=True)
-        with patch.object(self.gateway, "_start_job_worker") as worker, \
-                patch.object(self.gateway, "A3_DISPATCH_ALLOWED_ROOTS", [str(self.workdir)]):
-            for candidate in [str(outside), str(escape)]:
+    def test_nonexistent_and_file_paths_refused(self):
+        """Keep the basic filesystem validation with no allowlist set."""
+        self.override_env("A3_ADAPTER_CLAUDE_BIN", "/synthetic/absent")
+        plain_file = self.workdir / "file.txt"
+        plain_file.write_text("x")
+        with patch.object(self.gateway, "_start_job_worker") as worker:
+            for candidate in [str(self.workdir / "nonexistent"), str(plain_file)]:
                 with self.assertRaises(self.gateway._JobError) as error:
                     self.gateway.dispatch_job("claude", "x", candidate, "read_only")
                 self.assertEqual(error.exception.code, "INVALID_WORKING_DIRECTORY")
             worker.assert_not_called()
             self.assertEqual(self.gateway.JOB_STORE.list_ids(), [])
+
+    def test_working_directory_is_a_job_parameter_os_identity_decides(self):
+        """Operator permission model F-series: with no allowlist configured,
+        any existing directory enterable as the OS user is accepted — inside
+        the home, outside it, and through symlinks that resolve normally.
+        Nothing is rejected merely for being outside the home."""
+        # A real (stub) binary: admission must pass; the worker is mocked, so
+        # only the working-directory acceptance is under test here.
+        self.override_env("A3_ADAPTER_CLAUDE_BIN", str(self.stub("claude", "echo unused")))
+        inside_home = tempfile.mkdtemp(prefix="aee-osmodel-home-", dir=str(Path.home()))
+        self.addCleanup(lambda: shutil.rmtree(inside_home, ignore_errors=True))
+        outside_home = tempfile.mkdtemp(prefix="aee-osmodel-outside-")
+        self.addCleanup(lambda: shutil.rmtree(outside_home, ignore_errors=True))
+        link = self.workdir / "oslink"
+        link.symlink_to(outside_home, target_is_directory=True)
+        with patch.object(self.gateway, "_start_job_worker") as worker:
+            accepted = []
+            for candidate in [inside_home, outside_home]:
+                record = self.gateway.dispatch_job("claude", "x", candidate, "read_only")
+                self.assertEqual(record["status"], "queued")
+                self.assertEqual(record["working_directory"], str(Path(candidate).resolve()))
+                accepted.append(record)
+                # The worker is mocked, so each job stays queued and holds
+                # the single-flight lease; settle it before the next job.
+                self.gateway.JOB_STORE.update(record["job_id"], status="cancelled")
+            record = self.gateway.dispatch_job("claude", "x", str(link), "read_only")
+            # Symlinks resolve normally under OS rules: the job runs in the
+            # real target, not in the symlink path itself.
+            self.assertEqual(record["status"], "queued")
+            self.assertEqual(record["working_directory"], str(outside_home))
+            self.assertEqual(worker.call_count, 3)
+
+    def test_inaccessible_directory_refused_by_os_identity(self):
+        """A directory the executor OS user cannot enter is refused; refusal
+        is decided by actual OS permissions, not by any path root."""
+        self.override_env("A3_ADAPTER_CLAUDE_BIN", "/synthetic/absent")
+        locked = Path(self.temp.name) / "locked"
+        locked.mkdir()
+        locked.chmod(0o000)
+        if os.access(locked, os.R_OK):  # running as root in CI would pass
+            self.skipTest("directory check not meaningful for uid 0")
+        self.addCleanup(lambda: locked.chmod(0o755))
+        with patch.object(self.gateway, "_start_job_worker") as worker:
+            with self.assertRaises(self.gateway._JobError) as error:
+                self.gateway.dispatch_job("claude", "x", str(locked), "read_only")
+            self.assertEqual(error.exception.code, "INVALID_WORKING_DIRECTORY")
+            worker.assert_not_called()
+
+    def test_configured_allowlist_still_confines(self):
+        """An operator who configures A3_DISPATCH_ALLOWED_ROOTS keeps the
+        deployment-level confinement (optional, off by default)."""
+        self.override_env("A3_ADAPTER_CLAUDE_BIN", "/synthetic/absent")
+        with patch.object(self.gateway, "_start_job_worker") as worker, \
+                patch.object(self.gateway, "A3_DISPATCH_ALLOWED_ROOTS", ["/synthetic/no-root"]):
+            with self.assertRaises(self.gateway._JobError) as error:
+                self.gateway.dispatch_job("claude", "x", str(self.workdir), "read_only")
+            self.assertEqual(error.exception.code, "INVALID_WORKING_DIRECTORY")
+            worker.assert_not_called()
+
+    def test_executor_runs_as_gw_os_user_without_escalation(self):
+        """No privilege escalation: the job subprocess executes with the
+        launcher's own uid/gid and the gateway's cwd, per OS rules."""
+        uid = os.getuid()
+        gid = os.getgid()
+        stub = self.python_stub("claude", """#!/usr/bin/python3
+import json, os, sys
+sys.stdin.read()
+print(json.dumps({"type": "result",
+                  "result": f"uid={os.getuid()} gid={os.getgid()} cwd={os.getcwd()}",
+                  "is_error": False}))
+""")
+        self.override_env("A3_ADAPTER_CLAUDE_BIN", str(stub))
+        record = self.gateway.dispatch_job("claude", "x", str(self.workdir), "read_only")
+        terminal = self.wait_terminal(record["job_id"])
+        self.assertEqual(terminal["status"], "completed", terminal)
+        self.assertEqual(terminal["summary"],
+                         f"uid={uid} gid={gid} cwd={self.workdir}")
 
     def test_parent_traversal_is_canonicalized_not_escaped(self):
         self.override_env("A3_ADAPTER_CLAUDE_BIN", "/synthetic/absent")
