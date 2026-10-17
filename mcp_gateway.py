@@ -656,10 +656,16 @@ def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_even
             "observed": {"version": execution["adapter"].get("version"),
                          "executable_sha256": execution["adapter"].get("executable_sha256")},
         }
+        # Mirror the codex contract's truncation: clip the final summary to
+        # the configured cap and record truncation when it was exceeded.
+        summary = outcome["summary"]
+        clipped = len(summary) > A3_LIMITS.summary_chars
+        if clipped:
+            summary = summary[:A3_LIMITS.summary_chars]
         JOB_STORE.update(job_id, status="completed", finished_at=_now_iso(),
-                         exit_code=outcome["exit_code"], summary=outcome["summary"],
+                         exit_code=outcome["exit_code"], summary=summary,
                          log_excerpt=outcome["log_excerpt"], artifacts=[],
-                         truncated=False, execution=execution)
+                         truncated=clipped, execution=execution)
         log.info("event=job_completed job_id=%s duration_ms=%d", job_id,
                  int((time.monotonic() - worker_started) * 1000))
     except _JobError as error:

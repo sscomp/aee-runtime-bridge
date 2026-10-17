@@ -229,6 +229,19 @@ class AdapterContract(unittest.TestCase):
         self.assertEqual(terminal["exit_code"], 3)
         self.assertIn("synthetic boom", terminal["error"])
 
+    def test_summary_over_cap_is_clipped_and_flagged(self):
+        """F07: completed adapter jobs clip the summary to the configured cap
+        and set truncation, mirroring the codex contract."""
+        self.override_env("A3_ADAPTER_CLAUDE_BIN", str(self.python_stub("claude", CLAUDE_STUB)))
+        limits = self.gateway.Limits(timeout=60, summary_chars=32,
+                                     log_chars=100, result_bytes=65536)
+        with patch.object(self.gateway, "A3_LIMITS", limits):
+            record = self.gateway.dispatch_job("claude", "long", str(self.workdir), "read_only")
+            terminal = self.wait_terminal(record["job_id"])
+        self.assertEqual(terminal["status"], "completed", terminal)
+        self.assertTrue(terminal["truncated"])
+        self.assertEqual(len(terminal["summary"]), 32)
+
     # -- cancellation / timeout --------------------------------------------
 
     def test_cancel_kills_child_persists_terminal_state(self):
