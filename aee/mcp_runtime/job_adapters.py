@@ -116,9 +116,10 @@ class _ClaudeAdapter(AdapterSpec):
         """Extract the final result from a claude -p --output-format json run."""
         events = []
         try:
-            whole = json.loads(stdout)  # -p usually emits one JSON document
-            if isinstance(whole, dict):
-                events.append(whole)
+            whole = json.loads(stdout)  # -p emits one JSON document or array
+            for event in (whole if isinstance(whole, list) else [whole]):
+                if isinstance(event, dict):
+                    events.append(event)
         except (ValueError, UnicodeError):
             for line in stdout.splitlines():  # --verbose interleaves notices
                 candidate = line.strip()

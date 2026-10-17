@@ -33,6 +33,17 @@ sys.stdin.read()
 print(json.dumps({"type": "result", "result": "stub-final cwd=" + os.getcwd(), "is_error": False}))
 """
 
+# Real `claude -p --output-format json --verbose` emits a JSON array whose
+# last element is the result event; the parser must scan arrays, not only
+# single documents or per-line JSONL.
+CLAUDE_ARRAY_STUB = """#!/usr/bin/python3
+import json, os, sys
+sys.stdin.read()
+print(json.dumps([{"type": "system", "subtype": "init"},
+                  {"type": "result", "result": "array cwd=" + os.getcwd(),
+                   "is_error": False}]))
+"""
+
 PI_STUB = """#!/usr/bin/python3
 import os, sys
 sys.stdin.read()
@@ -186,6 +197,16 @@ class AdapterContract(unittest.TestCase):
         self.assertEqual(proof["read_only_enforcement"], "NATIVE_SANDBOX")
         self.assertEqual(proof["working_directory"], str(self.workdir))
         self.assertTrue(validate_success(terminal))
+
+    def test_claude_array_output_parsed(self):
+        """claude -p --output-format json --verbose emits an event array; the
+        final_message parser must extract the result event from it."""
+        self.override_env("A3_ADAPTER_CLAUDE_BIN", str(self.python_stub("claude", CLAUDE_ARRAY_STUB)))
+        record = self.gateway.dispatch_job("claude", "stub inspection", str(self.workdir),
+                                           "read_only")
+        terminal = self.wait_terminal(record["job_id"])
+        self.assertEqual(terminal["status"], "completed", terminal)
+        self.assertIn(f"cwd={self.workdir}", terminal["summary"])
 
     def test_pi_stub_text_adapter_completes(self):
         """F10 analogue: an optional adapter with TOOL_DENYLIST enforcement."""
