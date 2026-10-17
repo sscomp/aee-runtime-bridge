@@ -765,7 +765,6 @@ def dispatch_job(
         execution = execution_metadata(profile, identity, requested_profile=execution_profile,
                                        requested_model=model, requested_reasoning=reasoning_effort)
     elif agent_clean == "codex" and policy is not None:
-        read_manifest(A3_WORKSPACE_MANIFEST)
         raise _JobError("DEPLOYMENT_GATE_CLOSED",
                         "Codex dispatch requires the approved deployment gate on a "
                         "manifest-managed host; use an approved manifest or another adapter")
