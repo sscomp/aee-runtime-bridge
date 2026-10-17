@@ -43,6 +43,9 @@ class HardenedProtocol(unittest.TestCase):
         manifest.write_text(json.dumps({"safe.txt": hashlib.sha256((source / "safe.txt").read_bytes()).hexdigest()}))
         self.env = {"A3_JOB_STORE_DIR": str(self.root / "jobs"), "A3_DISPATCH_ALLOWED_ROOTS": self.source,
                     "A3_CODEX_BIN": str(self.binary), "A3_WORKSPACE_MANIFEST": str(manifest),
+                    # Adapter-mode codex must resolve deterministically even on
+                    # CI hosts without a real codex CLI (admission pins identity).
+                    "A3_ADAPTER_CODEX_BIN": str(self.binary),
                     "AEE_MCP_PORT": "8791", "AEE_MCP_SURFACE": "restricted",
                     "MCP_BRIDGE_API_KEY": "P2B_SYNTHETIC_AUTH", "AEE_MCP_REQUIRE_AUTH": "true"}
         self.gateway = self.load(self.env)
@@ -132,11 +135,15 @@ class HardenedProtocol(unittest.TestCase):
                 self.assertEqual(self.payload(body)["error_code"], "JOB_NOT_FOUND")
             # Multi-agent recovery: hermes is a registered adapter that cannot
             # enforce read_only here, so admission refuses with ADAPTER_UNSUPPORTED.
+            # Without a deployment manifest, codex runs through the generic
+            # adapter path, which rejects production model selectors up front
+            # with INVALID_PROFILE (the legacy contract's
+            # INVALID_EXECUTION_PROFILE only applies behind an approved gate).
             for extra, code in [({"agent": "hermes"}, "ADAPTER_UNSUPPORTED"),
                                 ({"mode": "read_write"}, "INVALID_MODE"),
-                                ({"model": "other-model"}, "INVALID_EXECUTION_PROFILE"),
-                                ({"reasoning_effort": "--help"}, "INVALID_EXECUTION_PROFILE"),
-                                ({"execution_profile": "--sandbox"}, "INVALID_EXECUTION_PROFILE")]:
+                                ({"model": "other-model"}, "INVALID_PROFILE"),
+                                ({"reasoning_effort": "--help"}, "INVALID_PROFILE"),
+                                ({"execution_profile": "--sandbox"}, "INVALID_PROFILE")]:
                 args = {"agent": "codex", "task": "fixture", "working_directory": self.source, **extra}
                 _, body = await rpc("tools/call", {"name": "aee_dispatch", "arguments": args})
                 self.assertEqual(self.payload(body)["error_code"], code)
@@ -183,7 +190,19 @@ class HardenedProtocol(unittest.TestCase):
             result = original_execute(*args, **kwargs)
             proof = successful_fields()['execution']
             return replace(result, evidence=proof['native_tool_evidence'], outcome=proof['result_contract'])
-        with patch.object(gateway, 'execute_codex', side_effect=corroborated_fixture):
+        # Multi-agent recovery routing: the legacy broker-mandated codex
+        # contract only runs behind an approved deployment gate, so admission
+        # is synthesized here with an approved policy and a no-op deployment
+        # gate (offline fixtures — no real Stage-2 approval is claimed or
+        # persisted). The worker keeps the historical non-broker offline
+        # context: policy resolves None after admission, exactly as this test
+        # did before the dispatch-routing change.
+        policy_states = iter([{'schema': 'fixture-policy'}])
+        with patch.object(gateway, 'execute_codex', side_effect=corroborated_fixture), \
+                patch.object(gateway, 'deployment_policy',
+                             side_effect=lambda: next(policy_states, None)), \
+                patch.object(gateway, 'deployment_gate_approved', return_value=True), \
+                patch.object(gateway, 'require_deployment_ready', lambda policy: None):
             asyncio.run(self.with_client(checks))
         # Completion may precede the tiny bookkeeping finally by one instruction.
         for thread in list(gateway._dispatch_pool.values()):

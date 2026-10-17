@@ -743,19 +743,26 @@ def dispatch_job(
         raise _JobError("INVALID_TASK", "task must not be empty")
     workdir = _validate_working_directory(working_directory)
     policy = deployment_policy()
-    if agent_clean == "codex":
-        # Codex keeps its legacy contract in full: production manifests
-        # re-verify the review gate BEFORE admission (fail-closed), and a
-        # policy-absent host runs the isolated bootstrap contract.
-        production_codex = True
+    approved = policy is not None and deployment_gate_approved(policy)
+    # The legacy broker-mandated codex contract runs ONLY on a host whose
+    # manifest is present AND approved. Policy-absent hosts run codex
+    # through the generic adapter path (native read-only sandbox); a
+    # present-but-unapproved manifest keeps codex fail-closed before
+    # admission rather than silently downgrading its contract.
+    production_codex = agent_clean == "codex" and approved
+    if production_codex:
         profile = select_profile(A3_EXECUTION_PROFILE if execution_profile is None else execution_profile,
                                  model, reasoning_effort)
         read_manifest(A3_WORKSPACE_MANIFEST)
-        if policy:
-            require_deployment_ready(policy)
+        require_deployment_ready(policy)
         identity = resolve_codex(A3_CODEX_BIN)
         execution = execution_metadata(profile, identity, requested_profile=execution_profile,
                                        requested_model=model, requested_reasoning=reasoning_effort)
+    elif agent_clean == "codex" and policy is not None:
+        read_manifest(A3_WORKSPACE_MANIFEST)
+        raise _JobError("DEPLOYMENT_GATE_CLOSED",
+                        "Codex dispatch requires the approved deployment gate on a "
+                        "manifest-managed host; use an approved manifest or another adapter")
     else:
         production_codex = False
         refuse_unsupported(agent_clean)
