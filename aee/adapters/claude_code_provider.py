@@ -427,11 +427,17 @@ class ClaudeCodeProvider:
             ExecStatus.TIMED_OUT,
             ExecStatus.FAILED,
         )
+        # Process exit can precede the background pipe readers. Keep polls
+        # nonblocking, but expose completion only once both streams and their
+        # byte counters are final. This also covers cancel/timeout races.
+        drain = getattr(record, "_drain_task", None)
+        output_pending = drain is not None and not drain.done()
+        is_terminal = is_terminal and not output_pending
         return ExecPollResult(
             external_run_id=external_run_id,
-            status=record.status,
+            status=ExecStatus.RUNNING if output_pending else record.status,
             is_terminal=is_terminal,
-            exit_code=record.exit_code,
+            exit_code=record.exit_code if is_terminal else None,
             output=None,
             error=record.error,
             stdout_bytes=record.stdout_bytes,
