@@ -101,6 +101,9 @@ class AdapterContract(unittest.TestCase):
         sys.modules.pop("aee_p2c_adapter_gateway", None)
 
     def setUp(self):
+        # These executables are synthetic protocol fixtures, not native CLI qualification.
+        probe = patch('aee.mcp_runtime.job_adapters.verify_claude_readonly_capabilities')
+        probe.start(); self.addCleanup(probe.stop)
         self.temp = tempfile.TemporaryDirectory(prefix="aee-adapters-job-")
         self.addCleanup(self.temp.cleanup)
         self.workdir = Path(self.temp.name) / "work"
@@ -302,7 +305,7 @@ print(json.dumps({"type": "result",
         self.assertIn(f"cwd={self.workdir}", terminal["summary"])
         proof = terminal["execution"]["adapter_proof"]
         self.assertEqual(proof["adapter"], "claude")
-        self.assertEqual(proof["read_only_enforcement"], "NATIVE_SANDBOX")
+        self.assertEqual(proof["read_only_enforcement"], "TOOL_ALLOWLIST")
         self.assertEqual(proof["working_directory"], str(self.workdir))
         self.assertTrue(validate_success(terminal))
 

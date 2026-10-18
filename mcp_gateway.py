@@ -1039,7 +1039,7 @@ def dispatch_job(
                             "codex production contract")
         # Adapter admissions resolve the installed binary now so an absent
         # CLI fails before admission instead of inside the worker.
-        execution = adapter_execution_metadata(agent_clean, mode_clean) if mode_clean == "autonomous" else adapter_execution_metadata(agent_clean)
+        execution = adapter_execution_metadata(agent_clean, mode_clean)
         execution['budget'] = {'configured': EXECUTION_POLICY.for_agent(agent_clean).record(),
                                'revision': EXECUTION_POLICY.revision}
     if mode_clean == "autonomous":
@@ -1235,8 +1235,9 @@ async def aee_dispatch(
 
     mode decides the agent's permission boundary:
     * 'read_only' (default): the agent runs inside its native read-only
-      sandbox (codex --sandbox read-only; claude --permission-mode plan)
-      and cannot modify the filesystem.
+      boundary (codex --sandbox read-only; claude --permission-mode plan
+      plus restricted safe-mode Read/Glob/Grep tool allowlist and empty MCP).
+      Claude plan mode alone does not enforce read-only.
     * 'write': an explicitly authorized, scoped write job. Requires per-job
       operator approval — pass metadata {"approval": "<operator-issued
       token>"} — and an operator-configured write-root scope: the job's

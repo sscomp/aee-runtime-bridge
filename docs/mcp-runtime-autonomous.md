@@ -3,7 +3,12 @@
 `aee_dispatch(mode="autonomous")` runs a headless CLI as the gateway OS account
 without per-tool approvals. It adds no OS privileges. The account's existing
 credentials, groups (including Docker), network and DAC/ACL permissions remain
-relevant. `read_only` and constrained `write` keep their existing argv and gates.
+relevant. Constrained `write` keeps its existing argv and gates. Claude `read_only` now
+uses restricted safe mode with a native Read/Glob/Grep tool allowlist and an
+empty strict MCP configuration. Plan mode alone allowed a real write in a
+Production negative test; the initial candidate was rolled back immediately.
+This documented regression fix removes execution/edit/write tools and hooks/plugins
+from that profile. Other modes keep their intended authority.
 The six-tool restricted MCP surface gains only the explicit mode enum value.
 
 Production must use authenticated loopback transport, systemd `NoNewPrivileges=yes`,

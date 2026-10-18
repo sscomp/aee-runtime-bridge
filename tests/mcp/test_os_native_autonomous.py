@@ -177,6 +177,21 @@ class AutonomousSecurity(unittest.TestCase):
                     self.assertNotIn(body['params']['arguments']['metadata']['autonomous_approval'],json.dumps(record))
         asyncio.run(run())
 
+    def test_claude_readonly_omits_every_execution_and_write_tool(self):
+        from aee.mcp_runtime.job_adapters import verify_claude_readonly_capabilities
+        spec = self.g.adapter_specs()['claude']
+        argv = spec.build_argv('/fixture', 'claude', 'read_only')
+        self.assertEqual(spec.read_only_enforcement, 'TOOL_ALLOWLIST')
+        self.assertEqual(argv[argv.index('--tools') + 1], 'Read,Glob,Grep')
+        self.assertIn('--restricted', argv); self.assertIn('--safe-mode', argv)
+        self.assertIn('--strict-mcp-config', argv)
+        self.assertEqual(argv[argv.index('--mcp-config') + 1], '{"mcpServers":{}}')
+        from types import SimpleNamespace
+        with patch('aee.mcp_runtime.job_adapters.run_bounded', return_value=SimpleNamespace(returncode=0, stdout=b'old CLI without controls')):
+            self.denied('ADAPTER_UNSUPPORTED', verify_claude_readonly_capabilities, '/fixture/claude')
+        self.assertNotIn('--restricted', spec.build_argv('/fixture','claude','autonomous'))
+        self.assertIn('acceptEdits', spec.build_argv('/fixture','claude','write'))
+
     def test_native_tool_event_counts_do_not_store_payload(self):
         p = EventParser('codex')
         p.feed(b'{"type":"item.started","item":{"type":"command_execution"}}\n'

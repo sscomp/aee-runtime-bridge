@@ -113,10 +113,11 @@ class _ClaudeAdapter(AdapterSpec):
             default_executable="claude",
             env_executable="A3_ADAPTER_CLAUDE_BIN",
             version_argv=("--version",),
-            read_only_enforcement="NATIVE_SANDBOX",
+            read_only_enforcement="TOOL_ALLOWLIST",
             enforcement_note=(
-                "claude -p --permission-mode plan: edit/write tools are denied "
-                "and bash is restricted to read-only analysis by plan mode"),
+                "claude restricted safe mode with only Read/Glob/Grep and an empty strict "
+                "MCP configuration: no command/code/edit/write tools, hooks or plugins. "
+                "Plan mode alone is not a read-only enforcement boundary"),
             write_enforcement="NATIVE_SANDBOX",
             write_note=(
                 "claude -p --permission-mode acceptEdits (headless): file "
@@ -137,9 +138,13 @@ class _ClaudeAdapter(AdapterSpec):
         if mode == "autonomous":
             return [executable, "-p", "--no-session-persistence",
                     "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
+        if mode == "read_only":
+            return [executable, "-p", "--no-session-persistence", "--permission-mode", "plan",
+                    "--restricted", "--safe-mode", "--tools", "Read,Glob,Grep",
+                    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                    "--output-format", "json"]
         return [executable, "-p", "--no-session-persistence",
-                "--permission-mode", "acceptEdits" if mode == "write" else "plan",
-                "--output-format", "json"]
+                "--permission-mode", "acceptEdits", "--output-format", "json"]
 
     @staticmethod
     def final_message(stdout: str, limits: Limits, *args, **kwargs) -> str:
@@ -307,6 +312,8 @@ def adapter_execution_metadata(agent: str, mode: str = "read_only") -> Dict[str,
         verify_autonomous_capabilities(agent, identity['executable'])
     elif agent == 'pi':
         verify_pi_capabilities(identity['executable'])
+    elif agent == 'claude' and mode == 'read_only':
+        verify_claude_readonly_capabilities(identity['executable'])
     return {"adapter": identity,
             "kind": "job-adapter",
             "observed": {"agent_version_probe": identity["version"]}}
@@ -366,6 +373,8 @@ def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str
         from .authorization import Authority
         original_cwd = execution['authorization']['working_directory']
         Authority.configured().check_start(execution['authorization'], spec.name, task, original_cwd)
+    if spec.name == 'claude' and mode == 'read_only':
+        verify_claude_readonly_capabilities(executable)
     argv = spec.build_argv(working_directory, executable, mode)
     if budget is not None:
         if spool is None:
@@ -494,3 +503,15 @@ def execute_adapter_job(spec, executable, execution, task, working_directory, **
         return _execute_adapter_job(spec, executable, execution, task, pinned, **kwargs)
     finally:
         os.close(fd)
+
+
+def verify_claude_readonly_capabilities(executable):
+    required = ('--restricted', '--safe-mode', '--tools', '--strict-mcp-config', '--mcp-config')
+    try:
+        result = run_bounded([executable, '--help'], env=_VERSION_ENV, cwd='/',
+                             limits=Limits(timeout=20, stdout_bytes=65536, stderr_bytes=8192))
+        text = result.stdout.decode('utf-8', 'replace')
+        if result.returncode or any(flag not in text for flag in required):
+            raise ValueError('missing read-only controls')
+    except (OSError, ValueError, JobError):
+        raise JobError('ADAPTER_UNSUPPORTED', 'Claude CLI lacks verified read-only tool isolation flags') from None
