@@ -12,8 +12,11 @@ DOCS = ['README.md', 'docs/architecture.md', 'docs/deployment.md',
         'docs/chatgpt-plugin-deployment.md', 'docs/legacy-http-profiles.md',
         'docs/legacy-retirement.md', 'docs/security-model.md',
         'docs/MIGRATION_FROM_AEE_MINI.md', 'docs/HERMES_ADAPTER_CONTRACT_MATRIX.md',
-        'config/p2c/README.md', 'tests/mcp/README.md']
-FIVE = {'aee_status', 'aee_agents', 'aee_dispatch', 'aee_job_status', 'aee_job_result'}
+        'config/p2c/README.md', 'tests/mcp/README.md',
+        'docs/chatgpt-secure-mcp-setup-runbook.md', 'docs/a2-secure-mcp-deploy-verify.md',
+        'docs/a2-uninstall-reinstall-migration.md']
+SIX = {'aee_status', 'aee_agents', 'aee_dispatch', 'aee_job_cancel',
+       'aee_job_status', 'aee_job_result'}
 
 
 def main():
@@ -49,8 +52,8 @@ def main():
             errors.append(f'{path.name}: credential must remain placeholder')
         if not fields.get('AEE_RUNTIME_MANIFEST') or not fields.get('AEE_BROKER_CONTROL'):
             errors.append(f'{path.name}: production gate/broker missing')
-    if set(envs['restricted']['AEE_MCP_EXPOSED_TOOLS'].split(',')) != FIVE:
-        errors.append('restricted example: five-tool contract changed')
+    if set(envs['restricted']['AEE_MCP_EXPOSED_TOOLS'].split(',')) != SIX:
+        errors.append('restricted example: six-tool contract changed')
     # Use runtime validators: changed JSON bytes invalidate reviewed identities.
     import sys
     sys.path.insert(0, str(ROOT))

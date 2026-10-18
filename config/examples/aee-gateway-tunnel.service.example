@@ -1,5 +1,5 @@
 [Unit]
-Description=AEE A3 MCP Gateway (restricted five-tool surface)
+Description=AEE A3 MCP Gateway (restricted six-tool surface)
 After=aee-gateway.service
 Wants=aee-gateway.service
 

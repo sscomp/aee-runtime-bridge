@@ -116,9 +116,9 @@ Follow [plugin walkthrough](chatgpt-plugin-deployment.md) to create the private
 Plugin, then perform exactly the same MCP checks as [local
 acceptance](agent-operations.md), but through ChatGPT:
 
-1. discovery/status invocation succeeds and exposes exactly the five restricted
-   tools (`aee_status`, `aee_agents`, `aee_dispatch`, `aee_job_status`,
-   `aee_job_result`);
+1. discovery/status invocation succeeds and exposes exactly the six restricted
+   tools (`aee_status`, `aee_agents`, `aee_dispatch`, `aee_job_cancel`,
+   `aee_job_status`, `aee_job_result`);
 2. one operator-approved **read-only** dispatch completes and its result is
    bounded and redacted as expected;
 3. negatives: wrong forwarded credential → rejected by the gateway; local/full

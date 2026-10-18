@@ -243,6 +243,18 @@ An auth/config/gate failure is a stop condition. Validate MCP using
 [agent operations](agent-operations.md), then connect [ChatGPT](chatgpt-mcp.md).
 See [rollback](troubleshooting.md) before enabling services at boot.
 
+### 4.A2. Secure MCP trusted dispatch (A2 enhancement)
+
+To authorize approved Secure MCP principals for `write`/`autonomous` dispatch
+without per-job tokens, provision the private trusted-dispatch policy and its
+env entry, then run the A2 acceptance-gate table: the dedicated
+[A2 deploy and verification guide](a2-secure-mcp-deploy-verify.md) covers
+policy shape, the startup refusal contract, gates G1–G8, and the sanitized
+[ChatGPT connector runbook](chatgpt-secure-mcp-setup-runbook.md) covers
+connector wiring and rotation. A clean uninstall/reinstall/migration plan —
+including persistent-data boundaries and rollback — is maintained separately
+([migration plan](a2-uninstall-reinstall-migration.md)).
+
 ## 4a. Model credential presentation on modern systemd (verified pattern)
 
 `aee-p2c-broker.service` ships `LoadCredential=openai-api-key:/etc/aee/secrets/openai-api-key`.

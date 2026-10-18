@@ -8,9 +8,10 @@ Plugin distribution. Instructions were checked against the official
 and [custom MCP server guide](https://developers.openai.com/api/docs/guides/custom-mcp-server).
 
 Complete step-by-step expansions of this summary: [end-to-end tunnel
-guide](openai-secure-mcp-tunnel.md) and the [Plugin
+guide](openai-secure-mcp-tunnel.md), the [Plugin
 walkthrough](chatgpt-plugin-deployment.md) — both carry the current
-**NOT YET TESTED (Stage 3B)** labels.
+**NOT YET TESTED (Stage 3B)** labels — and for A2 Secure MCP trusted dispatch
+the sanitized [setup and refresh runbook](chatgpt-secure-mcp-setup-runbook.md).
 
 ## Tunnel setup
 

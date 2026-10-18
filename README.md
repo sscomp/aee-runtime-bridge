@@ -44,9 +44,14 @@ If `uv` is missing, install it user-level (no root): `curl -LsSf https://astral.
 Python is another version. Full details in [host setup](docs/deployment.md).
 
 Configure `config/p2c/gateway-restricted.env.example` privately, retaining
-`127.0.0.1:8791/mcp (restricted)`, authentication and exactly `aee_status`,
-`aee_agents`, `aee_dispatch`, `aee_job_status`, `aee_job_result`.
-Only `codex` / `read_only` dispatch is supported; `aee_exec` remains local/full only
+`127.0.0.1:8791/mcp (restricted)`, authentication and exactly the six-tool
+surface: `aee_status`, `aee_agents`, `aee_dispatch`, `aee_job_cancel`,
+`aee_job_status`, `aee_job_result`. With the A2 private trusted-dispatch
+policy provisioned, approved Secure MCP principals may dispatch
+`read_only`/`write`/`autonomous` without per-job tokens
+([A2 deploy and verification](docs/a2-secure-mcp-deploy-verify.md)); without
+that policy only `codex` / `read_only` dispatch is supported. `aee_exec`
+remains local/full only
 on port 8790. Follow [host setup](docs/deployment.md) to run the gateway and —
 for real dispatch — the inference broker; [validation](docs/agent-operations.md) and
 [agent operations](docs/agent-operations.md) cover health, MCP handshake,
@@ -73,7 +78,7 @@ install the MCP closure or qualify production MCP dispatch.
   optional native qualification. Fixture success is not real model inference.
 
 Required CI covers isolated HTTP API/job tests, all four profile suites, shell bootstrap regression, MCP auth
-and five-tool boundary, job lifecycle/results, broker policies, packaging,
+and six-tool boundary, job lifecycle/results, broker policies, packaging,
 documentation/configuration and public-source secret scanning. It never installs
 services or publishes a release. Host qualification and planned Stage 3 E2E are
 separate, explicit acceptance steps.

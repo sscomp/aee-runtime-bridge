@@ -1494,7 +1494,7 @@ def _apply_tool_exposure_filter() -> None:
 
     allowed = RESTRICTED_TOOLS if AEE_MCP_SURFACE == "restricted" else frozenset(AEE_MCP_EXPOSED_TOOLS)
     if not allowed:
-        return  # deliberately full/local only; restricted always has fixed five
+        return  # deliberately full/local only; restricted always has the fixed six
     manager = mcp._tool_manager
     if getattr(manager, "_aee_surface_guard", False):
         return

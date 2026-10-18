@@ -11,10 +11,11 @@ guide](https://developers.openai.com/api/docs/guides/custom-mcp-server) and the
 [Secure MCP tunnel
 guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
 
-## 1a. Dispatch contract the Plugin exposes (Codex read-only only)
+## 1a. Dispatch contract the Plugin exposes (Stage 3B baseline; A2 trusted dispatch)
 
-The restricted surface supports exactly `agent="codex"` and `mode="read_only"`.
-Everything else is rejected by schema, by design:
+At the Stage 3B execution recorded here, the restricted surface dispatched only
+`agent="codex"` with `mode="read_only"`. That remains the hard fallback today
+for any deployment **without** a configured trusted-dispatch policy:
 
 - `agent="claude"` → `INVALID_AGENT`; `mode="read_write"` → `INVALID_MODE`.
   `aee_agents` reporting Claude Code as installed/available is *filesystem
@@ -30,6 +31,20 @@ Everything else is rejected by schema, by design:
   self-labels legacy-names in metadata; this does **not** imply execution on
   any node other than the one owning the tunnel. Confirm via `aee_status`
   hostname and the job's resolved `working_directory`.
+
+**A2 change — Secure MCP trusted dispatch.** The `aee_dispatch` schema now
+publishes the `mode` enum `read_only | write | autonomous`. A deployment that
+provisions the private trusted-dispatch policy
+([overview](mcp-runtime-autonomous.md), [setup and refresh
+runbook](chatgpt-secure-mcp-setup-runbook.md)) authorizes named Secure MCP
+principals — keyed to the SHA-256 digest of the tunnel bearer, never the value
+itself — to dispatch `write` and `autonomous` jobs over this same restricted
+surface with **no per-job approval token**. Authorization is not capability:
+agent adapters still verify their own execution fitness and fail closed before
+any launch (`ADAPTER_UNSUPPORTED`). Deployment state reporting keeps both
+models visible: `/status` shows
+`autonomous.authorization = secure_mcp_trusted_dispatch` when the policy is
+configured, `single-job-capability` for the legacy path.
 
 **Task authoring matters.** Native enforcement fails a job
 (`REQUIRED_TOOL_FAILED`, exit-free fail-shot) when any command execution the
@@ -47,7 +62,7 @@ is not public Plugin distribution. Complete the tunnel setup first — see
 ## 1. Prerequisites
 
 1. Restricted gateway healthy with auth enabled (`127.0.0.1:8791/mcp`, exactly
-   five exposed tools) — [agent operations](agent-operations.md).
+   the six-tool restricted surface) — [agent operations](agent-operations.md).
 2. Dispatch proven end-to-end locally (real completed job) — [host setup
    §2c](deployment.md). Without it, the Plugin would expose a surface whose every
    job fails.
@@ -90,9 +105,9 @@ do not modify gateway auth.
 
 ## 4. First-use validation (same checks as local acceptance, via ChatGPT)
 
-1. Discovery/status invocation succeeds; the tool list is exactly the five
+1. Discovery/status invocation succeeds; the tool list is exactly the six
    restricted tools — nothing beyond `aee_status`, `aee_agents`, `aee_dispatch`,
-   `aee_job_status`, `aee_job_result`.
+   `aee_job_cancel`, `aee_job_status`, `aee_job_result`.
 2. The gateway's `readOnlyHint` for read-only tools is respected (visible in the
    ChatGPT tool description).
 3. One operator-approved **read-only** dispatch from ChatGPT completes; verify
