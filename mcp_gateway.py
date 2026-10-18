@@ -1144,7 +1144,8 @@ async def status_route(request):
         "autonomous": {"profile": "os-native", "authorization": (TRUSTED_POLICY if TrustedDispatch.configured() is not None
                                                                          else "single-job-capability"),
                        "mandatory_directory_allowlist": False,
-                       "policy_configured": bool(os.getenv('AEE_AUTONOMOUS_POLICY'))},
+                       "policy_configured": bool(os.getenv('AEE_TRUSTED_DISPATCH_POLICY')
+                                                 or os.getenv('AEE_AUTONOMOUS_POLICY'))},
         "trusted_dispatch": (TrustedDispatch.configured().status()
                              if TrustedDispatch.configured() is not None else None),
         "write_scope": {
