@@ -97,6 +97,9 @@ class _CodexAdapter(AdapterSpec):
         # `-` reads the task from stdin instead of argv. --ephemeral keeps
         # session files off disk; --json yields the parsed event stream the
         # gateway already understands.
+        if mode == "autonomous":
+            return [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+                    "--dangerously-bypass-approvals-and-sandbox", "--cd", ".", "-"]
         sandbox = "workspace-write" if mode == "write" else "read-only"
         return [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
                 "--sandbox", sandbox, "--cd", working_directory, "-"]
@@ -131,6 +134,9 @@ class _ClaudeAdapter(AdapterSpec):
         # long before the final result arrives. The
         # single-object shape still carries result/usage/is_error, and the
         # parser below keeps accepting both shapes for forward compatibility.
+        if mode == "autonomous":
+            return [executable, "-p", "--no-session-persistence",
+                    "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
         return [executable, "-p", "--no-session-persistence",
                 "--permission-mode", "acceptEdits" if mode == "write" else "plan",
                 "--output-format", "json"]
@@ -198,7 +204,7 @@ class _PiAdapter(AdapterSpec):
                    mode: str = "read_only") -> List[str]:
         return [executable, "-p", "--no-session", "--mode", "json",
                 "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
-                "--no-approve", "--tools", "read"]
+                "--no-approve", "--tools", "read,bash,edit,write" if mode == "autonomous" else "read"]
 
 
 @_spec
@@ -217,8 +223,11 @@ class _HermesAdapter(AdapterSpec):
                 "simulate read-only compliance"),
         )
 
-    def build_argv(self, working_directory: str, executable: str) -> List[str]:
-        raise NotImplementedError  # refuse to build argv for UNSUPPORTED
+    def build_argv(self, working_directory: str, executable: str,
+                   mode: str = "read_only") -> List[str]:
+        if mode != "autonomous":
+            raise NotImplementedError  # existing constrained-mode mapping remains unsupported
+        return [executable, "chat", "--yolo", "--query-file", "-", "--format", "stream-json"]
 
 
 def adapter_specs() -> Dict[str, AdapterSpec]:
@@ -277,6 +286,8 @@ def refuse_unsupported(agent: str, mode: str = "read_only") -> None:
         raise JobError("INVALID_AGENT",
                        f"agent '{agent[:60]}' is not a registered adapter; "
                        f"supported adapters: {', '.join(sorted(AGENT_NAMES))}")
+    if mode == "autonomous":
+        return
     if mode == "write":
         if spec.write_enforcement == "UNSUPPORTED":
             raise JobError("ADAPTER_UNSUPPORTED",
@@ -289,10 +300,12 @@ def refuse_unsupported(agent: str, mode: str = "read_only") -> None:
                        "host; dispatch refused")
 
 
-def adapter_execution_metadata(agent: str) -> Dict[str, object]:
+def adapter_execution_metadata(agent: str, mode: str = "read_only") -> Dict[str, object]:
     """Execution proof recorded at admission; re-checked at dispatch time."""
     identity = adapter_identity(agent)
-    if agent == 'pi':
+    if mode == 'autonomous':
+        verify_autonomous_capabilities(agent, identity['executable'])
+    elif agent == 'pi':
         verify_pi_capabilities(identity['executable'])
     return {"adapter": identity,
             "kind": "job-adapter",
@@ -318,7 +331,7 @@ def _probe_version(spec: AdapterSpec, executable: str) -> str:
         return "unavailable"
 
 
-def execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str, object],
+def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str, object],
                         task: str, working_directory: str, *, limits: Limits,
                         cancel_event=None, budget=None, spool=None, redact=lambda x: x,
                         mode: str = "read_only") -> Dict[str, object]:
@@ -336,21 +349,28 @@ def execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str,
             or identity.get("executable_sha256") != observed["executable_sha256"]):
         raise JobError("EXECUTOR_IDENTITY_MISMATCH",
                        "Executor identity changed since admission")
+    # Provider credentials stay available; control-plane authority never enters child env.
     env = {key: value for key, value in os.environ.items()
-           if key not in {"PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "MCP_BRIDGE_API_KEY",
-                          "AEE_BROKER_CONTROL", "AEE_RUNTIME_MANIFEST"}}
-    if mode == "write":
+           if not key.startswith(('AEE_', 'A3_', 'MCP_BRIDGE_'))
+           and key not in {"PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"}}
+    if mode == "autonomous":
+        verify_autonomous_capabilities(spec.name, executable)
+    elif mode == "write":
         if spec.write_enforcement == "UNSUPPORTED":
             raise JobError("ADAPTER_UNSUPPORTED",
                            f"agent '{spec.name}' cannot enforce write mode on this host")
     elif spec.read_only_enforcement == "UNSUPPORTED":
         raise JobError("ADAPTER_UNSUPPORTED",
                        f"agent '{spec.name}' cannot enforce read_only on this host")
+    if mode == 'autonomous':
+        from .authorization import Authority
+        original_cwd = execution['authorization']['working_directory']
+        Authority.configured().check_start(execution['authorization'], spec.name, task, original_cwd)
     argv = spec.build_argv(working_directory, executable, mode)
     if budget is not None:
         if spool is None:
             raise JobError('SPOOL_BOUNDARY', 'Durable spool required for budget execution')
-        if spec.name == 'claude' and budget.idle_timeout_seconds is not None:
+        if spec.name == 'claude' and budget.idle_timeout_seconds is not None and '--verbose' not in argv:
             # Idle accounting requires observable progress, not final-only JSON.
             argv[argv.index('--output-format') + 1] = 'stream-json'
             argv.append('--verbose')
@@ -358,10 +378,18 @@ def execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str,
             if spec.name != 'claude':
                 raise JobError('INVALID_EXECUTION_BUDGET', 'Adapter does not support max_turns')
             argv += ['--max-turns', str(budget.max_turns)]
-        completed = run_streamed(argv, env=env, stdin=task.encode('utf-8'),
-                                 budget=budget, spool=spool, parser=EventParser(
-                                     spec.name, budget.result_inline_bytes, budget.memory_capture_bytes),
+        def on_start(pid):
+            if mode == 'autonomous':
+                from pathlib import Path
+                lines = Path(f'/proc/{pid}/status').read_text().splitlines()
+                execution['process_identity'] = {'pid': pid, 'launcher': 'process_guard',
+                    'status': [line for line in lines if line.startswith(
+                        ('Uid:', 'Gid:', 'Groups:', 'CapEff:', 'NoNewPrivs:'))]}
+        parser = EventParser(spec.name, budget.result_inline_bytes, budget.memory_capture_bytes)
+        completed = run_streamed(argv, env=env, stdin=task.encode('utf-8'), on_start=on_start,
+                                 budget=budget, spool=spool, parser=parser,
                                  cwd=working_directory, cancel_event=cancel_event, redact=redact)
+        execution['tool_event_record'] = parser.tool_evidence()
         if completed.returncode != 0:
             error = JobError('EXECUTION_FAILED', f'Executor exited {completed.returncode}',
                              exit_code=completed.returncode)
@@ -415,3 +443,54 @@ def verify_pi_capabilities(executable):
                 '--no-approve', '--mode', '--no-session', '--tools')
     if completed.returncode != 0 or any(flag not in help_text for flag in required):
         raise JobError('ADAPTER_UNSUPPORTED', 'Pi CLI does not advertise required read-only/JSON flags')
+
+
+_AUTONOMOUS_FLAGS = {
+    'codex': ('--dangerously-bypass-approvals-and-sandbox', '--json', '--ephemeral', '--skip-git-repo-check', '--cd'),
+    'claude': ('--dangerously-skip-permissions', '--print', '--output-format', '--no-session-persistence'),
+    'pi': ('--print', '--mode', '--no-session', '--no-extensions', '--no-mcp', '--no-skills',
+           '--no-prompt-templates', '--no-approve', '--tools'),
+    'hermes': ('--query-file', '--format', '--yolo'),
+}
+
+
+def verify_autonomous_capabilities(agent, executable):
+    args = ['exec', '--help'] if agent == 'codex' else ['chat', '--help'] if agent == 'hermes' else ['--help']
+    try:
+        result = run_bounded([executable, *args], env=_VERSION_ENV, cwd='/',
+                             limits=Limits(timeout=20, stdout_bytes=65536, stderr_bytes=8192))
+        text = result.stdout.decode('utf-8', 'replace')
+        if result.returncode or any(flag not in text for flag in _AUTONOMOUS_FLAGS.get(agent, ())):
+            raise ValueError('missing native capabilities')
+        if agent not in _AUTONOMOUS_FLAGS:
+            raise ValueError('unregistered autonomous mapping')
+    except (OSError, ValueError, JobError):
+        raise JobError('ADAPTER_UNSUPPORTED', 'Installed CLI lacks verified headless autonomous flags') from None
+
+
+def autonomous_capability(agent):
+    try:
+        spec, executable = resolve_adapter(agent)
+    except JobError as exc:
+        return {'autonomous_supported': False, 'reason': exc.code}
+    try:
+        verify_autonomous_capabilities(agent, executable)
+        return {'autonomous_supported': True, 'reason': 'native flags verified; provider readiness requires real job'}
+    except JobError as exc:
+        return {'autonomous_supported': False, 'reason': exc.code}
+
+
+def execute_adapter_job(spec, executable, execution, task, working_directory, **kwargs):
+    if kwargs.get('mode') != 'autonomous':
+        return _execute_adapter_job(spec, executable, execution, task, working_directory, **kwargs)
+    fd = os.open(working_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        expected = (execution.get('authorization') or {}).get('directory_identity')
+        if expected != {'device': info.st_dev, 'inode': info.st_ino}:
+            raise JobError('INVALID_WORKING_DIRECTORY', 'Working directory changed since admission')
+        # Parent holds fd across Popen; child chdir resolves this pinned inode.
+        pinned = f'/proc/{os.getpid()}/fd/{fd}'
+        return _execute_adapter_job(spec, executable, execution, task, pinned, **kwargs)
+    finally:
+        os.close(fd)

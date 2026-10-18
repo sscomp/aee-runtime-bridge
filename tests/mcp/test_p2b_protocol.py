@@ -158,7 +158,7 @@ class HardenedProtocol(unittest.TestCase):
                 "agent": "codex", "task": "fixture", "working_directory": self.source,
                 "mode": "read_write"}})
             text = body["result"]["content"][0]["text"]
-            self.assertIn("Input should be 'read_only' or 'write'", text)
+            self.assertIn("Input should be 'read_only', 'write' or 'autonomous'", text)
             self.assertEqual(self.gateway.JOB_STORE.list_ids(), [])
         asyncio.run(self.with_client(checks))
 

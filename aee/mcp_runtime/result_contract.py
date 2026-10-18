@@ -182,6 +182,8 @@ def validate_success(record, *, persisted=True):
     except (KeyError, TypeError, ValueError):
         reject('RESULT_INCOMPLETE', 'Completed job lacks consistent lifecycle timestamps')
     proof = execution.get('adapter_proof')
+    if record.get('mode') == 'autonomous' and proof is None:
+        reject('TOOL_EVIDENCE_INCOMPLETE', 'Autonomous result requires native adapter proof')
     if proof is not None:
         # Multi-agent recovery: jobs run by the generic adapter contract
         # (mcp_runtime/job_adapters) prove completion with adapter-shaped,
@@ -191,9 +193,37 @@ def validate_success(record, *, persisted=True):
         if any(k in proof for k in ('failure', 'error', 'error_code', 'interrupted',
                                     'fatal_error', 'timed_out', 'cancelled')):
             reject('INVALID_TERMINAL_STATE', 'Completed final turn contains failure metadata')
+        autonomous = record.get('mode') == 'autonomous'
+        if autonomous:
+            authorization = execution.get('authorization')
+            process = execution.get('process_identity')
+            process_valid = False
+            try:
+                identity = authorization['os_identity']
+                fields = dict(line.split(':', 1) for line in process['status'])
+                process_valid = (type(process['pid']) is int and process['pid'] > 0
+                    and [int(v) for v in fields['Uid'].split()] == [identity['uid']] * 4
+                    and [int(v) for v in fields['Gid'].split()] == [identity['gid']] * 4
+                    and sorted(int(v) for v in fields['Groups'].split()) == identity['groups']
+                    and fields['NoNewPrivs'].strip() == '1' and int(fields['CapEff'].strip(), 16) == 0)
+            except (TypeError, KeyError, ValueError, AttributeError):
+                pass
+            if (not isinstance(authorization, dict)
+                    or authorization.get('schema') != 'aee-autonomous-proof-v1'
+                    or authorization.get('mode') != 'autonomous'
+                    or authorization.get('profile') != 'os-native'
+                    or authorization.get('agent') != record.get('agent')
+                    or authorization.get('working_directory') != record.get('working_directory')
+                    or proof.get('authorization') != authorization
+                    or proof.get('mode') != 'autonomous'
+                    or execution.get('native_profile') != 'os-native'
+                    or not process_valid):
+                reject('TOOL_EVIDENCE_INCOMPLETE', 'Autonomous result lacks scoped authorization and process proof')
+        if not autonomous and proof.get('mode') == 'autonomous':
+            reject('INVALID_TERMINAL_STATE', 'Adapter mode contradicts job mode')
         if (type(proof.get('exit_code')) is not int or proof['exit_code'] != record['exit_code']
                 or proof.get('turn_completed') is not True
-                or proof.get('read_only_enforcement') in {'UNSUPPORTED', None, ''}):
+                or not autonomous and proof.get('read_only_enforcement') in {'UNSUPPORTED', None, ''}):
             reject('INVALID_TERMINAL_STATE', 'Completed job lacks a consistent successful final turn')
         if not isinstance(proof.get('working_directory'), str) \
                 or proof['working_directory'] != record.get('working_directory'):

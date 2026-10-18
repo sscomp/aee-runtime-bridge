@@ -8,7 +8,7 @@ dispatch, no network. Covers the REV 2 operator decision (2026-10-18):
   mocked Linux identities (Arch-based and non-Arch) and a mocked macOS
   identity, while legacy identity fields stay backward-compatible,
 * aee_agents follows the adapter registry instead of a hardcoded roster,
-* the exposed tool surface (names + input schemas) stays byte-equal to the
+* the exposed tool surface (names + input schemas) retains all fields except the explicit autonomous enum addition to the
   deployed base commit.
 """
 import asyncio
@@ -179,7 +179,7 @@ class StatusOSNativeIdentity(unittest.TestCase):
         mocks = [
             patch("os.getuid", return_value=1000), patch("os.geteuid", return_value=1000),
             patch("os.getgid", return_value=101), patch("os.getegid", return_value=101),
-            patch("os.getgrouplist", return_value=[1000, 101]),
+            patch("os.getgroups", return_value=[1000, 101]),
             patch("pwd.getpwuid", return_value=SimpleNamespace(pw_name="sscomp")),
             patch("grp.getgrgid", side_effect=lambda g: SimpleNamespace(
                 gr_name={1000: "sscomp", 101: "wheel"}[g])),
@@ -200,7 +200,7 @@ class StatusOSNativeIdentity(unittest.TestCase):
             patch("os.getuid", return_value=1234), patch("os.geteuid", return_value=1234),
             patch("os.getgid", return_value=1234), patch("os.getegid", return_value=1234),
             patch("pwd.getpwuid", side_effect=KeyError("not found")),
-            patch("os.getgrouplist", side_effect=OSError("no groups")),
+            patch("os.getgroups", side_effect=OSError("no groups")),
         ]
         for p in mocks:
             p.start()
@@ -276,14 +276,17 @@ class ToolSurfaceLockedToBase(unittest.TestCase):
         cand_tools = {t.name: t for t in cand.mcp._tool_manager.list_tools()}
         self.assertEqual(set(base_tools), set(cand_tools))
         for name, tool in base_tools.items():
-            self.assertEqual(tool.parameters, cand_tools[name].parameters, name)
+            expected = json.loads(json.dumps(tool.parameters))
+            if name == 'aee_dispatch':
+                expected['properties']['mode']['enum'] = ['read_only', 'write', 'autonomous']
+            self.assertEqual(expected, cand_tools[name].parameters, name)
 
     def test_signatures_equal_base_commit(self):
         base = _import_base_gateway(self)
         cand = _import_gateway(self)
         for name in EXPOSED + ["aee_exec"]:
             self.assertEqual(
-                str(inspect.signature(getattr(base, name))),
+                str(inspect.signature(getattr(base, name))).replace("Literal['read_only', 'write']", "Literal['read_only', 'write', 'autonomous']"),
                 str(inspect.signature(getattr(cand, name))),
                 name)
 

@@ -38,8 +38,8 @@ AGENT_NAMES = frozenset({"codex", "claude", "pi", "hermes"})
 # Dispatch modes (write-capable dispatch recovery): read_only is the sealed
 # default; write is admitted only when the gateway has already applied its
 # per-job approval + write-scope gates (the store itself stays mode-agnostic
-# but fail-closed to these two).
-DISPATCH_MODES = frozenset({"read_only", "write"})
+# but fail-closed to the three explicit modes).
+DISPATCH_MODES = frozenset({"read_only", "write", "autonomous"})
 
 # K02-R1: an oversized terminal-failed record used to abort at the store-record
 # boundary; lease release + reconciliation then rewrote it failed/

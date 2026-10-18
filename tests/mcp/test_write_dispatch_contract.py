@@ -93,7 +93,7 @@ class WriteDispatchContract(unittest.TestCase):
         tools = {t.name: t for t in self.gateway.mcp._tool_manager.list_tools()}
         mode = tools["aee_dispatch"].parameters["properties"]["mode"]
         self.assertEqual(mode.get("type"), "string")
-        self.assertEqual(mode.get("enum"), ["read_only", "write"])
+        self.assertEqual(mode.get("enum"), ["read_only", "write", "autonomous"])
         self.assertEqual(mode.get("default"), "read_only")
 
     def test_dispatch_description_names_both_modes_and_approval(self):
