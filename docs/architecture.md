@@ -8,7 +8,7 @@ projections. See [deployment](deployment.md) and [privacy](security-model.md).
 
 | Component | Source | Contract |
 |---|---|---|
-| Gateway | `mcp_gateway.py` | Restricted five tools on 8791; local/full on 8790 |
+| Gateway | `mcp_gateway.py` | Restricted six tools on 8791; local/full on 8790 |
 | Admission and store | `aee/mcp_runtime/store.py` | One active lease; bounded private JSON; restart handling |
 | Executor and sandbox | `aee/mcp_runtime/executor.py`, `sandbox.py`, `process.py` | Trusted immutable source, stdin task, namespaces, finite output/time/process limits |
 | Result contract | `aee/mcp_runtime/result_contract.py` | Exit zero alone is insufficient; independent completion proof; failures sticky |

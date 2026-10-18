@@ -70,7 +70,7 @@ AEE_MCP_EXPOSED_TOOLS = [t.strip() for t in os.getenv("AEE_MCP_EXPOSED_TOOLS", "
 if AEE_MCP_SURFACE == "restricted":
     configured_tools = os.getenv("AEE_MCP_EXPOSED_TOOLS")
     if configured_tools is not None and set(AEE_MCP_EXPOSED_TOOLS) != RESTRICTED_TOOLS:
-        raise ValueError("Restricted tool allowlist must equal the five-tool contract")
+        raise ValueError("Restricted tool allowlist must equal the six-tool contract")
     if not AEE_MCP_REQUIRE_AUTH:
         raise ValueError("Restricted MCP requires bearer authentication")
 
@@ -103,12 +103,19 @@ A3_CODEX_MAX_OUTPUT_FILE = int(os.getenv("A3_CODEX_MAX_OUTPUT_FILE", "65536"))
 # Dispatch job contract (A2 write-capable dispatch recovery): read_only is
 # the always-available default; write is an explicitly authorized mode with
 # per-job approval, operator-scoped write roots and bounded resources.
-# autonomous adds independent OS-issued capabilities and native process authority.
+# Explicit Secure MCP policy can replace per-job gates for approved transport principals.
 # Agents come from the generic adapter registry (multi-agent recovery work
 # order: codex is an adapter, not the mandatory sole backend).
 from aee.mcp_runtime.store import AGENT_NAMES as A3_ALLOWED_AGENTS, ACTIVE as ACTIVE_STATES
 A3_ALLOWED_MODES = {"read_only", "write", "autonomous"}
 from aee.mcp_runtime.authorization import Authority, authenticated_transport, digest as auth_digest
+from aee.mcp_runtime.trusted_dispatch import (TrustedDispatch, VerifiedSecureMCP,
+    secure_mcp_transport, check_execution, POLICY as TRUSTED_POLICY)
+if 'AEE_TRUSTED_DISPATCH_POLICY' in os.environ and (
+        not AEE_MCP_REQUIRE_AUTH or not AEE_MCP_API_KEY
+        or AEE_MCP_HOST != '127.0.0.1' or AEE_MCP_SURFACE != 'restricted'):
+    raise ValueError('Trusted dispatch requires authenticated restricted loopback Secure MCP')
+
 
 # Write-mode authorization (work order AEE_A2_WRITE_CAPABLE_DISPATCH_CONTRACT_RECOVERY):
 # * AEE_WRITE_ALLOWED_ROOTS: comma-separated realpath roots a write-mode job's
@@ -447,8 +454,10 @@ def discover_agents() -> List[Dict[str, Any]]:
             entry["dispatchable"] = bool(entry["dispatch_modes"])
             entry["autonomous_enabled"] = False
             try:
-                policy = Authority.configured().policy()
-                entry["autonomous_enabled"] = capability["autonomous_supported"] and spec.name in policy['agents']
+                trusted = TrustedDispatch.configured()
+                policy = trusted.policy() if trusted is not None else Authority.configured().policy()
+                entry["autonomous_enabled"] = (policy['enabled'] and capability["autonomous_supported"]
+                                               and spec.name in policy['agents'])
             except _JobError:
                 pass
     return agents
@@ -834,13 +843,12 @@ def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_even
         agent_name = execution["adapter"].get("adapter") or record.get("agent")
         mode = record.get("mode") or "read_only"
         spec, executable = resolve_adapter(agent_name)
-        if mode == "autonomous":
-            Authority.configured().check_start(execution.get('authorization'), spec.name, task, working_directory)
-        elif mode == "write":
+        check_execution(execution.get('authorization'), spec.name, mode, task, working_directory)
+        if mode == "write":
             if spec.write_enforcement == "UNSUPPORTED":
                 raise _JobError("ADAPTER_UNSUPPORTED",
                                 f"agent '{spec.name}' cannot enforce write mode on this host")
-        elif spec.read_only_enforcement == "UNSUPPORTED":
+        elif mode == "read_only" and spec.read_only_enforcement == "UNSUPPORTED":
             raise _JobError("ADAPTER_UNSUPPORTED",
                             f"agent '{spec.name}' cannot enforce read_only on this host")
         snapshot = execution.get('budget') or {
@@ -967,11 +975,9 @@ def dispatch_job(
     job keeps the production broker-mandated contract (read-only; unchanged).
     Every other admitted agent — or codex when Stage-2 approval is absent —
     runs through the generic adapter registry with per-adapter semantics.
-    ``write`` mode adds fail-closed gates on every branch: per-job operator
-    approval (metadata {"approval": ...}), an operator-configured write-root
-    scope, exclusion of AEE-owned operational regions, and an auditable
-    authorization proof recorded in the job record. Authentication and
-    working-directory validation are unchanged.
+    Explicit secure_mcp_trusted_dispatch authorizes approved authenticated
+    transport principals and records admission provenance without per-job tokens.
+    Deployments without that policy retain legacy write/capability gates.
     """
     agent_clean = (agent or "").strip().lower()
     if agent_clean not in A3_ALLOWED_AGENTS:
@@ -992,15 +998,22 @@ def dispatch_job(
         raise _JobError("INVALID_TASK", "task must not be empty")
     if metadata is not None and not isinstance(metadata, dict):
         raise _JobError("INVALID_METADATA", "metadata must be an object when provided")
-    workdir = _validate_working_directory(working_directory, mode_clean)
-    authorization = _validate_write_authorization(mode_clean, metadata, workdir)
+    trusted = TrustedDispatch.configured()
+    if trusted is not None:
+        # Check the authenticated transport before filesystem/CLI probing.
+        trusted.identity(mode_clean, agent_clean)
+    cwd_mode = 'autonomous' if trusted is not None and mode_clean == 'write' else mode_clean
+    workdir = _validate_working_directory(working_directory, cwd_mode)
+    authorization = (trusted.admit(agent_clean, mode_clean, task, workdir) if trusted is not None
+                     else _validate_write_authorization(mode_clean, metadata, workdir))
     if mode_clean == 'autonomous':
         if execution_profile is not None or model is not None or reasoning_effort is not None:
             raise _JobError('INVALID_PROFILE', 'Autonomous uses os-native profile; omit selector fields')
         if not AEE_MCP_REQUIRE_AUTH or AEE_MCP_HOST != '127.0.0.1':
             raise _JobError('AUTONOMOUS_CALLER_UNVERIFIED', 'Authenticated loopback control plane required')
-        Authority.configured().consume((metadata or {}).get('autonomous_approval'),
-                                       agent_clean, task, workdir, consume=False)
+        if trusted is None:
+            Authority.configured().consume((metadata or {}).get('autonomous_approval'),
+                                           agent_clean, task, workdir, consume=False)
 
     policy = deployment_policy()
     approved = policy is not None and deployment_gate_approved(policy)
@@ -1045,11 +1058,15 @@ def dispatch_job(
     if mode_clean == "autonomous":
         if not AEE_MCP_REQUIRE_AUTH or AEE_MCP_HOST != '127.0.0.1':
             raise _JobError('AUTONOMOUS_CALLER_UNVERIFIED', 'Authenticated loopback control plane required')
-        token = (metadata or {}).get('autonomous_approval')
-        authorization = Authority.configured().consume(token, agent_clean, task, workdir)
+        if trusted is None:
+            token = (metadata or {}).get('autonomous_approval')
+            authorization = Authority.configured().consume(token, agent_clean, task, workdir)
         execution['native_profile'] = 'os-native'
     if authorization is not None:
         execution['authorization'] = authorization
+    if trusted is not None:
+        # Fail closed if policy/principal changed while the binary was probed.
+        trusted.check_start(authorization, agent_clean, mode_clean, task, workdir)
     data = JOB_STORE.create(agent_clean, task, workdir, mode_clean, execution=execution)
     try:
         _start_job_worker(data["job_id"], task, workdir, production_codex=production_codex)
@@ -1124,9 +1141,12 @@ async def status_route(request):
         "auth_required": AEE_MCP_REQUIRE_AUTH,
         "allowed_roots": AEE_MCP_ALLOWED_ROOTS,
         "dispatch_modes": sorted(A3_ALLOWED_MODES),
-        "autonomous": {"profile": "os-native", "authorization": "single-job-capability",
+        "autonomous": {"profile": "os-native", "authorization": (TRUSTED_POLICY if TrustedDispatch.configured() is not None
+                                                                         else "single-job-capability"),
                        "mandatory_directory_allowlist": False,
                        "policy_configured": bool(os.getenv('AEE_AUTONOMOUS_POLICY'))},
+        "trusted_dispatch": (TrustedDispatch.configured().status()
+                             if TrustedDispatch.configured() is not None else None),
         "write_scope": {
             "configured": bool(WRITE_ALLOWED_ROOTS),
             "approval_configured": WRITE_APPROVAL_TOKEN is not None,
@@ -1171,6 +1191,8 @@ async def aee_status() -> str:
             "gateway_uptime_seconds": round(time.time() - _START_TIME, 1),
             "localhost_only": AEE_MCP_HOST == "127.0.0.1",
             "auth_required": AEE_MCP_REQUIRE_AUTH,
+            "trusted_dispatch": (TrustedDispatch.configured().status()
+                                 if TrustedDispatch.configured() is not None else None),
         },
     }
     return json.dumps(redact_obj(payload), ensure_ascii=False)
@@ -1238,22 +1260,16 @@ async def aee_dispatch(
       boundary (codex --sandbox read-only; claude --permission-mode plan
       plus restricted safe-mode Read/Glob/Grep tool allowlist and empty MCP).
       Claude plan mode alone does not enforce read-only.
-    * 'write': an explicitly authorized, scoped write job. Requires per-job
-      operator approval — pass metadata {"approval": "<operator-issued
-      token>"} — and an operator-configured write-root scope: the job's
-      working_directory must be inside that scope. Writes are executed by
-      the agent's native write sandbox (codex --sandbox workspace-write;
-      claude --permission-mode acceptEdits). Unauthorized writes, missing
-      approval or out-of-scope working directories are denied (fail
-      closed). The approval proof is fingerprinted into the job record's
-      audit trail; the secret itself is never stored or logged.
-
-    * 'autonomous': OS-native authority under the service account, without
-      per-tool approvals. Requires authenticated transport identity and a
-      short-lived single-job operator capability in metadata.autonomous_approval.
-      Bound to host, OS identity, agent, exact task and cwd; no mandatory root
-      allowlist. The native profile is os-native (omit selector fields).
-      AEE does not add OS privileges. Call aee_agents for actual CLI capabilities.
+    * 'write': native write mode (codex workspace-write; claude acceptEdits).
+      On A2 secure_mcp_trusted_dispatch, the approved authenticated Secure MCP
+      principal needs no per-job approval metadata or token; OS permissions
+      and the native adapter's write boundary apply.
+    * 'autonomous': OS-native service-account authority without per-tool
+      approvals or an AEE directory allowlist. A2 secure_mcp_trusted_dispatch
+      authorizes the approved Secure MCP principal without per-job tokens.
+      Other deployments retain legacy capability gates. The native profile is
+      os-native (omit selector fields). No additional OS privileges are granted.
+      Call aee_agents for installed capabilities and policy qualification.
 
     working_directory is a job parameter: access is decided by the
     executor identity's real OS permissions on that directory, not by a
@@ -1441,13 +1457,19 @@ def _build_auth_middleware(app):
             k.decode("latin-1").lower(): v.decode("latin-1")
             for k, v in scope.get("headers", [])
         }
-        auth = headers.get("authorization", "")
+        auth_fields = [v for k, v in scope.get('headers', []) if k.lower() == b'authorization']
+        auth = headers.get("authorization", "") if len(auth_fields) == 1 else ""
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
         if any(hmac.compare_digest(token.encode(), item.encode()) for item in allowed):
             context_token = authenticated_transport.set(auth_digest(token))
+            secure_token = secure_mcp_transport.set(
+                VerifiedSecureMCP(auth_digest(token))
+                if AEE_MCP_SURFACE == 'restricted' and AEE_MCP_HOST == '127.0.0.1'
+                else None)
             try:
                 await app(scope, receive, send)
             finally:
+                secure_mcp_transport.reset(secure_token)
                 authenticated_transport.reset(context_token)
             return
         resp = JSONResponse(

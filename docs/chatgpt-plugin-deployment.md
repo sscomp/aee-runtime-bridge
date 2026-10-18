@@ -40,7 +40,7 @@ existence checks like `ls <file> || printf 'ABSENT\n'`. See
 [troubleshooting](troubleshooting.md) for the attribution runbook.
 
 Goal: a **private** custom Plugin in the operator's ChatGPT workspace that talks
-MCP over the Secure MCP Tunnel to the restricted five-tool AEE v2 gateway. This
+MCP over the Secure MCP Tunnel to the restricted six-tool AEE v2 gateway. This
 is not public Plugin distribution. Complete the tunnel setup first — see
 [end-to-end tunnel guide](openai-secure-mcp-tunnel.md).
 

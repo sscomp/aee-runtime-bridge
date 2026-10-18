@@ -28,15 +28,15 @@ tunnel-client init --profile aee-restricted --tunnel-id "$AEE_TUNNEL_ID" \
 ```
 
 `init` writes a local profile. Use a private secret manager/service environment
-for `CONTROL_PLANE_API_KEY` and a **different** `AEE_MCP_FORWARD_KEY` equal to the
+for `CONTROL_PLANE_API_KEY` and a **different** `AEE_MCP_FORWARD_AUTH` equal to the
 restricted gateway bearer credential. No literal credential belongs in a profile,
 repo, shell argument or transcript. The forwarding header reference is:
 
 ```bash
 tunnel-client run --profile aee-restricted \
   --control-plane.api-key env:CONTROL_PLANE_API_KEY \
-  --mcp.extra-headers 'Authorization: Bearer env:AEE_MCP_FORWARD_KEY' \
-  --mcp.discovery-extra-headers 'Authorization: Bearer env:AEE_MCP_FORWARD_KEY'
+  --mcp.extra-headers 'Authorization: env:AEE_MCP_FORWARD_AUTH' \
+  --mcp.discovery-extra-headers 'Authorization: env:AEE_MCP_FORWARD_AUTH'
 ```
 
 Check the installed client's secret-reference syntax before use. Keep admin/UI
@@ -55,7 +55,7 @@ static bearer authentication, not an OAuth authorization server; validate the
 selected ChatGPT/tunnel auth mode with the actual account. Stop on an incompatible
 mode instead of disabling authentication.
 
-Confirm the exact five tools, invoke status/discovery, then perform one approved
+Confirm the exact six tools, invoke status/discovery, then perform one approved
 read-only dispatch and poll its result as in [local acceptance](agent-operations.md).
 Require ChatGPT → tunnel → restricted MCP → reviewed Codex → validated job result.
 Check invalid credentials, unavailable `aee_exec`, revoked leases and bounded
@@ -65,3 +65,7 @@ This independent-host/account E2E is **planned Stage 3, not already passed**.
 Tasks/source/results can reach OpenAI; private-network transport is not a promise
 of zero product logging. Review [security/privacy](security-model.md) and the
 operator's data policy before using sensitive source.
+
+For the current A2 deployment, see [trusted dispatch](mcp-runtime-autonomous.md).
+The approved authenticated Secure MCP principal needs no per-job token for
+write/autonomous. Final ChatGPT autonomous E2E remains an independent gate.

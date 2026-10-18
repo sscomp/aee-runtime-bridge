@@ -12,7 +12,7 @@ The Secure MCP Tunnel exposes a running restricted AEE v2 MCP gateway to ChatGPT
 over **outbound HTTPS only**: the `tunnel-client` you run dials OpenAI's control
 plane; no inbound port is opened on the gateway host. ChatGPT sends MCP requests
 through the tunnel; the client forwards them to `127.0.0.1:8791` (restricted
-five-tool surface). Checked against the official guides:
+six-tool surface). Checked against the official guides:
 
 - [Secure MCP tunnels](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 - [Custom MCP servers](https://developers.openai.com/api/docs/guides/custom-mcp-server)

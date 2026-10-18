@@ -369,10 +369,11 @@ def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str
     elif spec.read_only_enforcement == "UNSUPPORTED":
         raise JobError("ADAPTER_UNSUPPORTED",
                        f"agent '{spec.name}' cannot enforce read_only on this host")
-    if mode == 'autonomous':
-        from .authorization import Authority
-        original_cwd = execution['authorization']['working_directory']
-        Authority.configured().check_start(execution['authorization'], spec.name, task, original_cwd)
+    from .trusted_dispatch import check_execution, PROOF
+    authorization = execution.get('authorization') or {}
+    if mode == 'autonomous' or authorization.get('schema') == PROOF:
+        original_cwd = authorization['working_directory']
+        check_execution(authorization, spec.name, mode, task, original_cwd)
     if spec.name == 'claude' and mode == 'read_only':
         verify_claude_readonly_capabilities(executable)
     argv = spec.build_argv(working_directory, executable, mode)
@@ -388,7 +389,7 @@ def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str
                 raise JobError('INVALID_EXECUTION_BUDGET', 'Adapter does not support max_turns')
             argv += ['--max-turns', str(budget.max_turns)]
         def on_start(pid):
-            if mode == 'autonomous':
+            if mode == 'autonomous' or authorization.get('schema') == PROOF:
                 from pathlib import Path
                 lines = Path(f'/proc/{pid}/status').read_text().splitlines()
                 execution['process_identity'] = {'pid': pid, 'launcher': 'process_guard',
@@ -490,7 +491,9 @@ def autonomous_capability(agent):
 
 
 def execute_adapter_job(spec, executable, execution, task, working_directory, **kwargs):
-    if kwargs.get('mode') != 'autonomous':
+    from .trusted_dispatch import PROOF
+    if (kwargs.get('mode') != 'autonomous'
+            and (execution.get('authorization') or {}).get('schema') != PROOF):
         return _execute_adapter_job(spec, executable, execution, task, working_directory, **kwargs)
     fd = os.open(working_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:

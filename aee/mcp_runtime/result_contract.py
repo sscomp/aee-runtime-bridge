@@ -209,7 +209,11 @@ def validate_success(record, *, persisted=True):
             except (TypeError, KeyError, ValueError, AttributeError):
                 pass
             if (not isinstance(authorization, dict)
-                    or authorization.get('schema') != 'aee-autonomous-proof-v1'
+                    or authorization.get('schema') not in {'aee-autonomous-proof-v1', 'aee-secure-mcp-admission-v1'}
+                    or authorization.get('schema') == 'aee-secure-mcp-admission-v1' and (
+                        authorization.get('policy') != 'secure_mcp_trusted_dispatch'
+                        or authorization.get('transport') != 'secure_mcp'
+                        or not authorization.get('principal'))
                     or authorization.get('mode') != 'autonomous'
                     or authorization.get('profile') != 'os-native'
                     or authorization.get('agent') != record.get('agent')

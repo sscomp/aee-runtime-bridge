@@ -104,7 +104,7 @@ deployment.
    `aee-v2-local-gateway`): `ExecStart=.../.venv/bin/python mcp_gateway.py` with
    that EnvironmentFile; do not enable it at boot until the operator decides.
 4. Verify with [agent operations](agent-operations.md): `/health`, MCP
-   `initialize`, `tools/list` (exactly five tools), auth negatives.
+   `initialize`, `tools/list` (exactly six tools), auth negatives.
 
 Without the broker, dispatch **admits and enforces** jobs but a real Codex run
 fails `OUTPUT_LIMIT_EXCEEDED` (SIGXFSZ): codex's own session-state writes exceed
@@ -316,7 +316,7 @@ are two accepted shapes:
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8791/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}'
-# then, with the real bearer: initialize → tools/list (exactly five, no aee_exec)
+# then, with the real bearer: initialize → tools/list (exactly six, no aee_exec)
 # → aee_dispatch (read-only task, allowed root as working_directory; answer-only
 #   or a task that performs one actual read-only exec)
 # → poll aee_job_status to completed → aee_job_result (status completed, exit 0;
