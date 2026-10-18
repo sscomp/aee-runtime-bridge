@@ -27,7 +27,7 @@ from unittest.mock import patch
 from aee.mcp_runtime.store import JobError
 
 ROOT = Path(__file__).resolve().parents[2]
-BASE_COMMIT = "3d95cedfe3ec637f7b665516cacb7c9438a16ff1"
+BASE_COMMIT = "32171273d448bf8be18d7c92f3bee4958f1a5ee9"
 EXPOSED = ["aee_status", "aee_agents", "aee_dispatch",
            "aee_job_status", "aee_job_result", "aee_job_cancel"]
 # Runtime identity fields defined at the base deployment commit must remain.
