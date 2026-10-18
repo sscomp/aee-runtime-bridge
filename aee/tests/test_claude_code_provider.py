@@ -409,11 +409,10 @@ class TestClaudeCodeProviderDrainCompletion(_FakeClaudeMixin, unittest.IsolatedA
         self.addCleanup(release.set)
         try:
             await asyncio.wait_for(entered.wait(), 2)
-            if cancel:
-                await provider.cancel(result.external_run_id)
-            elif timeout:
-                record.timeout_fired = True
-                await provider.cancel(result.external_run_id)
+            cancellation = None
+            if cancel or timeout:
+                record.timeout_fired = timeout
+                cancellation = asyncio.create_task(provider.cancel(result.external_run_id))
             for _ in range(200):
                 if record.proc.returncode is not None:
                     break
@@ -425,8 +424,12 @@ class TestClaudeCodeProviderDrainCompletion(_FakeClaudeMixin, unittest.IsolatedA
                 self.assertFalse(poll.is_terminal)
                 self.assertEqual(poll.status, ExecStatus.RUNNING)
                 self.assertIsNone(poll.exit_code)
+            if cancellation is not None:
+                self.assertFalse(cancellation.done())
             release.set()
             await asyncio.wait_for(record._drain_task, 2)
+            if cancellation is not None:
+                self.assertTrue((await asyncio.wait_for(cancellation, 2)).cancelled)
             poll = await provider.poll(result.external_run_id)
             self.assertTrue(poll.is_terminal)
             self.assertEqual(poll.status, expected_status)
@@ -440,6 +443,19 @@ class TestClaudeCodeProviderDrainCompletion(_FakeClaudeMixin, unittest.IsolatedA
         finally:
             release.set()
             await asyncio.wait_for(record._drain_task, 3)
+
+    async def test_cancellation_cleanup_bound_preserves_reader(self):
+        from types import SimpleNamespace
+        provider = self._make_provider()
+        release = asyncio.Event()
+        drain = asyncio.create_task(release.wait())
+        try:
+            await asyncio.wait_for(provider._settle_output(SimpleNamespace(_drain_task=drain)), 5)
+            self.assertFalse(drain.done())
+            self.assertFalse(drain.cancelled())
+        finally:
+            release.set()
+            await drain
 
     async def test_nonzero_delayed_stderr(self):
         await self._assert_delayed_drain("__FAIL__", ExecStatus.FAILED)

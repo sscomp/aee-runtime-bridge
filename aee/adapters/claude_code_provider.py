@@ -450,6 +450,7 @@ class ClaudeCodeProvider:
         proc = record.proc
         if proc.returncode is not None:
             # Already finished — nothing to do.
+            await self._settle_output(record)
             return ExecCancelResult(
                 external_run_id=external_run_id,
                 cancelled=True,
@@ -458,6 +459,7 @@ class ClaudeCodeProvider:
         try:
             proc.terminate()  # SIGTERM
         except ProcessLookupError:
+            await self._settle_output(record)
             return ExecCancelResult(
                 external_run_id=external_run_id,
                 cancelled=True,
@@ -470,6 +472,7 @@ class ClaudeCodeProvider:
                 record.exit_code = int(proc.returncode)
                 record.finished_at = time.time()
                 record.status = ExecStatus.CANCELLED
+                await self._settle_output(record)
                 return ExecCancelResult(
                     external_run_id=external_run_id,
                     cancelled=True,
@@ -490,11 +493,25 @@ class ClaudeCodeProvider:
         record.finished_at = time.time()
         record.status = ExecStatus.CANCELLED
         record.error = "cancelled by caller (SIGTERM then SIGKILL)"
+        await self._settle_output(record)
         return ExecCancelResult(
             external_run_id=external_run_id,
             cancelled=True,
             reason="cancelled via SIGTERM then SIGKILL",
         )
+
+    async def _settle_output(self, record: _SubprocessRecord) -> None:
+        """Bound cancellation cleanup without cancelling the pipe readers.
+
+        A descendant may retain a pipe after the direct child exits. If it
+        outlives this bound, poll remains nonterminal until EOF arrives.
+        """
+        drain = getattr(record, "_drain_task", None)
+        if drain is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(drain), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
 
     def read_stdout(self, external_run_id: str) -> BinaryIO:
         record = self._require(external_run_id)
