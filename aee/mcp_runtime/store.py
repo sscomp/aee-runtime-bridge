@@ -30,6 +30,12 @@ MAX_TASK_CHARS = 8000
 MAX_SUMMARY_CHARS = 4000
 MAX_LOG_CHARS = 2000
 
+# Single source of truth for admitted executor agents: the P2C gateway
+# dispatch path and aee.mcp_runtime.job_adapters both consult this set.
+# Multi-agent recovery work order: executors are adapters (codex, claude,
+# pi, hermes); none is the mandatory sole backend.
+AGENT_NAMES = frozenset({"codex", "claude", "pi", "hermes"})
+
 # K02-R1: an oversized terminal-failed record used to abort at the store-record
 # boundary; lease release + reconciliation then rewrote it failed/
 # EXECUTION_INTERRUPTED, losing failure attribution. The store-side reducer
@@ -110,6 +116,28 @@ def _validated_store_diagnostics(value):
                 or isinstance(item, str) and len(item) <= 48):
             return None
     return dict(value)
+
+
+def _validated_stream_evidence(value):
+    if not isinstance(value, dict) or value.get('schema') != 'aee-stream-v1':
+        return None
+    result = {k: v for k, v in value.items() if k != 'streams'
+              and isinstance(k, str) and len(k) <= 48
+              and (v is None or type(v) in (int, float, bool) or isinstance(v, str) and len(v) <= 100)}
+    streams = value.get('streams')
+    if not isinstance(streams, dict) or set(streams) - {'stdout', 'stderr'}:
+        return None
+    result['streams'] = {}
+    for name, stream in streams.items():
+        if not isinstance(stream, dict):
+            return None
+        result['streams'][name] = {k: v for k, v in stream.items()
+                                  if k in {'observed_bytes', 'captured_bytes', 'spool_bytes', 'sha256',
+                                           'truncated', 'capture_truncated'}
+                                  and (v is None or type(v) in (int, bool)
+                                       or isinstance(v, str) and len(v) == 64)}
+        result['streams'][name]['tail_omitted'] = True
+    return result
 
 
 def _validated_failure_detail(value):
@@ -265,7 +293,7 @@ def read_job_record(root, job_id):
         data = json.loads(payload, object_pairs_hook=unique_object, parse_constant=invalid_constant)
         if (not isinstance(data, dict) or data.get("job_id") != job_id or
                 data.get("status") not in ACTIVE | TERMINAL or
-                data.get("agent") != "codex" or data.get("mode") != "read_only"):
+                data.get("agent") not in AGENT_NAMES or data.get("mode") != "read_only"):
             raise ValueError("invalid contract")
         for key in ["created_at", "updated_at", "working_directory", "task"]:
             if not isinstance(data.get(key), str):
@@ -314,6 +342,38 @@ def _bounded(data):
                        context=output_limit_context(
                            'store_record_serialize', 'record_json_utf8', 'utf8_bytes',
                            limit=MAX_RECORD_BYTES, observed=record_bytes, measured=True))
+
+
+def compact_adapter_terminal(record, fields):
+    """Fit adapter diagnostics/summary to the existing sealed record ceiling.
+
+    Raw stream fidelity lives in private artifacts. Optional tails and inline
+    summaries may shrink, but measured counters, digests and error attribution
+    survive. Reserve serialization/timestamp overhead before the atomic write.
+    """
+    fields = copy.deepcopy(fields)
+    def fits():
+        return len(json.dumps({**record, **fields}, ensure_ascii=False).encode()) <= MAX_RECORD_BYTES - 512
+    if fits():
+        return fields
+    streaming = (fields.get('execution') or {}).get('streaming')
+    if isinstance(streaming, dict):
+        for stream in streaming.get('streams', {}).values():
+            if isinstance(stream, dict) and 'tail' in stream:
+                stream.pop('tail')
+                stream['tail_omitted'] = True
+    for key in ('log_excerpt', 'summary'):
+        value = fields.get(key)
+        if not isinstance(value, str):
+            continue
+        while not fits() and len(value) > (1 if key == 'summary' else 0):
+            value = value[:len(value) // 2]
+            fields[key] = value
+            if key == 'summary':
+                fields['truncated'] = True
+    if not fits():
+        raise JobError('OUTPUT_LIMIT_EXCEEDED', 'Terminal metadata cannot fit bounded job record')
+    return fields
 
 
 class JobStore:
@@ -480,12 +540,33 @@ class JobStore:
         if any(not isinstance(d.get("owner"), dict) for d in active):
             raise JobError("JOB_STORE_CORRUPT", "Legacy active jobs require an offline migration review")
         for data in active:
+            # Recover bounded spool evidence only for already budget-enabled jobs.
+            # No schema migration or task retry; legacy records stay byte-compatible.
+            if isinstance(data.get('execution'), dict) and data['execution'].get('streaming'):
+                from .spool import SpoolStore
+                spool_root = self._root / 'spool'
+                if spool_root.exists():
+                    spool_store = SpoolStore(spool_root)
+                    try:
+                        def recovered(job_id, metadata):
+                            if job_id == data['job_id']:
+                                data['execution']['streaming'] = self._redact_stream_metadata(metadata)
+                        spool_store.reconcile(86400, recovered)
+                    finally:
+                        spool_store.close()
             # Existing result evidence is preserved; interrupted tasks never retry.
             data.update(status="failed", finished_at=now(), updated_at=now(),
                         error_code="EXECUTION_INTERRUPTED",
                         error="Executor lease disappeared; task was not retried")
             self._write(data)
         return len(active)
+
+    def _redact_stream_metadata(self, metadata):
+        value = copy.deepcopy(metadata)
+        for stream in value.get('streams', {}).values():
+            if isinstance(stream.get('tail'), str):
+                stream['tail'] = self._redact(stream['tail'])
+        return value
 
     def reconcile(self):
         with self._guard():
@@ -524,7 +605,8 @@ class JobStore:
             # original key stays durably named as truncation evidence.
             retained = {}
             for name, validate in (('output_limit_diagnostics', _validated_store_diagnostics),
-                                   ('native_tool_failure', _validated_failure_detail)):
+                                   ('native_tool_failure', _validated_failure_detail),
+                                   ('streaming', _validated_stream_evidence)):
                 if name in keys:
                     value = validate(execution[name])
                     if value is not None:
@@ -555,8 +637,9 @@ class JobStore:
         return f"A3JOB-{datetime.now(timezone.utc):%Y%m%d}-{secrets.token_hex(16)}"
 
     def create(self, agent, task, working_directory, mode, execution=None):
-        if agent != "codex" or mode != "read_only":
-            raise JobError("INVALID_AGENT" if agent != "codex" else "INVALID_MODE", "Unsupported executor contract")
+        if agent not in AGENT_NAMES or mode != "read_only":
+            raise JobError("INVALID_AGENT" if agent not in AGENT_NAMES else "INVALID_MODE",
+                           "Unsupported executor contract")
         if not isinstance(task, str) or not task.strip() or len(task) > MAX_TASK_CHARS:
             raise JobError("INVALID_TASK", "Task must be nonempty and at most 8000 characters")
         try:
@@ -566,7 +649,7 @@ class JobStore:
         with self._guard():
             fd = self._try_lease()
             if fd is None:
-                raise JobError("BUSY", "One Codex job is already active")
+                raise JobError("BUSY", "One job is already active")
             try:
                 self._reconcile_unleased()
                 stamp = now()

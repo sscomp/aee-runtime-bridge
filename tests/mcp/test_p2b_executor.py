@@ -221,8 +221,11 @@ class IsolatedExecutor(unittest.TestCase):
         self.assertTrue(seen)
         for pid in seen:
             path = Path(f"/proc/{pid}/stat")
-            if path.exists():
-                self.assertEqual(path.read_text().rsplit(")", 1)[1].split()[0], "Z")
+            try:
+                state = path.read_text().rsplit(")", 1)[1].split()[0]
+            except FileNotFoundError:
+                continue  # reaped between observation and read is successful cleanup
+            self.assertEqual(state, "Z")
 
 
 if __name__ == "__main__":

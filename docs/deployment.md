@@ -323,3 +323,14 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8791/mcp \
 #   a tool-using result also carries operation_attestation in its evidence)
 # full scripted sequence: see agent-operations.md and the R2/R3 reports
 ```
+
+
+## Generic adapter execution budgets (candidate)
+
+See [the execution budget contract](execution-budget/EXECUTION_BUDGET_CONTRACT.md),
+[streaming/job records](execution-budget/STREAMING_AND_JOB_RECORD_CONTRACT.md), and
+[candidate installation/rollback](execution-budget/RELEASE_AND_ROLLBACK.md).
+These add operator policy and private spools to generic adapters; they do not
+approve or bypass the pinned native broker deployment gate. A local real-CLI
+probe is available as `scripts/probe-adapter-budget.py --help`; it uses host auth,
+requires a new private state directory and never binds or restarts a service.
