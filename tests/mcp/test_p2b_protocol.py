@@ -144,14 +144,21 @@ class HardenedProtocol(unittest.TestCase):
             # adapter path, which rejects production model selectors up front
             # with INVALID_PROFILE (the legacy contract's
             # INVALID_EXECUTION_PROFILE only applies behind an approved gate).
+            # The write-capable dispatch contract publishes mode as a strict
+            # enum in the connector schema, so an out-of-contract mode is
+            # denied at schema validation with the two supported values named.
             for extra, code in [({"agent": "hermes"}, "ADAPTER_UNSUPPORTED"),
-                                ({"mode": "read_write"}, "INVALID_MODE"),
                                 ({"model": "other-model"}, "INVALID_PROFILE"),
                                 ({"reasoning_effort": "--help"}, "INVALID_PROFILE"),
                                 ({"execution_profile": "--sandbox"}, "INVALID_PROFILE")]:
                 args = {"agent": "codex", "task": "fixture", "working_directory": self.source, **extra}
                 _, body = await rpc("tools/call", {"name": "aee_dispatch", "arguments": args})
                 self.assertEqual(self.payload(body)["error_code"], code)
+            _, body = await rpc("tools/call", {"name": "aee_dispatch", "arguments": {
+                "agent": "codex", "task": "fixture", "working_directory": self.source,
+                "mode": "read_write"}})
+            text = body["result"]["content"][0]["text"]
+            self.assertIn("Input should be 'read_only' or 'write'", text)
             self.assertEqual(self.gateway.JOB_STORE.list_ids(), [])
         asyncio.run(self.with_client(checks))
 

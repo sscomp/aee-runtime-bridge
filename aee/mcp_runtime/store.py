@@ -35,6 +35,11 @@ MAX_LOG_CHARS = 2000
 # Multi-agent recovery work order: executors are adapters (codex, claude,
 # pi, hermes); none is the mandatory sole backend.
 AGENT_NAMES = frozenset({"codex", "claude", "pi", "hermes"})
+# Dispatch modes (write-capable dispatch recovery): read_only is the sealed
+# default; write is admitted only when the gateway has already applied its
+# per-job approval + write-scope gates (the store itself stays mode-agnostic
+# but fail-closed to these two).
+DISPATCH_MODES = frozenset({"read_only", "write"})
 
 # K02-R1: an oversized terminal-failed record used to abort at the store-record
 # boundary; lease release + reconciliation then rewrote it failed/
@@ -293,7 +298,7 @@ def read_job_record(root, job_id):
         data = json.loads(payload, object_pairs_hook=unique_object, parse_constant=invalid_constant)
         if (not isinstance(data, dict) or data.get("job_id") != job_id or
                 data.get("status") not in ACTIVE | TERMINAL or
-                data.get("agent") not in AGENT_NAMES or data.get("mode") != "read_only"):
+                data.get("agent") not in AGENT_NAMES or data.get("mode") not in DISPATCH_MODES):
             raise ValueError("invalid contract")
         for key in ["created_at", "updated_at", "working_directory", "task"]:
             if not isinstance(data.get(key), str):
@@ -637,7 +642,7 @@ class JobStore:
         return f"A3JOB-{datetime.now(timezone.utc):%Y%m%d}-{secrets.token_hex(16)}"
 
     def create(self, agent, task, working_directory, mode, execution=None):
-        if agent not in AGENT_NAMES or mode != "read_only":
+        if agent not in AGENT_NAMES or mode not in DISPATCH_MODES:
             raise JobError("INVALID_AGENT" if agent not in AGENT_NAMES else "INVALID_MODE",
                            "Unsupported executor contract")
         if not isinstance(task, str) or not task.strip() or len(task) > MAX_TASK_CHARS:

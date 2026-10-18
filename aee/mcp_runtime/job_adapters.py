@@ -52,8 +52,11 @@ class AdapterSpec:
     version_argv: Tuple[str, ...]  # argv suffix probing the version string
     read_only_enforcement: str     # NATIVE_SANDBOX | TOOL_DENYLIST | UNSUPPORTED
     enforcement_note: str
+    write_enforcement: str = "UNSUPPORTED"   # NATIVE_SANDBOX | UNSUPPORTED
+    write_note: str = "no write-mode argv is implemented for this adapter"
 
-    def build_argv(self, working_directory: str, executable: str) -> List[str]:
+    def build_argv(self, working_directory: str, executable: str,
+                   mode: str = "read_only") -> List[str]:
         raise NotImplementedError
 
 
@@ -82,14 +85,21 @@ class _CodexAdapter(AdapterSpec):
             enforcement_note=(
                 "codex exec --sandbox read-only: model-run commands confined "
                 "to filesystem read-only via the codex native sandbox"),
+            write_enforcement="NATIVE_SANDBOX",
+            write_note=(
+                "codex exec --sandbox workspace-write: writes confined to the "
+                "job working directory and /tmp by the codex native sandbox; "
+                "network access stays disabled by default"),
         )
 
-    def build_argv(self, working_directory: str, executable: str) -> List[str]:
+    def build_argv(self, working_directory: str, executable: str,
+                   mode: str = "read_only") -> List[str]:
         # `-` reads the task from stdin instead of argv. --ephemeral keeps
         # session files off disk; --json yields the parsed event stream the
         # gateway already understands.
+        sandbox = "workspace-write" if mode == "write" else "read-only"
         return [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
-                "--sandbox", "read-only", "--cd", working_directory, "-"]
+                "--sandbox", sandbox, "--cd", working_directory, "-"]
 
 
 @_spec
@@ -104,9 +114,16 @@ class _ClaudeAdapter(AdapterSpec):
             enforcement_note=(
                 "claude -p --permission-mode plan: edit/write tools are denied "
                 "and bash is restricted to read-only analysis by plan mode"),
+            write_enforcement="NATIVE_SANDBOX",
+            write_note=(
+                "claude -p --permission-mode acceptEdits (headless): file "
+                "edits inside the working directory are auto-accepted; every "
+                "tool that would need an interactive prompt (e.g. Bash) is "
+                "denied in non-interactive mode"),
         )
 
-    def build_argv(self, working_directory: str, executable: str) -> List[str]:
+    def build_argv(self, working_directory: str, executable: str,
+                   mode: str = "read_only") -> List[str]:
         # Task arrives on stdin (no positional prompt) so it is never in argv.
         # `--output-format json` alone emits one final result JSON object;
         # adding `--verbose` streams the whole event array instead and its
@@ -114,7 +131,8 @@ class _ClaudeAdapter(AdapterSpec):
         # long before the final result arrives. The
         # single-object shape still carries result/usage/is_error, and the
         # parser below keeps accepting both shapes for forward compatibility.
-        return [executable, "-p", "--no-session-persistence", "--permission-mode", "plan",
+        return [executable, "-p", "--no-session-persistence",
+                "--permission-mode", "acceptEdits" if mode == "write" else "plan",
                 "--output-format", "json"]
 
     @staticmethod
@@ -169,9 +187,15 @@ class _PiAdapter(AdapterSpec):
             enforcement_note=(
                 "pi -p --tools read --no-mcp --no-extensions: bash/edit/write and MCP tools disabled, "
                 "only the read tool is available in the non-interactive run"),
+            write_enforcement="UNSUPPORTED",
+            write_note=(
+                "pi has no verifiable write-scope confinement in its "
+                "non-interactive vocabulary on this host; write dispatch is "
+                "refused rather than simulated"),
         )
 
-    def build_argv(self, working_directory: str, executable: str) -> List[str]:
+    def build_argv(self, working_directory: str, executable: str,
+                   mode: str = "read_only") -> List[str]:
         return [executable, "-p", "--no-session", "--mode", "json",
                 "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
                 "--no-approve", "--tools", "read"]
@@ -236,20 +260,29 @@ def adapter_identity(agent: str) -> Dict[str, object]:
             "executable_sha256": _sha256(executable),
             "version": _probe_version(spec, executable),
             "read_only_enforcement": spec.read_only_enforcement,
-            "enforcement_note": spec.enforcement_note}
+            "enforcement_note": spec.enforcement_note,
+            "write_enforcement": spec.write_enforcement,
+            "write_note": spec.write_note}
 
 
-def refuse_unsupported(agent: str) -> None:
-    """Fail-closed admission for adapters that cannot enforce read-only.
+def refuse_unsupported(agent: str, mode: str = "read_only") -> None:
+    """Fail-closed admission for adapters that cannot enforce the requested mode.
 
-    Registry-only check (no binary resolution): an UNSUPPORTED adapter is
-    refused whether or not its CLI happens to be installed.
+    Registry-only check (no binary resolution): an adapter that cannot
+    enforce the requested mode honestly is refused whether or not its CLI
+    happens to be installed.
     """
     spec = _ADAPTERS.get((agent or "").strip().lower())
     if spec is None:
         raise JobError("INVALID_AGENT",
                        f"agent '{agent[:60]}' is not a registered adapter; "
                        f"supported adapters: {', '.join(sorted(AGENT_NAMES))}")
+    if mode == "write":
+        if spec.write_enforcement == "UNSUPPORTED":
+            raise JobError("ADAPTER_UNSUPPORTED",
+                           f"agent '{spec.name}' cannot enforce write mode on this "
+                           "host; dispatch refused")
+        return
     if spec.read_only_enforcement == "UNSUPPORTED":
         raise JobError("ADAPTER_UNSUPPORTED",
                        f"agent '{spec.name}' cannot enforce read_only on this "
@@ -287,7 +320,8 @@ def _probe_version(spec: AdapterSpec, executable: str) -> str:
 
 def execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str, object],
                         task: str, working_directory: str, *, limits: Limits,
-                        cancel_event=None, budget=None, spool=None, redact=lambda x: x) -> Dict[str, object]:
+                        cancel_event=None, budget=None, spool=None, redact=lambda x: x,
+                        mode: str = "read_only") -> Dict[str, object]:
     """Run one bounded adapter job; returns summary/log excerpt evidence.
 
     Mirrors the codex worker's semantics: the child process group is
@@ -305,10 +339,14 @@ def execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str,
     env = {key: value for key, value in os.environ.items()
            if key not in {"PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "MCP_BRIDGE_API_KEY",
                           "AEE_BROKER_CONTROL", "AEE_RUNTIME_MANIFEST"}}
-    if spec.read_only_enforcement == "UNSUPPORTED":
+    if mode == "write":
+        if spec.write_enforcement == "UNSUPPORTED":
+            raise JobError("ADAPTER_UNSUPPORTED",
+                           f"agent '{spec.name}' cannot enforce write mode on this host")
+    elif spec.read_only_enforcement == "UNSUPPORTED":
         raise JobError("ADAPTER_UNSUPPORTED",
                        f"agent '{spec.name}' cannot enforce read_only on this host")
-    argv = spec.build_argv(working_directory, executable)
+    argv = spec.build_argv(working_directory, executable, mode)
     if budget is not None:
         if spool is None:
             raise JobError('SPOOL_BOUNDARY', 'Durable spool required for budget execution')
