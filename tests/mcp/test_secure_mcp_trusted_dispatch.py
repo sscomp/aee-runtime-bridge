@@ -116,6 +116,27 @@ class TrustedSecurity(unittest.TestCase):
         os.environ['AEE_TRUSTED_DISPATCH_POLICY']=''
         self.denied('TRUSTED_DISPATCH_NOT_CONFIGURED',self.dispatch)
 
+    def test_trusted_native_write_sandbox_keeps_canonical_workspace(self):
+        import hashlib
+        from types import SimpleNamespace
+        from pathlib import Path
+        from aee.mcp_runtime.job_adapters import execute_adapter_job, adapter_specs
+        from aee.mcp_runtime.budget import ExecutionBudget
+        from aee.mcp_runtime.process import Limits
+        spec=adapter_specs()['codex'];executable='/usr/bin/true'
+        execution={'adapter':{'executable':executable,
+                   'executable_sha256':hashlib.sha256(Path(executable).read_bytes()).hexdigest()},
+                   'authorization':self.authority.admit('codex','write','fixture task',str(self.cwd))}
+        def streamed(argv,**kwargs):
+            self.assertEqual(argv[argv.index('--sandbox')+1],'workspace-write')
+            self.assertEqual(argv[argv.index('--cd')+1],str(self.cwd))
+            self.assertTrue(kwargs['cwd'].startswith('/proc/'))
+            return SimpleNamespace(returncode=0,final='fixture',streaming={'streams':{'stderr':{'tail':''}}})
+        with patch('aee.mcp_runtime.job_adapters.run_streamed',side_effect=streamed) as run:
+            execute_adapter_job(spec,executable,execution,'fixture task',str(self.cwd),
+                mode='write',limits=Limits(),cancel_event=None,budget=ExecutionBudget(),spool=object())
+            run.assert_called_once()
+
     def test_missing_proof_rejected_for_every_trusted_worker_mode(self):
         for mode in ['read_only','write','autonomous']:
             self.denied('TRUSTED_DISPATCH_PROOF_INVALID',check_execution,

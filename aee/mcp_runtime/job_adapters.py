@@ -376,7 +376,14 @@ def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str
         check_execution(authorization, spec.name, mode, task, original_cwd)
     if spec.name == 'claude' and mode == 'read_only':
         verify_claude_readonly_capabilities(executable)
-    argv = spec.build_argv(working_directory, executable, mode)
+    # Native sandbox roots must use the canonical workspace path. A /proc fd
+    # alias is suitable for Popen's pinned cwd, but Codex file tools reject it
+    # as outside the workspace-write project. Autonomous keeps its native '.'
+    # mapping; trusted read/write retain their original sandbox root semantics.
+    native_workdir = (authorization['working_directory']
+                      if authorization.get('schema') == PROOF and mode != 'autonomous'
+                      else working_directory)
+    argv = spec.build_argv(native_workdir, executable, mode)
     if budget is not None:
         if spool is None:
             raise JobError('SPOOL_BOUNDARY', 'Durable spool required for budget execution')
