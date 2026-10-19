@@ -13,6 +13,11 @@
 .env
 .env.*
 !.env.example
+# Live operator secret-env files (e.g. shadow.env / a2-tunnel shadow envs).
+# Narrow names only: *.env / *.env.* examples and templates stay trackable.
+shadow.env
+shadow.env.*
+*.shadow.env
 .api_keys.vault.json
 **/.api_keys.vault.json
 CREDENTIALS.txt

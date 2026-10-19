@@ -17,7 +17,7 @@ curl --fail --silent --show-error http://127.0.0.1:8791/health
 echo "Bearer $MCP_BRIDGE_API_KEY"; : # bearer for the checks below
 ```
 
-MCP handshake, tools list (expected: exactly the restricted five), auth
+MCP handshake, tools list (expected: exactly the restricted six), auth
 negatives and completed-dispatch checks are scripted in
 [agent operations](agent-operations.md). Local/full `aee_exec` lives on port
 8790 and is intentionally not exposed through the restricted surface.
@@ -82,7 +82,11 @@ or command output.
 
 For stop/disable/removal sequences by route, start at
 [troubleshooting](troubleshooting.md); the tunnel/Plugin rollback order is in
-[end-to-end tunnel guide](openai-secure-mcp-tunnel.md) §5.
+[end-to-end tunnel guide](openai-secure-mcp-tunnel.md) §5, and the clean
+uninstall/reinstall migration plan (A3-era and Abacus profiles, with backup
+and persistent-data boundaries) is [here](a2-uninstall-reinstall-migration.md).
+For the A2 trusted-dispatch install and its acceptance gates, use
+[a2-secure-mcp-deploy-verify](a2-secure-mcp-deploy-verify.md).
 
 ## Legacy bridge cutover (aee-bridge / a2-aee-tracker)
 

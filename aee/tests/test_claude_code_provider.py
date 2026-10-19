@@ -386,6 +386,90 @@ class TestClaudeCodeProviderFailure(_FakeClaudeMixin, unittest.IsolatedAsyncioTe
         self.assertIn("already exited", cancel_result.reason)
 
 
+class TestClaudeCodeProviderDrainCompletion(_FakeClaudeMixin, unittest.IsolatedAsyncioTestCase):
+    """Completion includes stream EOF; process exit alone is insufficient."""
+
+    async def _assert_delayed_drain(self, prompt, expected_status, *, cancel=False,
+                                    timeout=False, empty=False):
+        provider = self._make_provider()
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        original = provider._drain_one
+
+        async def delayed(record, stream, *, is_err):
+            if is_err:
+                entered.set()
+                await release.wait()
+            await original(record, stream, is_err=is_err)
+
+        provider._drain_one = delayed
+        result = await provider.submit(prompt=prompt, cwd=self.cwd)
+        record = provider._runs[result.external_run_id]
+        # Release first during cleanup even when an assertion fails.
+        self.addCleanup(release.set)
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            cancellation = None
+            if cancel or timeout:
+                record.timeout_fired = timeout
+                cancellation = asyncio.create_task(provider.cancel(result.external_run_id))
+            for _ in range(200):
+                if record.proc.returncode is not None:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIsNotNone(record.proc.returncode)
+            # Repeated polling cannot turn process exit into premature EOF.
+            for _ in range(3):
+                poll = await asyncio.wait_for(provider.poll(result.external_run_id), 0.5)
+                self.assertFalse(poll.is_terminal)
+                self.assertEqual(poll.status, ExecStatus.RUNNING)
+                self.assertIsNone(poll.exit_code)
+            if cancellation is not None:
+                self.assertFalse(cancellation.done())
+            release.set()
+            await asyncio.wait_for(record._drain_task, 2)
+            if cancellation is not None:
+                self.assertTrue((await asyncio.wait_for(cancellation, 2)).cancelled)
+            poll = await provider.poll(result.external_run_id)
+            self.assertTrue(poll.is_terminal)
+            self.assertEqual(poll.status, expected_status)
+            stderr = provider.read_stderr(result.external_run_id).read()
+            self.assertEqual(poll.stderr_bytes, len(stderr))
+            if empty:
+                self.assertEqual(stderr, b"")
+            if prompt == "__FAIL__":
+                self.assertEqual(poll.exit_code, 1)
+                self.assertIn(b"synthetic failure", stderr)
+        finally:
+            release.set()
+            await asyncio.wait_for(record._drain_task, 3)
+
+    async def test_cancellation_cleanup_bound_preserves_reader(self):
+        from types import SimpleNamespace
+        provider = self._make_provider()
+        release = asyncio.Event()
+        drain = asyncio.create_task(release.wait())
+        try:
+            await asyncio.wait_for(provider._settle_output(SimpleNamespace(_drain_task=drain)), 5)
+            self.assertFalse(drain.done())
+            self.assertFalse(drain.cancelled())
+        finally:
+            release.set()
+            await drain
+
+    async def test_nonzero_delayed_stderr(self):
+        await self._assert_delayed_drain("__FAIL__", ExecStatus.FAILED)
+
+    async def test_success_empty_stderr(self):
+        await self._assert_delayed_drain("ok", ExecStatus.EXITED, empty=True)
+
+    async def test_cancel_waits_for_stream_eof(self):
+        await self._assert_delayed_drain("__HANG__", ExecStatus.CANCELLED, cancel=True)
+
+    async def test_timeout_waits_for_stream_eof(self):
+        await self._assert_delayed_drain("__HANG__", ExecStatus.TIMED_OUT, timeout=True)
+
+
 class TestClaudeCodeProviderEnvFilter(_FakeClaudeMixin, unittest.TestCase):
     """Group D — env var allow-list filtering."""
 

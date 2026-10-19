@@ -5,7 +5,7 @@
 `127.0.0.1:8790/mcp` is local/full; `127.0.0.1:8791/mcp` is restricted remote-facing
 through the private tunnel. Both are private loopback services. Candidate port 8791
 forces the restricted surface, requires bearer auth, and rejects an explicitly empty
-or expanded tool allowlist. Its fixed five-tool list/call guard excludes `aee_exec`,
+or expanded tool allowlist. Its fixed six-tool list/call guard excludes `aee_exec`,
 including future registrations. The current published protocol and bootstrap
 regressions enforce this boundary; publication is not a live service upgrade.
 

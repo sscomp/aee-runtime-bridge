@@ -57,20 +57,31 @@ def resolve_executor(configured):
     return identity
 
 
-def require_deployment_ready(policy):
+def deployment_gate_approved(policy):
+    """Pure predicate: has this manifest passed the reviewed deployment gate?
+
+    Never executes containment verification and raises nothing; the
+    gateway startup path uses it to decouple basic startup (and generic
+    adapter dispatch) from Stage-2 certification, while the approved
+    broker-mandated codex path keeps calling require_deployment_ready().
+    """
     identity = policy.get('codex', {})
-    if (policy.get('native_provider_compatibility') != 'VERIFIED'
-            or policy.get('native_tool_runtime_compatibility') != 'VERIFIED'
-            or policy.get('resource_containment') != 'VERIFIED'
-            or policy.get('resource_policy_revision') != resource_record()
-            or policy.get('sandbox_policy_revision') != sandbox_record()
-            or policy.get('job_failure_semantics') != 'VERIFIED'
-            or policy.get('job_failure_contract') != FAILURE_REVISION
-            or policy.get('deployment_status') != 'APPROVED_STAGE2'
-            or not policy.get('operator_approval_id')
-            or policy.get('provider_contract') != contract_record()
-            or not matches_reviewed_executor(identity.get('version'), identity.get('sha256'),
-                                             identity.get('code_mode_host', {}).get('sha256'))):
+    return (policy.get('native_provider_compatibility') == 'VERIFIED'
+            and policy.get('native_tool_runtime_compatibility') == 'VERIFIED'
+            and policy.get('resource_containment') == 'VERIFIED'
+            and policy.get('resource_policy_revision') == resource_record()
+            and policy.get('sandbox_policy_revision') == sandbox_record()
+            and policy.get('job_failure_semantics') == 'VERIFIED'
+            and policy.get('job_failure_contract') == FAILURE_REVISION
+            and policy.get('deployment_status') == 'APPROVED_STAGE2'
+            and bool(policy.get('operator_approval_id'))
+            and policy.get('provider_contract') == contract_record()
+            and matches_reviewed_executor(identity.get('version'), identity.get('sha256'),
+                                          identity.get('code_mode_host', {}).get('sha256')))
+
+
+def require_deployment_ready(policy):
+    if not deployment_gate_approved(policy):
         raise JobError('DEPLOYMENT_GATE_CLOSED', 'Candidate has not passed the reviewed deployment gate')
     verify_current_containment()
 

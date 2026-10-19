@@ -5,6 +5,10 @@ chat, Master Plan or local reports. Detect the host and stop on conflicts before
 requesting operator authorization for provisioning, inference or tunnel linkage.
 Offline tests/builds are safe preparation; production installation is separate.
 
+For the current A2 Secure MCP deployment, [trusted dispatch](mcp-runtime-autonomous.md)
+specifies qualified multi-agent execution without per-job tokens. The older
+manifest/broker qualification below applies to deployments using that contract.
+
 ## Local acceptance after an approved installation
 
 1. Check `/health` with the deployment command. Inspect its body privately and
@@ -13,7 +17,7 @@ Offline tests/builds are safe preparation; production installation is separate.
 2. Use an MCP SDK/Inspector HTTP client to `http://127.0.0.1:8791/mcp`, with the
    dedicated `Authorization` bearer credential supplied privately. Initialize a
    session, send `notifications/initialized`, and call `tools/list`. Require exactly
-   `aee_status`, `aee_agents`, `aee_dispatch`, `aee_job_status`, `aee_job_result`.
+   `aee_status`, `aee_agents`, `aee_dispatch`, `aee_job_status`, `aee_job_result`, `aee_job_cancel`.
    Missing/invalid credentials must fail 401; `aee_exec` must be unavailable.
 3. Call `aee_status` and `aee_agents`. Codex identity must match the reviewed
    manifest. Hermes/Claude discovery is informational; neither is a restricted

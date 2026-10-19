@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "defaults": {
+    "wall_timeout_seconds": 3600,
+    "idle_timeout_seconds": null,
+    "memory_capture_bytes": 65536,
+    "spool_max_bytes_per_stream": 67108864,
+    "spool_max_bytes_per_job": 100663296,
+    "spool_max_bytes_total": 536870912,
+    "result_inline_bytes": 16384,
+    "log_excerpt_bytes": 2000,
+    "retention_seconds": 86400,
+    "max_concurrent_jobs": 1,
+    "on_spool_full": "fail",
+    "parser_mode": "structured-v1"
+  },
+  "adapters": {
+    "claude": {"max_turns": null, "wall_timeout_seconds": 7200},
+    "codex": {"wall_timeout_seconds": 7200},
+    "pi": {"wall_timeout_seconds": 3600}
+  }
+}

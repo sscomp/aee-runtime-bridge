@@ -104,7 +104,7 @@ deployment.
    `aee-v2-local-gateway`): `ExecStart=.../.venv/bin/python mcp_gateway.py` with
    that EnvironmentFile; do not enable it at boot until the operator decides.
 4. Verify with [agent operations](agent-operations.md): `/health`, MCP
-   `initialize`, `tools/list` (exactly five tools), auth negatives.
+   `initialize`, `tools/list` (exactly six tools), auth negatives.
 
 Without the broker, dispatch **admits and enforces** jobs but a real Codex run
 fails `OUTPUT_LIMIT_EXCEEDED` (SIGXFSZ): codex's own session-state writes exceed
@@ -243,6 +243,18 @@ An auth/config/gate failure is a stop condition. Validate MCP using
 [agent operations](agent-operations.md), then connect [ChatGPT](chatgpt-mcp.md).
 See [rollback](troubleshooting.md) before enabling services at boot.
 
+### 4.A2. Secure MCP trusted dispatch (A2 enhancement)
+
+To authorize approved Secure MCP principals for `write`/`autonomous` dispatch
+without per-job tokens, provision the private trusted-dispatch policy and its
+env entry, then run the A2 acceptance-gate table: the dedicated
+[A2 deploy and verification guide](a2-secure-mcp-deploy-verify.md) covers
+policy shape, the startup refusal contract, gates G1–G8, and the sanitized
+[ChatGPT connector runbook](chatgpt-secure-mcp-setup-runbook.md) covers
+connector wiring and rotation. A clean uninstall/reinstall/migration plan —
+including persistent-data boundaries and rollback — is maintained separately
+([migration plan](a2-uninstall-reinstall-migration.md)).
+
 ## 4a. Model credential presentation on modern systemd (verified pattern)
 
 `aee-p2c-broker.service` ships `LoadCredential=openai-api-key:/etc/aee/secrets/openai-api-key`.
@@ -316,10 +328,21 @@ are two accepted shapes:
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8791/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}'
-# then, with the real bearer: initialize → tools/list (exactly five, no aee_exec)
+# then, with the real bearer: initialize → tools/list (exactly six, no aee_exec)
 # → aee_dispatch (read-only task, allowed root as working_directory; answer-only
 #   or a task that performs one actual read-only exec)
 # → poll aee_job_status to completed → aee_job_result (status completed, exit 0;
 #   a tool-using result also carries operation_attestation in its evidence)
 # full scripted sequence: see agent-operations.md and the R2/R3 reports
 ```
+
+
+## Generic adapter execution budgets (candidate)
+
+See [the execution budget contract](execution-budget/EXECUTION_BUDGET_CONTRACT.md),
+[streaming/job records](execution-budget/STREAMING_AND_JOB_RECORD_CONTRACT.md), and
+[candidate installation/rollback](execution-budget/RELEASE_AND_ROLLBACK.md).
+These add operator policy and private spools to generic adapters; they do not
+approve or bypass the pinned native broker deployment gate. A local real-CLI
+probe is available as `scripts/probe-adapter-budget.py --help`; it uses host auth,
+requires a new private state directory and never binds or restarts a service.

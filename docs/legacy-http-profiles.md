@@ -63,7 +63,7 @@ DB. Operator-supplied commands and credentials remain separate.
 ## Endpoints
 
 These are legacy `app.py` HTTP endpoints (default loopback port 8787), separate
-from the five-tool restricted MCP gateway:
+from the six-tool restricted MCP gateway:
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|

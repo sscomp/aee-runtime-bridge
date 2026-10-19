@@ -9,9 +9,14 @@ approval or real inference is implied by the offline fixture test path.
 from __future__ import annotations
 
 import asyncio
+import grp
+import hashlib
+import hmac
 import json
 import logging
 import os
+import platform
+import pwd
 import re
 import shlex
 import shutil
@@ -22,7 +27,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 # ---------------------------------------------------------------------------
 # Config (env-driven; no hardcoded secrets)
@@ -54,7 +59,7 @@ try:
 except Exception:
     AEE_PRODUCT_VERSION = "unknown"
 
-RESTRICTED_TOOLS = frozenset({"aee_status", "aee_agents", "aee_dispatch",
+RESTRICTED_TOOLS = frozenset({"aee_status", "aee_agents", "aee_dispatch", "aee_job_cancel",
                               "aee_job_status", "aee_job_result"})
 AEE_MCP_SURFACE = os.getenv("AEE_MCP_SURFACE", "restricted" if AEE_MCP_PORT == 8791 else "local")
 if AEE_MCP_SURFACE not in {"local", "restricted"}:
@@ -65,7 +70,7 @@ AEE_MCP_EXPOSED_TOOLS = [t.strip() for t in os.getenv("AEE_MCP_EXPOSED_TOOLS", "
 if AEE_MCP_SURFACE == "restricted":
     configured_tools = os.getenv("AEE_MCP_EXPOSED_TOOLS")
     if configured_tools is not None and set(AEE_MCP_EXPOSED_TOOLS) != RESTRICTED_TOOLS:
-        raise ValueError("Restricted tool allowlist must equal the five-tool contract")
+        raise ValueError("Restricted tool allowlist must equal the six-tool contract")
     if not AEE_MCP_REQUIRE_AUTH:
         raise ValueError("Restricted MCP requires bearer authentication")
 
@@ -84,18 +89,9 @@ A3_JOB_STORE_DIR = Path(os.getenv(
 # ONLY (work order A3 §Working Directory Security). Comma-separated roots.
 A3_DISPATCH_ALLOWED_ROOTS: List[str] = [
     p.strip()
-    for p in os.getenv(
-        "A3_DISPATCH_ALLOWED_ROOTS", str(Path(__file__).resolve().parent)
-    ).split(",")
+    for p in os.getenv("A3_DISPATCH_ALLOWED_ROOTS", "").split(",")
     if p.strip()
 ]
-
-# Directories that are NEVER valid as (or inside) a working directory,
-# even if they live under an allowed root.
-A3_DISPATCH_FORBIDDEN_PATH_RE = re.compile(
-    r"(?i)(/\.git(/|$)|/\.ssh(/|$)|/\.hermes(/|$)|/\.aws(/|$)|/\.gnupg(/|$)"
-    r"|/\.cache/claude|/\.codex/sessions|/\.config/chromium|credential)"
-)
 
 # Codex job hard limits.
 A3_CODEX_BIN = os.getenv("A3_CODEX_BIN", "codex")
@@ -104,9 +100,50 @@ A3_CODEX_MAX_SUMMARY = int(os.getenv("A3_CODEX_MAX_SUMMARY", "4000"))    # chars
 A3_CODEX_MAX_LOG = int(os.getenv("A3_CODEX_MAX_LOG", "2000"))           # chars
 A3_CODEX_MAX_OUTPUT_FILE = int(os.getenv("A3_CODEX_MAX_OUTPUT_FILE", "65536"))
 
-# Bootstrap job contract: read-only Codex only.
-A3_ALLOWED_AGENTS = {"codex"}
-A3_ALLOWED_MODES = {"read_only"}
+# Dispatch job contract (A2 write-capable dispatch recovery): read_only is
+# the always-available default; write is an explicitly authorized mode with
+# per-job approval, operator-scoped write roots and bounded resources.
+# Explicit Secure MCP policy can replace per-job gates for approved transport principals.
+# Agents come from the generic adapter registry (multi-agent recovery work
+# order: codex is an adapter, not the mandatory sole backend).
+from aee.mcp_runtime.store import AGENT_NAMES as A3_ALLOWED_AGENTS, ACTIVE as ACTIVE_STATES
+A3_ALLOWED_MODES = {"read_only", "write", "autonomous"}
+from aee.mcp_runtime.authorization import Authority, authenticated_transport, digest as auth_digest
+from aee.mcp_runtime.trusted_dispatch import (TrustedDispatch, VerifiedSecureMCP,
+    secure_mcp_transport, check_execution, POLICY as TRUSTED_POLICY)
+if 'AEE_TRUSTED_DISPATCH_POLICY' in os.environ and (
+        not AEE_MCP_REQUIRE_AUTH or not AEE_MCP_API_KEY
+        or AEE_MCP_HOST != '127.0.0.1' or AEE_MCP_SURFACE != 'restricted'):
+    raise ValueError('Trusted dispatch requires authenticated restricted loopback Secure MCP')
+
+
+# Write-mode authorization (work order AEE_A2_WRITE_CAPABLE_DISPATCH_CONTRACT_RECOVERY):
+# * AEE_WRITE_ALLOWED_ROOTS: comma-separated realpath roots a write-mode job's
+#   working_directory MUST be inside. Unset/empty fails write dispatch closed
+#   (WRITE_SCOPE_NOT_CONFIGURED) — write mode is never silently blanket-enabled.
+# * AEE_WRITE_APPROVAL_TOKEN: operator-secret (0600 env file) every write job
+#   must present via metadata {"approval": ...}. Unset fails write dispatch
+#   closed (WRITE_MODE_NOT_CONFIGURED).
+_WRITE_ROOTS_ENV = os.getenv("AEE_WRITE_ALLOWED_ROOTS", "")
+WRITE_ALLOWED_ROOTS: List[str] = [
+    p for p in (Path(r.strip()).expanduser() for r in _WRITE_ROOTS_ENV.split(",") if r.strip())
+]
+_WRITE_TOKEN_ENV = os.getenv("AEE_WRITE_APPROVAL_TOKEN", "").encode()
+WRITE_APPROVAL_TOKEN = _WRITE_TOKEN_ENV or None
+
+# A2 dispatch hard-denylist: never admit write-mode jobs whose working
+# directory sits inside an AEE-owned operational region (source releases,
+# job store, shadow runtime, gateway/tunnel credentials can never be the
+# working directory of a dispatched agent).
+_WRITE_FORBIDDEN_ROOTS = [
+    Path.home() / "aee" / "releases",
+    Path.home() / "aee" / "state",
+    Path.home() / "aee" / "shadow",
+    Path.home() / ".config" / "aee",
+    Path.home() / ".config" / "aee-a2-tunnel",
+    Path.home() / ".local" / "state" / "aee",
+    Path.home() / ".local" / "state" / "aee-p2b-jobs",
+]
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -116,7 +153,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-log = logging.getLogger("aee-a3-mcp-gateway")
+log = logging.getLogger("aee-mcp-gateway")
 
 _START_TIME = time.time()
 
@@ -127,6 +164,7 @@ _START_TIME = time.time()
 # Credential-shaped values are redacted from every tool output.
 _SECRET_VALUE_RE = re.compile(
     r"("
+    r"aee-aut1\.[A-Za-z0-9_-]{43}|"
     r"sk-[A-Za-z0-9_\-]{8,}"                       # OpenAI-style keys
     r"|gh[pousr]_[A-Za-z0-9]{20,}"                 # GitHub tokens
     r"|xox[baprs]-[A-Za-z0-9\-]+"                  # Slack tokens
@@ -266,6 +304,51 @@ def _host_boot_time() -> Optional[str]:
     return datetime.fromtimestamp(time.time() - up, tz=timezone.utc).isoformat()
 
 
+def _os_platform() -> Dict[str, Any]:
+    """OS-native platform identity (Linux + macOS; no hardcoded hosts)."""
+    info: Dict[str, Any] = {
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+    }
+    distro: Optional[str] = None
+    if info["system"] == "Darwin":
+        mac = platform.mac_ver()[0]
+        distro = f"macOS {mac}" if mac else "macOS"
+    else:
+        try:  # Linux: /etc/os-release (freedesktop API), absent on macOS
+            distro = platform.freedesktop_os_release().get("PRETTY_NAME")
+        except (OSError, AttributeError, ValueError):
+            pass
+    info["distro"] = distro
+    return info
+
+
+def _execution_identity() -> Dict[str, Any]:
+    """OS-native execution identity of this gateway process (uid/gid)."""
+    uid, euid = os.getuid(), os.geteuid()
+    gid, egid = os.getgid(), os.getegid()
+    username: Optional[str] = None
+    try:
+        username = pwd.getpwuid(euid).pw_name
+    except (KeyError, OSError):
+        pass
+    groups: List[str] = []
+    try:
+        gids = os.getgroups()
+    except (OSError, KeyError):
+        gids = [egid]
+    for _gid in gids:
+        try:
+            groups.append(grp.getgrgid(_gid).gr_name)
+        except (KeyError, OSError):
+            groups.append(str(_gid))
+    return {
+        "username": username, "uid": uid, "gid": gid,
+        "effective_uid": euid, "effective_gid": egid, "groups": sorted(groups),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Agent discovery (read-only; never mutates agent config)
 # ---------------------------------------------------------------------------
@@ -279,6 +362,10 @@ _AGENT_COMMANDS: Dict[str, List[str]] = {
     "claude": [
         "claude",
         str(Path.home() / ".local/bin/claude"),
+    ],
+    "pi": [
+        "pi",
+        str(Path.home() / ".local/bin/pi"),
     ],
 }
 
@@ -340,7 +427,40 @@ def discover_agent(name: str) -> Dict[str, Any]:
 
 
 def discover_agents() -> List[Dict[str, Any]]:
-    return [discover_agent(n) for n in ("hermes", "codex", "claude")]
+    """Read-only discovery for the aee_agents surface (multi-agent recovery).
+
+    Every adapter-registry agent is listed — installed binaries with
+    path/version, absent ones with installed=False — plus the adapter's
+    declared read_only enforcement semantics, so a caller can see WHY an
+    agent cannot be dispatched (ADAPTER_UNSUPPORTED shows openly).
+    The listing follows the adapter registry, not a hardcoded roster:
+    agents registered (or removed) in job_adapters appear/disappear here
+    automatically.
+    """
+    agents = [discover_agent(n) for n in sorted(adapter_specs())]
+    for entry in agents:
+        spec = adapter_specs().get(entry.get("agent"))
+        if spec is not None:
+            entry["read_only_enforcement"] = spec.read_only_enforcement
+            entry["enforcement_note"] = spec.enforcement_note
+            capability = autonomous_capability(spec.name)
+            entry.update(capability)
+            entry["dispatchable"] = bool(entry.get('installed')) and spec.read_only_enforcement != "UNSUPPORTED"
+            entry["dispatch_modes"] = (["read_only"] if entry["dispatchable"] else [])
+            if entry.get('installed') and spec.write_enforcement != "UNSUPPORTED":
+                entry["dispatch_modes"].append("write")
+            if capability["autonomous_supported"]:
+                entry["dispatch_modes"].append("autonomous")
+            entry["dispatchable"] = bool(entry["dispatch_modes"])
+            entry["autonomous_enabled"] = False
+            try:
+                trusted = TrustedDispatch.configured()
+                policy = trusted.policy() if trusted is not None else Authority.configured().policy()
+                entry["autonomous_enabled"] = (policy['enabled'] and capability["autonomous_supported"]
+                                               and spec.name in policy['agents'])
+            except _JobError:
+                pass
+    return agents
 
 
 # ---------------------------------------------------------------------------
@@ -430,18 +550,29 @@ def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
-from aee.mcp_runtime.store import JobError as _JobError, JobStore as _PersistentJobStore
+from aee.mcp_runtime.store import (JobError as _JobError, JobStore as _PersistentJobStore,
+                                   compact_adapter_terminal)
 
 
-def _validate_working_directory(working_directory: str) -> str:
-    """Resolve + validate a dispatch working_directory (A3 security gate).
+def _validate_working_directory(working_directory: str, mode: str = "read_only") -> str:
+    """Resolve + validate a dispatch working_directory (OS-identity model).
 
-    MUST be an existing directory, under an A3_DISPATCH_ALLOWED_ROOTS root,
-    not inside a forbidden (.git/.ssh/credential...) path, checked on the
-    REAL resolved path (symlinks resolved, traversal collapsed).
+    Per the operator's A2 recovery permission model: the working directory
+    is a job parameter, not an authorization boundary. The executor runs
+    under the gateway process's own OS user (no sudo/setuid/escalation),
+    so access is decided by that identity's actual OS permissions. Basic
+    filesystem validation only: the path must exist, be a directory,
+    resolve symlinks normally, and be enterable/readable as the executor
+    user. An optional deployment-level confinement still applies when the
+    operator configures A3_DISPATCH_ALLOWED_ROOTS; by default no path
+    roots are imposed. No privilege path is ever created for the job.
     Returns the resolved absolute path or raises _JobError.
     """
-    raw = (working_directory or "").strip()
+    if not isinstance(working_directory, str):
+        raise _JobError("INVALID_WORKING_DIRECTORY", "Expected a directory path string")
+    raw = working_directory if mode == "autonomous" else (working_directory or "").strip()
+    if mode == 'autonomous' and not os.path.isabs(raw):
+        raise _JobError("INVALID_WORKING_DIRECTORY", "Autonomous cwd must be absolute")
     if not raw:
         raise _JobError("INVALID_WORKING_DIRECTORY", "working_directory is required")
     if "\x00" in raw:
@@ -456,24 +587,102 @@ def _validate_working_directory(working_directory: str) -> str:
             "working_directory is not an existing directory",
         )
     resolved_s = str(resolved)
-    if A3_DISPATCH_FORBIDDEN_PATH_RE.search(resolved_s):
+    if mode != "autonomous" and A3_DISPATCH_ALLOWED_ROOTS:
+        for root in A3_DISPATCH_ALLOWED_ROOTS:
+            try:
+                resolved.relative_to(Path(root).resolve())
+                break
+            except ValueError:
+                continue
+        else:
+            raise _JobError(
+                "INVALID_WORKING_DIRECTORY",
+                "working_directory is outside the configured dispatch allowlist",
+            )
+    if not (os.access(resolved, os.R_OK) and os.access(resolved, os.X_OK)):
         raise _JobError(
             "INVALID_WORKING_DIRECTORY",
-            "working_directory resolves into a forbidden path "
-            "(.git/.ssh/credential/config area)",
-        )
-    for root in A3_DISPATCH_ALLOWED_ROOTS:
-        try:
-            resolved.relative_to(Path(root).resolve())
-            break
-        except ValueError:
-            continue
-    else:
-        raise _JobError(
-            "INVALID_WORKING_DIRECTORY",
-            "working_directory is outside the dispatch allowlist",
+            "working_directory is not enterable/readable as the executor OS user",
         )
     return resolved_s
+
+
+def _under_root(path: Path, root: Path) -> Optional[str]:
+    """Return the root a path sits under, else None (symlink-resolved compare)."""
+    try:
+        path.relative_to(root.resolve())
+        return str(root.resolve())
+    except (ValueError, OSError):
+        return None
+
+
+def _validate_write_authorization(mode: str, metadata: object,
+                                  resolved_workdir: str) -> Optional[Dict[str, Any]]:
+    """Fail-closed write-mode gates; returns the per-job authorization proof.
+
+    Requirements (work order AEE_A2_WRITE_CAPABLE_DISPATCH_CONTRACT_RECOVERY):
+    operator approval secret presented per job, an operator-configured write
+    root scope, and exclusion of every AEE-owned operational region. read_only
+    jobs pass through untouched (returns None).
+    """
+    if mode != "write":
+        return None
+    resolved = Path(resolved_workdir)
+    if WRITE_APPROVAL_TOKEN is None:
+        raise _JobError(
+            "WRITE_MODE_NOT_CONFIGURED",
+            "mode 'write' requires the operator-configured AEE_WRITE_APPROVAL_TOKEN "
+            "(0600 env); write dispatch is not enabled",
+        )
+    approval = ""
+    if isinstance(metadata, dict):
+        value = metadata.get("approval")
+        approval = value if isinstance(value, str) else ""
+    if not approval:
+        raise _JobError(
+            "WRITE_APPROVAL_INVALID",
+            'mode \'write\' requires per-job operator approval: pass metadata '
+            '{"approval": "<operator-issued token>"}',
+        )
+    if not hmac.compare_digest(approval.encode("utf-8"), WRITE_APPROVAL_TOKEN):
+        raise _JobError(
+            "WRITE_APPROVAL_INVALID",
+            "the supplied metadata.approval does not match the operator-approved "
+            "token; write dispatch refused",
+        )
+    if not WRITE_ALLOWED_ROOTS:
+        raise _JobError(
+            "WRITE_SCOPE_NOT_CONFIGURED",
+            "mode 'write' requires operator-configured AEE_WRITE_ALLOWED_ROOTS; "
+            "no write scope is enabled on this host",
+        )
+    write_root = None
+    for root in WRITE_ALLOWED_ROOTS:
+        write_root = _under_root(resolved, root)
+        if write_root:
+            break
+    if not write_root:
+        raise _JobError(
+            "INVALID_WRITE_SCOPE",
+            f"write-mode working_directory '{redact(resolved_workdir[:200])}' is "
+            f"outside the operator-configured write roots {sorted(map(str, WRITE_ALLOWED_ROOTS))}",
+        )
+    for forbidden in _WRITE_FORBIDDEN_ROOTS:
+        if _under_root(resolved, forbidden) is not None:
+            raise _JobError(
+                "INVALID_WRITE_SCOPE",
+                "write-mode working_directory may not sit inside an AEE-owned "
+                f"operational region ({forbidden})",
+            )
+    return {
+        "mode": "write",
+        "approval_fingerprint": hashlib.sha256(approval.encode("utf-8")).hexdigest()[:16],
+        "write_root": write_root,
+        "provenance": redact_obj({
+            key: value for key, value in (metadata.items() if isinstance(metadata, dict) else [])
+            if key != "approval" and isinstance(key, str)
+        }),
+    }
 
 
 class JobStore(_PersistentJobStore):
@@ -493,17 +702,34 @@ JOB_STORE = JobStore(A3_JOB_STORE_DIR)
 from aee.mcp_runtime.result_contract import validate_success
 from aee.mcp_runtime.executor import execute_codex
 from aee.mcp_runtime.process import Limits
+from aee.mcp_runtime.budget import ExecutionBudget, BudgetPolicy
+from aee.mcp_runtime.spool import SpoolStore
 from aee.mcp_runtime.profiles import (
     ExecutorIdentity, execution_metadata, select_profile,
 )
-from aee.mcp_runtime.runtime import resolve_executor as resolve_codex, deployment_policy, require_deployment_ready
+from aee.mcp_runtime.runtime import resolve_executor as resolve_codex, deployment_policy, require_deployment_ready, deployment_gate_approved
+from aee.mcp_runtime.job_adapters import (
+    adapter_execution_metadata, adapter_identity, adapter_specs, refuse_unsupported,
+    resolve_adapter, execute_adapter_job, autonomous_capability,
+)
 from aee.mcp_runtime.broker_client import control as broker_control
 from aee.mcp_runtime.sandbox import read_manifest
 
 A3_EXECUTION_PROFILE = os.getenv("A3_EXECUTION_PROFILE", "codex-readonly-high")
 A3_WORKSPACE_MANIFEST = os.getenv("A3_WORKSPACE_MANIFEST")
-A3_LIMITS = Limits(timeout=A3_CODEX_TIMEOUT_SEC, summary_chars=A3_CODEX_MAX_SUMMARY,
+A3_LIMITS = Limits(timeout=min(A3_CODEX_TIMEOUT_SEC, 900), summary_chars=A3_CODEX_MAX_SUMMARY,
                    log_chars=A3_CODEX_MAX_LOG, result_bytes=A3_CODEX_MAX_OUTPUT_FILE)
+# Snapshot operator configuration once. Legacy values are migration fallbacks only
+# when explicitly set; the old 900s default is not imposed on generic adapters.
+_LEGACY_BUDGET = {}
+for _env, _field, _value in (
+    ('A3_CODEX_TIMEOUT_SEC', 'wall_timeout_seconds', A3_CODEX_TIMEOUT_SEC),
+    ('A3_CODEX_MAX_LOG', 'log_excerpt_bytes', A3_CODEX_MAX_LOG),
+    ('A3_CODEX_MAX_OUTPUT_FILE', 'result_inline_bytes', A3_CODEX_MAX_OUTPUT_FILE)):
+    if _env in os.environ:
+        _LEGACY_BUDGET[_field] = _value
+EXECUTION_POLICY = BudgetPolicy(os.getenv('AEE_EXECUTION_POLICY'), legacy=_LEGACY_BUDGET)
+
 
 
 def _codex_executable() -> str:
@@ -595,16 +821,138 @@ def run_codex_job(job_id: str, task: str, working_directory: str, *, cancel_even
                 log.error("event=broker_revoke_failed job_id=%s", job_id)
         JOB_STORE.release(job_id)
         _dispatch_pool.pop(job_id, None)
+        _cancel_events.pop(job_id, None)
+
+
+def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_event=None) -> None:
+    """Execute one adapter-routed job (multi-agent recovery contract).
+
+    Same worker lifecycle as run_codex_job — persist running, bounded
+    execution, terminal update with adapter proof, redacted bounded
+    failure mapping — but the executor comes from the job_adapters
+    registry instead of the approved codex/broker contract.
+    """
+    worker_started = time.monotonic()
+    execution = None
+    spool_store = spool = None
+    try:
+        record = JOB_STORE.get(job_id)
+        execution = record.get("execution")
+        if not isinstance(execution, dict) or not isinstance(execution.get("adapter"), dict):
+            raise _JobError("EXECUTION_FAILED", "Job record lacks adapter execution proof")
+        agent_name = execution["adapter"].get("adapter") or record.get("agent")
+        mode = record.get("mode") or "read_only"
+        spec, executable = resolve_adapter(agent_name)
+        check_execution(execution.get('authorization'), spec.name, mode, task, working_directory)
+        if mode == "write":
+            if spec.write_enforcement == "UNSUPPORTED":
+                raise _JobError("ADAPTER_UNSUPPORTED",
+                                f"agent '{spec.name}' cannot enforce write mode on this host")
+        elif mode == "read_only" and spec.read_only_enforcement == "UNSUPPORTED":
+            raise _JobError("ADAPTER_UNSUPPORTED",
+                            f"agent '{spec.name}' cannot enforce read_only on this host")
+        snapshot = execution.get('budget') or {
+            'configured': EXECUTION_POLICY.for_agent(spec.name).record(), 'revision': EXECUTION_POLICY.revision}
+        budget = ExecutionBudget(**snapshot['configured'])
+        spool_store = SpoolStore(JOB_STORE._root / 'spool')
+        spool_store.reconcile(budget.retention_seconds)
+        spool = spool_store.create(job_id, budget, snapshot['revision'])
+        execution['streaming'] = spool.metadata('running')
+        JOB_STORE.update(job_id, status="running", started_at=_now_iso(), execution=execution)
+        log.info("event=job_started job_id=%s adapter=%s", job_id, spec.name)
+        outcome = execute_adapter_job(spec, executable, execution, task, working_directory,
+                                      limits=A3_LIMITS, cancel_event=cancel_event,
+                                      budget=budget, spool=spool, redact=redact, mode=mode)
+        execution["streaming"] = outcome["streaming"]
+        execution["adapter_proof"] = {
+            "adapter": spec.name,
+            "mode": mode,
+            "read_only_enforcement": spec.read_only_enforcement,
+            "enforcement_note": spec.enforcement_note,
+            "write_enforcement": spec.write_enforcement,
+            "write_note": spec.write_note,
+            "authorization": execution.get("authorization"),
+            "exit_code": outcome["exit_code"],
+            "turn_completed": True,
+            "working_directory": working_directory,
+            "observed": {"version": execution["adapter"].get("version"),
+                         "executable_sha256": execution["adapter"].get("executable_sha256")},
+        }
+        # Mirror the codex contract's truncation: clip the final summary to
+        # the configured cap and record truncation when it was exceeded.
+        summary = outcome["summary"]
+        clipped = len(summary) > A3_LIMITS.summary_chars
+        if clipped:
+            summary = summary[:A3_LIMITS.summary_chars]
+        fields = compact_adapter_terminal(record, {
+            'status': 'completed', 'finished_at': _now_iso(), 'exit_code': outcome['exit_code'],
+            'summary': summary, 'log_excerpt': outcome['log_excerpt'], 'artifacts': [],
+            'truncated': clipped, 'execution': execution})
+        JOB_STORE.update(job_id, **fields)
+        log.info("event=job_completed job_id=%s duration_ms=%d", job_id,
+                 int((time.monotonic() - worker_started) * 1000))
+    except _JobError as error:
+        log.warning("event=job_failed job_id=%s error_code=%s duration_ms=%d", job_id, error.code,
+                    int((time.monotonic() - worker_started) * 1000))
+        status = {'EXECUTION_TIMEOUT': 'timed_out', 'EXECUTION_IDLE_TIMEOUT': 'timed_out', 'EXECUTION_CANCELLED': 'cancelled'}.get(error.code, 'failed')
+        if isinstance(execution, dict) and isinstance(error.context, dict):
+            # R5-R2 additive output-limit boundary diagnostics, mirroring the
+            # codex worker path: bounded scalars only, never on completed
+            # records, retrievable through aee_job_result's execution field.
+            execution['output_limit_diagnostics'] = error.context
+        if spool is not None and getattr(error, 'streaming', None) is None:
+            try:
+                error.streaming = spool.finish(code=error.code, exit_code=error.exit_code, redact=redact)
+            except (OSError, _JobError):
+                error.streaming = spool.metadata('failed', code='SPOOL_IO_ERROR', redact=redact)
+        if isinstance(execution, dict) and getattr(error, 'streaming', None) is not None:
+            execution['streaming'] = error.streaming
+        diagnostic_tail = (execution or {}).get('streaming', {}).get('streams', {}).get('stderr', {}).get('tail', '')
+        fields = {'execution': execution, 'log_excerpt': diagnostic_tail} if isinstance(execution, dict) else {}
+        fields.update(status=status, finished_at=_now_iso(), exit_code=error.exit_code,
+                      error_code=error.code, error=redact(error.message))
+        JOB_STORE.update(job_id, **compact_adapter_terminal(record, fields))
+    except Exception as exc:
+        safe_type = type(exc).__name__[:64]
+        if not (safe_type.isascii() and safe_type.isidentifier()):
+            safe_type = "Unknown"
+        log.warning(
+            "event=job_failed job_id=%s error_code=EXECUTION_FAILED exc_type=%s",
+            job_id, safe_type,
+        )
+        if spool is not None and isinstance(execution, dict):
+            try:
+                execution['streaming'] = spool.finish(code='EXECUTION_FAILED', redact=redact)
+            except (OSError, _JobError):
+                execution['streaming'] = spool.metadata('failed', code='SPOOL_IO_ERROR', redact=redact)
+        fields = compact_adapter_terminal(record, {
+            'status': 'failed', 'finished_at': _now_iso(), 'error_code': 'EXECUTION_FAILED',
+            'error': 'Isolated executor failed', 'execution': execution})
+        JOB_STORE.update(job_id, **fields)
+    finally:
+        if spool is not None:
+            spool.close()
+        if spool_store is not None:
+            spool_store.close()
+        JOB_STORE.release(job_id)
+        _dispatch_pool.pop(job_id, None)
+        _cancel_events.pop(job_id, None)
 
 
 _dispatch_pool: Dict[str, threading.Thread] = {}
+_cancel_events: Dict[str, threading.Event] = {}
 
 
-def _start_job_worker(job_id: str, task: str, working_directory: str) -> None:
+def _start_job_worker(job_id: str, task: str, working_directory: str, *,
+                      production_codex: bool = False) -> None:
     """Spawn the executor thread; single-flight by design (bootstrap)."""
+    target = run_codex_job if production_codex else run_agent_job
+    cancel_event = threading.Event()
+    _cancel_events[job_id] = cancel_event
     t = threading.Thread(
-        target=run_codex_job,
+        target=target,
         args=(job_id, task, working_directory),
+        kwargs={"cancel_event": cancel_event},
         name=f"aee-job-{job_id}",
         daemon=True,
     )
@@ -619,38 +967,109 @@ def _start_job_worker(job_id: str, task: str, working_directory: str) -> None:
 def dispatch_job(
     agent: str, task: str, working_directory: str, mode: str,
     execution_profile: Optional[str] = None, model: Optional[str] = None,
-    reasoning_effort: Optional[str] = None,
+    reasoning_effort: Optional[str] = None, metadata: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """A3 dispatch entrypoint — validate, persist, spawn, return immediately."""
+    """Dispatch entrypoint — validate, persist, spawn, return immediately.
+
+    Routing: when the deployment manifest is present AND approved, a codex
+    job keeps the production broker-mandated contract (read-only; unchanged).
+    Every other admitted agent — or codex when Stage-2 approval is absent —
+    runs through the generic adapter registry with per-adapter semantics.
+    Explicit secure_mcp_trusted_dispatch authorizes approved authenticated
+    transport principals and records admission provenance without per-job tokens.
+    Deployments without that policy retain legacy write/capability gates.
+    """
     agent_clean = (agent or "").strip().lower()
     if agent_clean not in A3_ALLOWED_AGENTS:
         raise _JobError(
             "INVALID_AGENT",
-            f"agent '{redact(agent_clean[:60])}' is not supported in the A3 "
-            "bootstrap contract; expected 'codex'",
+            f"agent '{redact(agent_clean[:60])}' is not supported; "
+            "supported agents: " + ", ".join(sorted(A3_ALLOWED_AGENTS)),
         )
     mode_clean = (mode or "").strip().lower()
     if mode_clean not in A3_ALLOWED_MODES:
         raise _JobError(
             "INVALID_MODE",
-            f"mode '{redact(mode_clean[:60])}' is not supported in the A3 "
-            "bootstrap contract; expected 'read_only'",
+            f"mode '{redact(mode_clean[:60])}' is not supported on this runtime; "
+            "expected 'read_only', 'write' or 'autonomous'",
         )
+    refuse_unsupported(agent_clean, mode_clean)
     if not task or not task.strip():
         raise _JobError("INVALID_TASK", "task must not be empty")
-    workdir = _validate_working_directory(working_directory)
-    profile = select_profile(A3_EXECUTION_PROFILE if execution_profile is None else execution_profile,
-                             model, reasoning_effort)
-    read_manifest(A3_WORKSPACE_MANIFEST)
+    if metadata is not None and not isinstance(metadata, dict):
+        raise _JobError("INVALID_METADATA", "metadata must be an object when provided")
+    trusted = TrustedDispatch.configured()
+    if trusted is not None:
+        # Check the authenticated transport before filesystem/CLI probing.
+        trusted.identity(mode_clean, agent_clean)
+    cwd_mode = 'autonomous' if trusted is not None and mode_clean == 'write' else mode_clean
+    workdir = _validate_working_directory(working_directory, cwd_mode)
+    authorization = (trusted.admit(agent_clean, mode_clean, task, workdir) if trusted is not None
+                     else _validate_write_authorization(mode_clean, metadata, workdir))
+    if mode_clean == 'autonomous':
+        if execution_profile is not None or model is not None or reasoning_effort is not None:
+            raise _JobError('INVALID_PROFILE', 'Autonomous uses os-native profile; omit selector fields')
+        if not AEE_MCP_REQUIRE_AUTH or AEE_MCP_HOST != '127.0.0.1':
+            raise _JobError('AUTONOMOUS_CALLER_UNVERIFIED', 'Authenticated loopback control plane required')
+        if trusted is None:
+            Authority.configured().consume((metadata or {}).get('autonomous_approval'),
+                                           agent_clean, task, workdir, consume=False)
+
     policy = deployment_policy()
-    if policy:
+    approved = policy is not None and deployment_gate_approved(policy)
+    # The legacy broker-mandated codex contract runs ONLY on a host whose
+    # manifest is present AND approved. Policy-absent hosts run codex
+    # through the generic adapter path (native sandbox); a
+    # present-but-unapproved manifest keeps codex fail-closed before
+    # admission rather than silently downgrading its contract. The broker
+    # contract executes a reviewed read-only workspace snapshot, so write
+    # mode is refused there rather than silently discarded.
+    production_codex = agent_clean == "codex" and approved and mode_clean != "autonomous"
+    if production_codex and mode_clean == "write":
+        raise _JobError(
+            "INVALID_MODE",
+            "mode 'write' is not supported by the approved codex broker "
+            "contract (it executes a read-only workspace snapshot); "
+            "dispatch write jobs to the adapter registry instead",
+        )
+    if production_codex:
+        profile = select_profile(A3_EXECUTION_PROFILE if execution_profile is None else execution_profile,
+                                 model, reasoning_effort)
+        read_manifest(A3_WORKSPACE_MANIFEST)
         require_deployment_ready(policy)
-    identity = resolve_codex(A3_CODEX_BIN)
-    execution = execution_metadata(profile, identity, requested_profile=execution_profile,
-                                   requested_model=model, requested_reasoning=reasoning_effort)
+        identity = resolve_codex(A3_CODEX_BIN)
+        execution = execution_metadata(profile, identity, requested_profile=execution_profile,
+                                       requested_model=model, requested_reasoning=reasoning_effort)
+    elif agent_clean == "codex" and policy is not None and mode_clean != "autonomous":
+        raise _JobError("DEPLOYMENT_GATE_CLOSED",
+                        "Codex dispatch requires the approved deployment gate on a "
+                        "manifest-managed host; use an approved manifest or another adapter")
+    else:
+        production_codex = False
+        if execution_profile is not None or model is not None or reasoning_effort is not None:
+            raise _JobError("INVALID_PROFILE",
+                            "execution_profile/model/reasoning_effort selectors apply only to the "
+                            "codex production contract")
+        # Adapter admissions resolve the installed binary now so an absent
+        # CLI fails before admission instead of inside the worker.
+        execution = adapter_execution_metadata(agent_clean, mode_clean)
+        execution['budget'] = {'configured': EXECUTION_POLICY.for_agent(agent_clean).record(),
+                               'revision': EXECUTION_POLICY.revision}
+    if mode_clean == "autonomous":
+        if not AEE_MCP_REQUIRE_AUTH or AEE_MCP_HOST != '127.0.0.1':
+            raise _JobError('AUTONOMOUS_CALLER_UNVERIFIED', 'Authenticated loopback control plane required')
+        if trusted is None:
+            token = (metadata or {}).get('autonomous_approval')
+            authorization = Authority.configured().consume(token, agent_clean, task, workdir)
+        execution['native_profile'] = 'os-native'
+    if authorization is not None:
+        execution['authorization'] = authorization
+    if trusted is not None:
+        # Fail closed if policy/principal changed while the binary was probed.
+        trusted.check_start(authorization, agent_clean, mode_clean, task, workdir)
     data = JOB_STORE.create(agent_clean, task, workdir, mode_clean, execution=execution)
     try:
-        _start_job_worker(data["job_id"], task, workdir)
+        _start_job_worker(data["job_id"], task, workdir, production_codex=production_codex)
     except Exception:
         JOB_STORE.update(data["job_id"], status="failed", finished_at=_now_iso(),
                          error_code="EXECUTION_FAILED", error="Worker could not start")
@@ -672,7 +1091,7 @@ def job_error_payload(exc: _JobError) -> Dict[str, Any]:
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
-    "aee-a3-gateway",
+    "aee-mcp-gateway",
     host=AEE_MCP_HOST,
     port=AEE_MCP_PORT,
     streamable_http_path="/mcp",
@@ -691,7 +1110,7 @@ async def health_route(request):
     payload = {
         "ok": True,
         "status": "healthy",
-        "gateway": "aee-a3-mcp-gateway",
+        "gateway": "aee-mcp-gateway",
         "version": AEE_GATEWAY_VERSION,
         "aee_product_version": AEE_PRODUCT_VERSION,
         "hostname": socket.gethostname(),
@@ -712,7 +1131,7 @@ async def status_route(request):
 
     payload = {
         "ok": True,
-        "gateway": "aee-a3-mcp-gateway",
+        "gateway": "aee-mcp-gateway",
         "version": AEE_GATEWAY_VERSION,
         "aee_product_version": AEE_PRODUCT_VERSION,
         "hostname": socket.gethostname(),
@@ -721,6 +1140,19 @@ async def status_route(request):
         "host_uptime_seconds": _uptime_seconds(),
         "auth_required": AEE_MCP_REQUIRE_AUTH,
         "allowed_roots": AEE_MCP_ALLOWED_ROOTS,
+        "dispatch_modes": sorted(A3_ALLOWED_MODES),
+        "autonomous": {"profile": "os-native", "authorization": (TRUSTED_POLICY if TrustedDispatch.configured() is not None
+                                                                         else "single-job-capability"),
+                       "mandatory_directory_allowlist": False,
+                       "policy_configured": bool(os.getenv('AEE_TRUSTED_DISPATCH_POLICY')
+                                                 or os.getenv('AEE_AUTONOMOUS_POLICY'))},
+        "trusted_dispatch": (TrustedDispatch.configured().status()
+                             if TrustedDispatch.configured() is not None else None),
+        "write_scope": {
+            "configured": bool(WRITE_ALLOWED_ROOTS),
+            "approval_configured": WRITE_APPROVAL_TOKEN is not None,
+            "roots": sorted(str(root.resolve()) for root in WRITE_ALLOWED_ROOTS),
+        },
     }
     return JSONResponse(payload)
 
@@ -730,24 +1162,27 @@ async def status_route(request):
 
 @mcp.tool()
 async def aee_status() -> str:
-    """Get the current live system status of the Omarchy-A3 AEE runtime node.
+    """Get the current live system status of this AEE runtime node.
 
-    Returns hostname, kernel, uptime, CPU load, memory, disk, and AEE
-    gateway/product version info, read live from the real Omarchy-A3 host.
-    Read-only.
+    Returns hostname, OS platform, kernel, uptime, CPU load, memory,
+    disk, AEE gateway/product version info, and the runtime execution
+    identity (OS uid/gid of this gateway process), all read live from
+    this host via OS-native APIs. Read-only.
     """
     payload = {
         "aee_gateway_version": AEE_GATEWAY_VERSION,
         "aee_product_version": AEE_PRODUCT_VERSION,
         "node": {
             "hostname": socket.gethostname(),
-            "os": "Omarchy (Arch-based)",
-            "kernel": _read_proc("/proc/sys/kernel/osrelease"),
+            "os": platform.platform(),
+            "platform": _os_platform(),
+            "kernel": platform.release(),
             "boot_time": _host_boot_time(),
             "uptime_seconds": _uptime_seconds(),
             "cpu": _cpu_load(),
             "memory": _mem(),
             "disks": _disks(),
+            "execution_identity": _execution_identity(),
         },
         "gateway": {
             "bind": f"{AEE_MCP_HOST}:{AEE_MCP_PORT}",
@@ -757,6 +1192,8 @@ async def aee_status() -> str:
             "gateway_uptime_seconds": round(time.time() - _START_TIME, 1),
             "localhost_only": AEE_MCP_HOST == "127.0.0.1",
             "auth_required": AEE_MCP_REQUIRE_AUTH,
+            "trusted_dispatch": (TrustedDispatch.configured().status()
+                                 if TrustedDispatch.configured() is not None else None),
         },
     }
     return json.dumps(redact_obj(payload), ensure_ascii=False)
@@ -764,11 +1201,14 @@ async def aee_status() -> str:
 
 @mcp.tool()
 async def aee_agents() -> str:
-    """List AI agent runtimes installed and available on Omarchy-A3.
+    """List executor agent adapters registered in this gateway's
+    Agent Registry.
 
-    Reports hermes, codex, and claude with installed / executable path /
-    version / available. Read-only discovery — this tool never modifies
-    agent configuration.
+    Each registered adapter is reported with installed / executable
+    path / version / available, plus its declared read-only enforcement
+    semantics. The listing follows the adapter registry — adapters
+    added to or removed from it appear/disappear here automatically.
+    Read-only discovery — this tool never modifies agent configuration.
     """
     agents = await asyncio.to_thread(discover_agents)
     return json.dumps({"agents": redact_obj(agents)}, ensure_ascii=False)
@@ -801,27 +1241,52 @@ async def aee_dispatch(
     agent: str,
     working_directory: str,
     task: Optional[str] = None,
-    mode: str = "read_only",
+    mode: Literal["read_only", "write", "autonomous"] = "read_only",
     prompt: Optional[str] = None,
     metadata: Optional[dict] = None,
     execution_profile: Optional[str] = None,
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
 ) -> str:
-    """Dispatch a controlled, read-only job to the Codex agent on this node.
+    """Dispatch a bounded job to a registered agent adapter on this node.
 
-    Bootstrap contract (A3): agent must be 'codex' and mode must be
-    'read_only'; every other agent or mode is rejected. working_directory
-    must be an existing directory under the dispatch allowlist. Execution
-    reads a reviewed source snapshot; host source files cannot be modified.
-    Model/reasoning selectors must match the named execution profile.
-    Returns immediately with a job_id; poll aee_job_status / aee_job_result.
+    Supported agents run local CLIs under the OS-identity execution
+    model: the Codex adapter runs the Codex CLI and the Claude adapter
+    runs the Claude Code CLI, both as this gateway's own OS user — no
+    sudo/setuid/credential escalation. agent must be a registered
+    adapter (call aee_agents for the live registry set).
+
+    mode decides the agent's permission boundary:
+    * 'read_only' (default): the agent runs inside its native read-only
+      boundary (codex --sandbox read-only; claude --permission-mode plan
+      plus restricted safe-mode Read/Glob/Grep tool allowlist and empty MCP).
+      Claude plan mode alone does not enforce read-only.
+    * 'write': native write mode (codex workspace-write; claude acceptEdits).
+      On A2 secure_mcp_trusted_dispatch, the approved authenticated Secure MCP
+      principal needs no per-job approval metadata or token; OS permissions
+      and the native adapter's write boundary apply.
+    * 'autonomous': OS-native service-account authority without per-tool
+      approvals or an AEE directory allowlist. A2 secure_mcp_trusted_dispatch
+      authorizes the approved Secure MCP principal without per-job tokens.
+      Other deployments retain legacy capability gates. The native profile is
+      os-native (omit selector fields). No additional OS privileges are granted.
+      Call aee_agents for installed capabilities and policy qualification.
+
+    working_directory is a job parameter: access is decided by the
+    executor identity's real OS permissions on that directory, not by a
+    mandatory allowlist (operator-configured root lists still confine
+    read-only dispatch and confine write scope when set). Every job runs
+    with bounded resources (timeout, output caps, durable spool) and a
+    full audit trail. Returns immediately with a job_id; track the job
+    lifecycle through aee_job_status / aee_job_result and cancel active
+    jobs through aee_job_cancel.
     """
     # Back-compat: A1 callers passed `prompt` + optional `metadata`.
     task = task or prompt or ""
     try:
         data = await asyncio.to_thread(
-            dispatch_job, agent, task, working_directory, mode, execution_profile, model, reasoning_effort
+            dispatch_job, agent, task, working_directory, mode, execution_profile, model, reasoning_effort,
+            metadata
         )
         return json.dumps(
             {
@@ -836,6 +1301,9 @@ async def aee_dispatch(
             ensure_ascii=False,
         )
     except _JobError as exc:
+        log.warning("event=dispatch_denied mode=%s agent=%s code=%s",
+                    mode if mode in A3_ALLOWED_MODES else 'invalid',
+                    agent if agent in A3_ALLOWED_AGENTS else 'invalid', exc.code)
         return json.dumps(job_error_payload(exc), ensure_ascii=False)
 
 
@@ -917,6 +1385,40 @@ async def aee_job_result(job_id: str) -> str:
     )
 
 
+@mcp.tool()
+async def aee_job_cancel(job_id: str) -> str:
+    """Request cancellation of an active dispatched AEE job.
+
+    Cooperative-cancel: the worker thread observes the cancel flag inside
+    its bounded run loop, raises EXECUTION_CANCELLED, and the executor's
+    whole process group is killed by the sandbox teardown. Terminal state
+    (cancelled) is persisted by the worker; poll aee_job_status.
+    """
+    try:
+        data = await asyncio.to_thread(JOB_STORE.get, job_id)
+    except _JobError as exc:
+        return json.dumps(job_error_payload(exc), ensure_ascii=False)
+    if data["status"] not in ACTIVE_STATES:
+        return json.dumps({
+            "ok": False,
+            "job_id": job_id,
+            "error_code": "JOB_NOT_ACTIVE",
+            "error": f"job is {data['status']}; cancel is only valid while queued/running",
+        }, ensure_ascii=False)
+    event = _cancel_events.get(job_id)
+    if event is None:
+        # Worker already finished or release raced the store read.
+        return json.dumps({
+            "ok": False,
+            "job_id": job_id,
+            "error_code": "JOB_NOT_ACTIVE",
+            "error": "job is no longer owned by a running worker",
+        }, ensure_ascii=False)
+    event.set()
+    return json.dumps({"ok": True, "job_id": job_id, "status": data["status"],
+                       "cancel": "requested"}, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Bearer auth middleware (Starlette-level, applied to the MCP ASGI app)
 # ---------------------------------------------------------------------------
@@ -956,10 +1458,20 @@ def _build_auth_middleware(app):
             k.decode("latin-1").lower(): v.decode("latin-1")
             for k, v in scope.get("headers", [])
         }
-        auth = headers.get("authorization", "")
+        auth_fields = [v for k, v in scope.get('headers', []) if k.lower() == b'authorization']
+        auth = headers.get("authorization", "") if len(auth_fields) == 1 else ""
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-        if token in allowed:
-            await app(scope, receive, send)
+        if any(hmac.compare_digest(token.encode(), item.encode()) for item in allowed):
+            context_token = authenticated_transport.set(auth_digest(token))
+            secure_token = secure_mcp_transport.set(
+                VerifiedSecureMCP(auth_digest(token))
+                if AEE_MCP_SURFACE == 'restricted' and AEE_MCP_HOST == '127.0.0.1'
+                else None)
+            try:
+                await app(scope, receive, send)
+            finally:
+                secure_mcp_transport.reset(secure_token)
+                authenticated_transport.reset(context_token)
             return
         resp = JSONResponse(
             {"ok": False, "error": "unauthorized"},
@@ -982,7 +1494,7 @@ def _apply_tool_exposure_filter() -> None:
 
     allowed = RESTRICTED_TOOLS if AEE_MCP_SURFACE == "restricted" else frozenset(AEE_MCP_EXPOSED_TOOLS)
     if not allowed:
-        return  # deliberately full/local only; restricted always has fixed five
+        return  # deliberately full/local only; restricted always has the fixed six
     manager = mcp._tool_manager
     if getattr(manager, "_aee_surface_guard", False):
         return
@@ -1005,14 +1517,43 @@ def _apply_tool_exposure_filter() -> None:
     manager._aee_surface_guard = True
 
 
+def startup_gate_mode(policy) -> str:
+    """Startup/deployment policy decision for the gateway process.
+
+    Returns ``APPROVED`` when the manifest passed the reviewed gate (the
+    production codex/broker contract is then also required on startup),
+    ``OPEN_GENERIC`` when a well-formed manifest exists but Stage-2 is
+    not approved (gateway starts; generic adapter dispatch remains under
+    auth + per-job safety), and raises for a structurally invalid
+    manifest (deployment_policy already fail-closes those).
+    """
+    if policy is None:
+        return "OPEN_GENERIC"  # policy-absent isolated/bootstrap mode
+    return "APPROVED" if deployment_gate_approved(policy) else "OPEN_GENERIC"
+
+
 def main() -> None:
+    # Multi-agent recovery: basic gateway startup and generic adapter
+    # dispatch are no longer gated on Stage-2 deployment certification.
+    # ONLY the approved production codex/broker contract checks the gate;
+    # auth and per-job safety are enforced on every branch. An INVALID
+    # manifest (unparseable/structurally rejected) remains fail-closed:
+    # the host policy cannot be trusted for dispatch.
     policy = deployment_policy()
-    if policy:
+    mode = startup_gate_mode(policy)
+    if mode == "APPROVED":
         require_deployment_ready(policy)
         resolve_codex(A3_CODEX_BIN)
         read_manifest(A3_WORKSPACE_MANIFEST)
         if not os.getenv("AEE_BROKER_CONTROL") or AEE_MCP_HOST != "127.0.0.1":
             raise _JobError("RUNTIME_POLICY_INVALID", "Production broker and loopback binding are required")
+    elif mode != "OPEN_GENERIC":
+        raise _JobError("RUNTIME_POLICY_INVALID", "Deployment policy mode is invalid")
+    else:
+        log.warning(
+            "event=startup_deployment_gate_open "
+            "mode=generic-adapter-dispatch note=stage2-not-approved; "
+            "auth and per-job safety remain enforced")
     if AEE_MCP_REQUIRE_AUTH and not AEE_MCP_API_KEY:
         print(
             "FATAL: MCP_BRIDGE_API_KEY is not configured; refusing to start "
@@ -1022,7 +1563,7 @@ def main() -> None:
         )
         sys.exit(2)
     log.info(
-        "AEE A3 MCP Gateway starting on %s:%s (auth=%s, allowed_roots=%s)",
+        "AEE MCP Gateway starting on %s:%s (auth=%s, allowed_roots=%s)",
         AEE_MCP_HOST,
         AEE_MCP_PORT,
         "required" if AEE_MCP_REQUIRE_AUTH else "disabled",
@@ -1065,7 +1606,7 @@ def main() -> None:
     )
     server = _Server(config)
     log.info(
-        "AEE A3 MCP Gateway binding: http://%s:%s/mcp (health: /health, status: /status)",
+        "AEE MCP Gateway binding: http://%s:%s/mcp (health: /health, status: /status)",
         AEE_MCP_HOST,
         AEE_MCP_PORT,
     )

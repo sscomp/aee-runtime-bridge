@@ -17,16 +17,19 @@ Verifies the contract documented in
 * ``RuntimeSelector`` rejects the claude-code runtime when a task
   excludes it via ``excluded_runtime_ids``.
 
-The test runs against the real bootstrap path (no monkey-patching
-of the descriptor builder). On hosts without ``claude`` on ``$PATH``
-the claude-code-specific assertions are skipped, but the
-"does-not-register" assertions still run.
+The tests run against the real bootstrap path and descriptor builder.
+An executable local fixture controls binary discovery, so selector assertions
+run on hosts without an installed Claude CLI. No model or network is used.
 """
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 import shutil
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from aee.runtimes import registry as registry_module
 from aee.runtimes import selector as selector_module
@@ -36,6 +39,23 @@ from aee.runtimes.models import TaskRuntimeRequirements
 
 def _has_claude_cli() -> bool:
     return shutil.which("claude") is not None
+
+
+class _SyntheticClaudeDiscovery:
+    """Exercise real PATH discovery without depending on a host installation."""
+
+    def _install_discovery_fixture(self):
+        root = tempfile.TemporaryDirectory(prefix="aee-selector-")
+        self.addCleanup(root.cleanup)
+        binary = Path(root.name) / "claude"
+        # Descriptor construction only checks executable discovery. Execution
+        # would be a test error; never impersonate a working provider.
+        binary.write_text("#!/bin/sh\nexit 99\n")
+        binary.chmod(0o755)
+        env = patch.dict(os.environ, {"PATH": root.name + os.pathsep + os.environ.get("PATH", "")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.assertEqual(shutil.which("claude"), str(binary))
 
 
 class _RegistrySnapshot:
@@ -84,10 +104,11 @@ class _RegistrySnapshot:
                 reg.register_runtime(desc, replace=True)
 
 
-class TestClaudeCodeBootstrap(unittest.TestCase):
+class TestClaudeCodeBootstrap(_SyntheticClaudeDiscovery, unittest.TestCase):
     """Group A — bootstrap behaviour with and without the binary."""
 
     def setUp(self) -> None:
+        self._install_discovery_fixture()
         self._snap = _RegistrySnapshot()
         self._snap.__enter__()
 
@@ -95,8 +116,7 @@ class TestClaudeCodeBootstrap(unittest.TestCase):
         self._snap.__exit__(None, None, None)
 
     def test_bootstrap_registers_claude_code_when_binary_present(self) -> None:
-        if not _has_claude_cli():
-            self.skipTest("claude CLI not on $PATH on this host")
+        self.assertTrue(_has_claude_cli(), "synthetic discovery fixture unavailable")
         registry_module.bootstrap_default_runtimes(force=True)
         ids = {r.runtime_id for r in registry_module.runtime_registry.list_runtimes()}
         self.assertIn("aee-lightweight-local", ids)
@@ -121,6 +141,11 @@ class TestClaudeCodeBootstrap(unittest.TestCase):
         # actually changes; for the test we only assert non-doubling).
         self.assertLessEqual(n_second, n_first + 1)
 
+    def test_default_descriptor_absent_with_empty_path(self) -> None:
+        with patch.dict(os.environ, {"PATH": ""}):
+            self.assertFalse(_has_claude_cli())
+            self.assertIsNone(build_claude_code_descriptor())
+
     def test_descriptor_factory_returns_none_without_binary(self) -> None:
         d = build_claude_code_descriptor(
             binary="/no/such/binary/definitely-missing"
@@ -128,8 +153,7 @@ class TestClaudeCodeBootstrap(unittest.TestCase):
         self.assertIsNone(d)
 
     def test_descriptor_factory_shape(self) -> None:
-        if not _has_claude_cli():
-            self.skipTest("claude CLI not on $PATH on this host")
+        self.assertTrue(_has_claude_cli(), "synthetic discovery fixture unavailable")
         d = build_claude_code_descriptor()
         self.assertIsNotNone(d)
         assert d is not None  # for type-checker
@@ -138,10 +162,11 @@ class TestClaudeCodeBootstrap(unittest.TestCase):
         self.assertIn("runtime.claude_code", d.capabilities.capabilities)
 
 
-class TestRuntimeSelectorClaudeCode(unittest.TestCase):
+class TestRuntimeSelectorClaudeCode(_SyntheticClaudeDiscovery, unittest.TestCase):
     """Group B — selector picks the right runtime for each requirement."""
 
     def setUp(self) -> None:
+        self._install_discovery_fixture()
         self._snap = _RegistrySnapshot()
         self._snap.__enter__()
         registry_module.bootstrap_default_runtimes(force=True)
@@ -160,8 +185,7 @@ class TestRuntimeSelectorClaudeCode(unittest.TestCase):
         return result.selected_runtime_id
 
     def test_explicit_claude_code_runtime_type_picks_claude_code(self) -> None:
-        if not _has_claude_cli():
-            self.skipTest("claude CLI not on $PATH on this host")
+        self.assertTrue(_has_claude_cli(), "synthetic discovery fixture unavailable")
         req = TaskRuntimeRequirements(runtime_type="claude_code")
         self.assertEqual(self._select(req), "claude-code-local")
 
@@ -178,8 +202,7 @@ class TestRuntimeSelectorClaudeCode(unittest.TestCase):
         )
 
     def test_excluded_claude_code_falls_back_to_lightweight(self) -> None:
-        if not _has_claude_cli():
-            self.skipTest("claude CLI not on $PATH on this host")
+        self.assertTrue(_has_claude_cli(), "synthetic discovery fixture unavailable")
         req = TaskRuntimeRequirements(
             runtime_type="claude_code",
             excluded_runtime_ids=["claude-code-local"],
@@ -193,8 +216,7 @@ class TestRuntimeSelectorClaudeCode(unittest.TestCase):
             pass  # acceptable
 
     def test_disabled_claude_code_is_not_selectable(self) -> None:
-        if not _has_claude_cli():
-            self.skipTest("claude CLI not on $PATH on this host")
+        self.assertTrue(_has_claude_cli(), "synthetic discovery fixture unavailable")
         # Replace the registered claude-code runtime with a disabled
         # copy. (The repo stores descriptors in SQLite, so mutating
         # the in-memory copy from list_runtimes() does not persist;

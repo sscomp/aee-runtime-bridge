@@ -11,7 +11,7 @@ exact native Codex/companion and Bubblewrap build; other builds fail closed.
 
 The external MCP Python venv belongs outside the immutable release. Gateway and
 broker use different accounts; only the broker has `LoadCredential`. Restricted
-port 8791 binds loopback, requires auth and exposes exactly five tools. Local/full
+port 8791 binds loopback, requires auth and exposes exactly six tools. Local/full
 port 8790 is optional and never a tunnel target. Keep all environment substitutions
 private; `<...>` values deliberately require operator provisioning.
 

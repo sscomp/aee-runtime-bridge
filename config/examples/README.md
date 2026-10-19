@@ -26,7 +26,7 @@ The `.env` examples use systemd EnvironmentFile syntax, not shell expansions.
 | Example | Local destination / relationship |
 |---|---|
 | `gateway-local.env.example` | `.env.aee-mcp`, mode 0600; full six-tool gateway |
-| `gateway-restricted.env.example` | `.env.aee-mcp-tunnel`, mode 0600; explicit five-tool surface |
+| `gateway-restricted.env.example` | `.env.aee-mcp-tunnel`, mode 0600; explicit six-tool surface |
 | `tunnel-creds.env.example` | `.env.aee-tunnel-creds`, mode 0600; separate control-plane and forward credentials |
 | `tunnel-client.yaml.example` | `~/.config/tunnel-client/<TUNNEL_PROFILE>.yaml`, mode 0600, parent 0700 |
 | `*.service.example` | User systemd unit templates; paths assume `%h/aee-runtime-bridge` |
@@ -41,17 +41,17 @@ to `http://127.0.0.1:8791/mcp`; 8792 is its loopback health listener.
 Replace path placeholders with absolute existing paths for your host.
 Both gateway envs should point to the same persistent store and dispatch
 root. The local surface exposes all registered tools when its exposure
-setting is empty. The restricted example lists the five current tools.
+setting is empty. The restricted example lists the six current tools.
 
 In P2B, port 8791 forces the restricted surface. Its absent allowlist defaults
-to the fixed five; an explicitly empty/expanded allowlist is rejected.
+to the fixed six-tool set; an explicitly empty/expanded allowlist is rejected.
 The default P2B store is `~/.local/state/aee-p2b-jobs`. Do not point a P2B
 fixture at the live A3 store; active legacy records require migration review.
 
 The templates capture existing `Type=simple`, restart and ordering behavior;
 they provide no new readiness guarantees. Installed restricted-unit comments
 still mention the older two-tool A2 surface; the env and fresh `tools/list`
-establish the actual five-tool A3 surface. The example wording reflects A3.
+establish the actual six-tool A3 surface. The example wording reflects A3.
 Do not run tunnel-client doctor concurrently with the installed client using
 the same fixed health port. Installation/reload/restart belongs to a future
 authorized deployment task, not this baseline capture.

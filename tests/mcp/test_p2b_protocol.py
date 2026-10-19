@@ -15,6 +15,8 @@ import httpx
 
 ROOT = Path(__file__).resolve().parents[2]
 FIVE = {"aee_status", "aee_agents", "aee_dispatch", "aee_job_status", "aee_job_result"}
+# Multi-agent recovery: the restricted surface gained aee_job_cancel (six-tool contract).
+SIX = FIVE | {"aee_job_cancel"}
 
 
 class HardenedProtocol(unittest.TestCase):
@@ -41,11 +43,19 @@ class HardenedProtocol(unittest.TestCase):
         manifest.write_text(json.dumps({"safe.txt": hashlib.sha256((source / "safe.txt").read_bytes()).hexdigest()}))
         self.env = {"A3_JOB_STORE_DIR": str(self.root / "jobs"), "A3_DISPATCH_ALLOWED_ROOTS": self.source,
                     "A3_CODEX_BIN": str(self.binary), "A3_WORKSPACE_MANIFEST": str(manifest),
+                    # Adapter-mode codex must resolve deterministically even on
+                    # CI hosts without a real codex CLI (admission pins identity).
+                    "A3_ADAPTER_CODEX_BIN": str(self.binary),
                     "AEE_MCP_PORT": "8791", "AEE_MCP_SURFACE": "restricted",
                     "MCP_BRIDGE_API_KEY": "P2B_SYNTHETIC_AUTH", "AEE_MCP_REQUIRE_AUTH": "true"}
         self.gateway = self.load(self.env)
         self.addCleanup(self.gateway.JOB_STORE.close)
         self.gateway._apply_tool_exposure_filter()
+        # Generic adapter discovery reads environment at admission, not import.
+        # Keep this synthetic binary override active throughout the fixture.
+        environment = patch.dict(os.environ, self.env)
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def load(self, environment):
         name = "aee_p2b_protocol_" + str(len(sys.modules))
@@ -92,7 +102,7 @@ class HardenedProtocol(unittest.TestCase):
         async def checks(rpc):
             status, body = await rpc("tools/list")
             self.assertEqual(status, 200)
-            self.assertEqual({tool["name"] for tool in body["result"]["tools"]}, FIVE)
+            self.assertEqual({tool["name"] for tool in body["result"]["tools"]}, SIX)
             for tool in ["aee_exec", "aee_future_full_tool"]:
                 _, body = await rpc("tools/call", {"name": tool, "arguments": {}})
                 self.assertTrue(body["result"]["isError"])
@@ -117,8 +127,8 @@ class HardenedProtocol(unittest.TestCase):
             return "local fixture"
 
         local._apply_tool_exposure_filter()
-        self.assertEqual({t.name for t in local.mcp._tool_manager.list_tools()}, FIVE | {"aee_exec", "aee_future_full_tool"})
-        self.assertEqual({t.name for t in self.gateway.mcp._tool_manager.list_tools()}, FIVE)
+        self.assertEqual({t.name for t in local.mcp._tool_manager.list_tools()}, SIX | {"aee_exec", "aee_future_full_tool"})
+        self.assertEqual({t.name for t in self.gateway.mcp._tool_manager.list_tools()}, SIX)
 
     def test_auth_invalid_job_and_profile_errors_structured(self):
         async def checks(rpc):
@@ -128,14 +138,27 @@ class HardenedProtocol(unittest.TestCase):
             for tool in ["aee_job_status", "aee_job_result"]:
                 _, body = await rpc("tools/call", {"name": tool, "arguments": {"job_id": "../fixture"}})
                 self.assertEqual(self.payload(body)["error_code"], "JOB_NOT_FOUND")
-            for extra, code in [({"agent": "hermes"}, "INVALID_AGENT"),
-                                ({"mode": "read_write"}, "INVALID_MODE"),
-                                ({"model": "other-model"}, "INVALID_EXECUTION_PROFILE"),
-                                ({"reasoning_effort": "--help"}, "INVALID_EXECUTION_PROFILE"),
-                                ({"execution_profile": "--sandbox"}, "INVALID_EXECUTION_PROFILE")]:
+            # Multi-agent recovery: hermes is a registered adapter that cannot
+            # enforce read_only here, so admission refuses with ADAPTER_UNSUPPORTED.
+            # Without a deployment manifest, codex runs through the generic
+            # adapter path, which rejects production model selectors up front
+            # with INVALID_PROFILE (the legacy contract's
+            # INVALID_EXECUTION_PROFILE only applies behind an approved gate).
+            # The write-capable dispatch contract publishes mode as a strict
+            # enum in the connector schema, so an out-of-contract mode is
+            # denied at schema validation with the two supported values named.
+            for extra, code in [({"agent": "hermes"}, "ADAPTER_UNSUPPORTED"),
+                                ({"model": "other-model"}, "INVALID_PROFILE"),
+                                ({"reasoning_effort": "--help"}, "INVALID_PROFILE"),
+                                ({"execution_profile": "--sandbox"}, "INVALID_PROFILE")]:
                 args = {"agent": "codex", "task": "fixture", "working_directory": self.source, **extra}
                 _, body = await rpc("tools/call", {"name": "aee_dispatch", "arguments": args})
                 self.assertEqual(self.payload(body)["error_code"], code)
+            _, body = await rpc("tools/call", {"name": "aee_dispatch", "arguments": {
+                "agent": "codex", "task": "fixture", "working_directory": self.source,
+                "mode": "read_write"}})
+            text = body["result"]["content"][0]["text"]
+            self.assertIn("Input should be 'read_only', 'write' or 'autonomous'", text)
             self.assertEqual(self.gateway.JOB_STORE.list_ids(), [])
         asyncio.run(self.with_client(checks))
 
@@ -179,7 +202,19 @@ class HardenedProtocol(unittest.TestCase):
             result = original_execute(*args, **kwargs)
             proof = successful_fields()['execution']
             return replace(result, evidence=proof['native_tool_evidence'], outcome=proof['result_contract'])
-        with patch.object(gateway, 'execute_codex', side_effect=corroborated_fixture):
+        # Multi-agent recovery routing: the legacy broker-mandated codex
+        # contract only runs behind an approved deployment gate, so admission
+        # is synthesized here with an approved policy and a no-op deployment
+        # gate (offline fixtures — no real Stage-2 approval is claimed or
+        # persisted). The worker keeps the historical non-broker offline
+        # context: policy resolves None after admission, exactly as this test
+        # did before the dispatch-routing change.
+        policy_states = iter([{'schema': 'fixture-policy'}])
+        with patch.object(gateway, 'execute_codex', side_effect=corroborated_fixture), \
+                patch.object(gateway, 'deployment_policy',
+                             side_effect=lambda: next(policy_states, None)), \
+                patch.object(gateway, 'deployment_gate_approved', return_value=True), \
+                patch.object(gateway, 'require_deployment_ready', lambda policy: None):
             asyncio.run(self.with_client(checks))
         # Completion may precede the tiny bookkeeping finally by one instruction.
         for thread in list(gateway._dispatch_pool.values()):

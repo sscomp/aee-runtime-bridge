@@ -48,7 +48,7 @@ loopback ports 8790/8791 free, and an operator-provisioned OpenAI API key file
    otherwise use the reviewed broker-owned 0600 file + `ExecStart=` drop-in.
    → [deployment §4a](deployment.md#4a-model-credential-presentation-on-modern-systemd-verified-pattern)
 8. **Start + restricted surface check.** `systemd-analyze verify` then start
-   broker and `aee-p2c-gateway@restricted`; `/health` 200; exactly the five
+   broker and `aee-p2c-gateway@restricted`; `/health` 200; exactly the six
    remote tools; no `aee_exec`; auth negatives 401. **Stop here until a genuine
    operator review approves production** — startup without the reviewed
    manifest is the honest stop, never `AEE_RUNTIME_MANIFEST` removed.

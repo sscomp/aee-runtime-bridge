@@ -12,7 +12,7 @@ The Secure MCP Tunnel exposes a running restricted AEE v2 MCP gateway to ChatGPT
 over **outbound HTTPS only**: the `tunnel-client` you run dials OpenAI's control
 plane; no inbound port is opened on the gateway host. ChatGPT sends MCP requests
 through the tunnel; the client forwards them to `127.0.0.1:8791` (restricted
-five-tool surface). Checked against the official guides:
+six-tool surface). Checked against the official guides:
 
 - [Secure MCP tunnels](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 - [Custom MCP servers](https://developers.openai.com/api/docs/guides/custom-mcp-server)
@@ -116,9 +116,9 @@ Follow [plugin walkthrough](chatgpt-plugin-deployment.md) to create the private
 Plugin, then perform exactly the same MCP checks as [local
 acceptance](agent-operations.md), but through ChatGPT:
 
-1. discovery/status invocation succeeds and exposes exactly the five restricted
-   tools (`aee_status`, `aee_agents`, `aee_dispatch`, `aee_job_status`,
-   `aee_job_result`);
+1. discovery/status invocation succeeds and exposes exactly the six restricted
+   tools (`aee_status`, `aee_agents`, `aee_dispatch`, `aee_job_cancel`,
+   `aee_job_status`, `aee_job_result`);
 2. one operator-approved **read-only** dispatch completes and its result is
    bounded and redacted as expected;
 3. negatives: wrong forwarded credential → rejected by the gateway; local/full
