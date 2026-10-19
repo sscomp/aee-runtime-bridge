@@ -24,6 +24,12 @@ All routes start with the same three commands below. `install.sh` (the legacy
 HTTP/profile installer) is **not** part of the MCP route; the [legacy reference](docs/legacy-http-profiles.md)
 remains only for the four older HTTP/CLI profiles.
 
+Gateway installs choose a **deployment profile**: `os-native` (default — systemd
+user unit under an existing OS identity, DAC/ACL as the boundary) or `restricted`
+(explicit opt-in — dedicated system accounts, sandbox hardening, mandatory
+workspace confinement). Profile contracts, env schema, adapter provisioning and
+installer/rollback live in [deployment profiles](docs/deployment-profiles.md).
+
 Start with the single [host setup](docs/deployment.md) sequence: clone a reviewed
 commit, install the hash-locked MCP closure, run the credential-free smoke below,
 then use the existing offline packager and operator-approved systemd deployment.

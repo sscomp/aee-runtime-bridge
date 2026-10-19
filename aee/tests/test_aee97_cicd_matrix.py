@@ -682,8 +682,12 @@ class TestWorkflowYamlAgreement(unittest.TestCase):
 
     def test_merge_gate_requires_current_mcp_and_profiles(self) -> None:
         text = self._yaml_text()
-        self.assertIn('needs: [profile-job, mcp-runtime, compatibility-api]', text)
-        for job in ('profile-job', 'mcp-runtime', 'compatibility-api'):
+        # Phase 3 (deployment profiles) adds the `deployment-profiles` job to
+        # the §21.7 gate aggregation; the gate still fails closed on every
+        # member (`if: always()` + explicit `!= "success"` checks).
+        self.assertIn('needs: [profile-job, mcp-runtime, compatibility-api, deployment-profiles]', text)
+        for job in ('profile-job', 'mcp-runtime', 'compatibility-api',
+                    'deployment-profiles'):
             self.assertIn('${{ needs.' + job + '.result }}" != "success"', text)
         self.assertNotIn('continue-on-error', text)
         self.assertIn("-m unittest discover -s tests/mcp -p 'test_*.py'", text)

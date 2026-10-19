@@ -6,6 +6,12 @@ stated. Host- and operator-specific values (`/opt/aee`, numeric UIDs, unit
 names, the approval id) are **examples** — substitute the reviewed values for
 your host. Do not invent any value.
 
+Profile selection is an explicit operator decision on any host: this checklist
+drives the **restricted** profile; a host running the default **os-native**
+profile skips the system-account, manifest and broker steps and instead follows
+the [deployment profiles](deployment-profiles.md) contract (user unit, DAC/ACL
+boundary, optional trusted-dispatch onboarding).
+
 Prerequisites summary: Linux x86_64, systemd with cgroup v2, CPython 3.13.x via
 `uv`, Git, GCC, `prlimit`, rootless capability to install
 [`bwrap`](deployment.md#5-host-evidence-notes-provenance) at `/usr/bin/bwrap`,

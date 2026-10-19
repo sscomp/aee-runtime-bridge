@@ -131,6 +131,15 @@ WRITE_ALLOWED_ROOTS: List[str] = [
 _WRITE_TOKEN_ENV = os.getenv("AEE_WRITE_APPROVAL_TOKEN", "").encode()
 WRITE_APPROVAL_TOKEN = _WRITE_TOKEN_ENV or None
 
+# Deployment profile selection (work order AEE_V2_PHASE3_*): operator-set
+# label surfaced additively in aee_status gateway diagnostics. Unknown/invalid
+# values degrade to None (never guessed, never a capability switch).
+_DEPLOYMENT_PROFILE_RAW = (os.getenv("AEE_DEPLOYMENT_PROFILE") or "").strip()
+AEE_DEPLOYMENT_PROFILE: Optional[str] = (
+    _DEPLOYMENT_PROFILE_RAW
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,24}", _DEPLOYMENT_PROFILE_RAW) else None
+)
+
 # A2 dispatch hard-denylist: never admit write-mode jobs whose working
 # directory sits inside an AEE-owned operational region (source releases,
 # job store, shadow runtime, gateway/tunnel credentials can never be the
@@ -1192,6 +1201,7 @@ async def aee_status() -> str:
             "gateway_uptime_seconds": round(time.time() - _START_TIME, 1),
             "localhost_only": AEE_MCP_HOST == "127.0.0.1",
             "auth_required": AEE_MCP_REQUIRE_AUTH,
+            "deployment_profile": AEE_DEPLOYMENT_PROFILE,
             "trusted_dispatch": (TrustedDispatch.configured().status()
                                  if TrustedDispatch.configured() is not None else None),
         },
