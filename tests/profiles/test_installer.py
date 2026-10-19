@@ -212,6 +212,24 @@ class ApplyTransaction(InstallerFixture):
         self.assertTrue(self.env.exists())
         self.assertTrue(self.jobs.exists())
 
+    def test_apply_failure_yields_structured_receipt(self):
+        # N-4/R2-N20: a mid-apply OSError produces an APPLY_FAILED JSON
+        # receipt with exit 2 (never a bare traceback with exit 1).
+        def _env_with_jobs(jobs_dir):
+            env = Path(self.tmp) / 'brokenjobs.env'
+            env.write_text(self.env.read_text().replace(
+                f'A3_JOB_STORE_DIR={self.jobs}', f'A3_JOB_STORE_DIR={jobs_dir}'))
+            env.chmod(0o600)
+            return str(env)
+        try:
+            self.jobs.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.jobs.parent, 0o500)  # read-only parent → mkdir OSError
+            receipt, code = installer.apply_args(self._args(dry_run=False, apply=True))
+            self.assertEqual((receipt['result'], code), ('APPLY_FAILED', 2))
+            self.assertTrue(receipt['errors'])
+        finally:
+            os.chmod(self.jobs.parent, 0o700)
+
     def test_receipt_contains_var_names_not_values(self):
         receipt, _ = installer.apply_args(self._args(dry_run=False, apply=True))
         blob = json.dumps(receipt)
