@@ -230,6 +230,23 @@ class ApplyTransaction(InstallerFixture):
         finally:
             os.chmod(self.jobs.parent, 0o700)
 
+    def test_receipt_write_failure_is_not_apply_failure(self):
+        # R3-N3: a failed receipt write must NOT report APPLY_FAILED (the
+        # installation itself completed); it reports APPLY_OK_RECEIPT_FAILED.
+        ro = Path(self.tmp) / 'ro'
+        ro.mkdir()
+        ro.chmod(0o500)
+        try:
+            receipt, code = installer.apply_args(self._args(
+                dry_run=False, apply=True, receipt=str(ro / 'r.json')))
+            self.assertEqual((receipt['result'], code), ('APPLY_OK_RECEIPT_FAILED', 2))
+            self.assertIn('APPLY_OK', receipt['result'])
+            # the installation itself completed: the unit file exists
+            self.assertTrue((Path(self.tmp) / 'units' / 'aee-gateway.service').is_file())
+            self.assertIn('completed', receipt['note'])
+        finally:
+            ro.chmod(0o700)
+
     def test_receipt_contains_var_names_not_values(self):
         receipt, _ = installer.apply_args(self._args(dry_run=False, apply=True))
         blob = json.dumps(receipt)
@@ -334,6 +351,37 @@ class RestrictedStaging(InstallerFixture):
         receipt, code = installer.rollback_last(args)
         self.assertEqual(receipt['result'], 'ROLLBACK_REQUIRES_PROFILE')
         self.assertEqual(code, 1)
+
+    def test_rollback_declines_negative_and_malformed_entries(self):
+        # R3-N1 (negative mode wraps into setgid/sticky perms) and R3-N2
+        # (missing meta keys must decline, never raise): zero modification.
+        py2 = Path(self.tmp + '/fakepython2')
+        py2.write_text('#!/bin/sh\nexit 0\n')
+        py2.chmod(0o755)
+        installer.apply_args(self._args(dry_run=False, apply=True))
+        installer.apply_args(self._args(dry_run=False, apply=True, python=str(py2),
+                                        upgrade_authorized=True))
+        stamp = sorted((Path(self.tmp) / 'backups').iterdir())[-1]
+        meta_path = stamp / 'BACKUP-META.json'
+        meta = json.loads(meta_path.read_text())
+        good = meta['entries'][0]
+        unit = Path(meta['unit_path'])
+        before = unit.read_text()
+        # negative mode: prior behavior restored with setgid/sticky mangling
+        meta['entries'] = [dict(good, mode='-0o600')]
+        meta_path.write_text(json.dumps(meta))
+        receipt, code = installer.rollback_last(self._args())
+        self.assertEqual((receipt['result'], code), ('ROLLBACK_BLOCKED', 1))
+        self.assertTrue(any('out-of-range mode' in d for d in receipt['declined']))
+        self.assertEqual(unit.read_text(), before)
+        # missing 'backup' key: declined, no KeyError traceback, unit intact
+        meta['entries'] = [{'original': str(unit), 'sha256': good['sha256'],
+                            'mode': '0o644'}]
+        meta_path.write_text(json.dumps(meta))
+        receipt, code = installer.rollback_last(self._args())
+        self.assertEqual((receipt['result'], code), ('ROLLBACK_BLOCKED', 1))
+        self.assertTrue(any('malformed entry' in d for d in receipt['declined']))
+        self.assertEqual(unit.read_text(), before)
 
     def test_rollback_declines_out_of_provenance_and_sha_mismatch(self):
         # N-3: a crafted BACKUP-META.json cannot overwrite arbitrary files

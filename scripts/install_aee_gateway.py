@@ -483,7 +483,9 @@ def apply_args(args):
         try:
             Path(args.receipt).expanduser().resolve().write_text(json.dumps(receipt, indent=1))
         except OSError as exc:
-            return {'result': 'APPLY_FAILED',
+            # R3-N3: the installation itself COMPLETED — do not report
+            # APPLY_FAILED, or automation would roll back a good install.
+            return {'result': 'APPLY_OK_RECEIPT_FAILED',
                     'errors': [f'receipt write failed: {type(exc).__name__}: {exc}'],
                     'backups_dir': backup_ref,
                     'backups': [b['original'] for b in made_backups],
@@ -545,14 +547,21 @@ def rollback_last(args):
         for entry in meta.get('entries') or []:
             try:
                 mode = int(entry.get('mode', '0o644'), 8)
-            except (ValueError, TypeError):
-                declined.append(f"declined malformed mode {entry.get('mode')!r} "
-                                f'for {entry.get("original")!r}')
+            except (AttributeError, ValueError, TypeError):
+                declined.append(f'declined malformed entry {entry!r} (unparseable mode)')
                 continue
-            if not isinstance(mode, int) or mode > 0o7777:
+            # R3-N1: bounds must be checked on BOTH sides — Python's os.chmod
+            # wraps negative ints into a 32-bit payload (setgid/sticky bits),
+            # so a negative mode would silently mangle the restored unit.
+            if mode < 0 or mode > 0o7777:
                 declined.append(f'declined out-of-range mode {entry.get("mode")!r}')
                 continue
-            src, dst = Path(entry['backup']), Path(entry['original'])
+            try:
+                src, dst = Path(entry['backup']), Path(entry['original'])
+            except (KeyError, TypeError):
+                declined.append("declined malformed entry (missing or invalid "
+                                "'backup'/'original' keys)")
+                continue
             if str(dst) != str(meta['unit_path']):
                 declined.append(f'declined out-of-provenance restore target: {dst}')
                 continue
