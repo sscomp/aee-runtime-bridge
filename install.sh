@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # AEE Epic 9.3 — Installer Shell Wrapper (Master Plan §21.3).
 #
+# NOTE (deployment profiles): this legacy wrapper serves the four older HTTP/CLI
+# profiles (full/mini/edge/developer) only. The MCP gateway deployment profiles
+# (os-native / restricted) are installed by scripts/install-aee-gateway.sh; see
+# docs/deployment-profiles.md.
+#
 # Single profile-aware installer wrapper that delegates ALL profile
 # validation, planning, and read-only pre-flight to the canonical
 # Python CLI (aee.cli → aee.installer.backend). Per Master Plan

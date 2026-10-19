@@ -14,7 +14,7 @@ DOCS = ['README.md', 'docs/architecture.md', 'docs/deployment.md',
         'docs/MIGRATION_FROM_AEE_MINI.md', 'docs/HERMES_ADAPTER_CONTRACT_MATRIX.md',
         'config/p2c/README.md', 'tests/mcp/README.md',
         'docs/chatgpt-secure-mcp-setup-runbook.md', 'docs/a2-secure-mcp-deploy-verify.md',
-        'docs/a2-uninstall-reinstall-migration.md']
+        'docs/a2-uninstall-reinstall-migration.md', 'docs/deployment-profiles.md']
 SIX = {'aee_status', 'aee_agents', 'aee_dispatch', 'aee_job_cancel',
        'aee_job_status', 'aee_job_result'}
 

@@ -186,6 +186,29 @@ jobs:
       - name: Public source secret gate
         run: python scripts/scan-aee-baseline-secrets.py
 
+  deployment-profiles:
+    name: Deployment profiles, installer and trusted-dispatch onboarding
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install hashed MCP closure
+        run: python -m pip install --require-hashes -r requirements-mcp.lock
+      - name: Profile schema and shipped examples
+        run: python scripts/validate_profiles.py
+      - name: Profile contract, installer, provisioning and adapter-audit tests
+        run: PYTHONPATH=.:tests/mcp python -m unittest discover -s tests/profiles -p 'test_*.py' -v
+      - name: Adapter discovery report (non-strict; CI has no agent binaries)
+        run: python scripts/audit_adapters.py
+      - name: Canonical documentation and config contract
+        run: python scripts/check-canonical-docs.py
+      - name: Public source secret gate
+        run: python scripts/scan-aee-baseline-secrets.py
+
   compatibility-api:
     name: Supported HTTP API and job lifecycle
     runs-on: ubuntu-latest
@@ -204,15 +227,15 @@ jobs:
   merge-gate:
     name: Merge Gate (all active contracts green)
     runs-on: ubuntu-latest
-    needs: [profile-job, mcp-runtime, compatibility-api]
+    needs: [profile-job, mcp-runtime, compatibility-api, deployment-profiles]
     if: ${{ always() }}
     steps:
       - name: Enforce all-green
         run: |
           set -e
           echo "profile-job result: ${{ needs.profile-job.result }}"
-          if [ "${{ needs.profile-job.result }}" != "success" ] || [ "${{ needs.mcp-runtime.result }}" != "success" ] || [ "${{ needs.compatibility-api.result }}" != "success" ]; then
-            echo "::error::§21.7 merge gate failed: profile-job did not succeed (got ${{ needs.profile-job.result }}). All 4 profiles, MCP and HTTP API must be green for merge to main."
+          if [ "${{ needs.profile-job.result }}" != "success" ] || [ "${{ needs.mcp-runtime.result }}" != "success" ] || [ "${{ needs.compatibility-api.result }}" != "success" ] || [ "${{ needs.deployment-profiles.result }}" != "success" ]; then
+            echo "::error::§21.7 merge gate failed: profile-job did not succeed (got ${{ needs.profile-job.result }}). All 4 profiles, MCP, HTTP API and deployment profiles must be green for merge to main."
             exit 1
           fi
           echo "Merge gate: all active contracts green. Reviewer approval still required."
