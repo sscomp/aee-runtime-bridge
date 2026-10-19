@@ -68,6 +68,29 @@ class Provisioning(unittest.TestCase):
                               self._args(disable_write_autonomous=True),
                               'c' * 64)
 
+    def test_disable_write_autonomous_alone_revokes(self):
+        # (review P4-R2 test note) disable-only is tested directly: enabled
+        # True → False through --disable-write-autonomous without any other
+        # flag interaction.
+        existing = {'principals': {'a' * 64: 'old'}, 'agents': ['claude'],
+                    'enabled': True}
+        result = prov.build_policy(existing,
+                                   self._args(enable_write_autonomous=False,
+                                              disable_write_autonomous=True),
+                                   'c' * 64)
+        self.assertFalse(result['enabled'])
+        self.assertEqual(result['principals']['c' * 64], 'host-principal')
+
+    def test_non_dict_policy_refused(self):
+        # N-5: valid-JSON non-dict values are invalid policies, not empty ones.
+        self.policy_path.parent.mkdir(parents=True)
+        for blob in ('[1,2,3]', '"a string"', '7', 'null'):
+            self.policy_path.write_text(blob)
+            with self.assertRaises(SystemExit):
+                prov._load_existing(self.policy_path)
+            self.assertEqual(prov._load_existing(self.policy_path,
+                                                 overwrite_invalid=True), {})
+
     def test_invalid_existing_policy_blocksWithout_overwrite(self):
         # P4 F-10: a corrupt/unknown-schema policy must not be silently
         # rebuilt over (its principals would be dropped); either refused or

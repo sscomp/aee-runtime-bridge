@@ -271,6 +271,83 @@ class RestrictedStaging(InstallerFixture):
         receipt, _ = installer.apply_args(args)
         self.assertEqual(receipt['result'], 'PREFLIGHT_FAILED')
 
+    def _restricted_args(self, **over):
+        over.setdefault('apply', True)
+        over.setdefault('dry_run', not over['apply'])
+        return self._args(profile='restricted',
+                          env_path=str(self._restricted_env()),
+                          staging_dir=self.tmp + '/staging', unit_mode_user=False,
+                          **over)
+
+    def test_restricted_rerun_is_idempotent_not_refused(self):
+        # N-1 (review P4-R2): F-6 must not turn the tool's OWN staged units
+        # into unmanaged collisions — a restricted re-run is a no-op.
+        staged = Path(self.tmp) / 'staging' / 'aee-p2c-gateway@.service'
+        first, code = installer.apply_args(self._restricted_args())
+        self.assertEqual((first['result'], code), ('OK', 0))
+        mtime = staged.stat().st_mtime_ns
+        second, _ = installer.apply_args(self._restricted_args())
+        self.assertEqual(second['result'], 'OK')
+        self.assertEqual(staged.stat().st_mtime_ns, mtime)
+        self.assertTrue(any('left untouched' in entry for entry in second['changed']))
+        stamps = list((Path(self.tmp) / 'backups').iterdir()) \
+            if (Path(self.tmp) / 'backups').exists() else []
+        self.assertEqual(stamps, [])
+
+    def test_restricted_dry_run_describes_would_stage(self):
+        # N-6: dry-run describes the WOULD-be staging instead of a silent [].
+        receipt, _ = installer.apply_args(self._restricted_args(apply=False))
+        self.assertTrue(any('would-stage restricted unit' in c for c in receipt['changed']))
+        self.assertFalse(Path(self.tmp, 'staging').exists())
+
+    def test_apply_corrects_unit_mode_drift(self):
+        # N-7: byte-identical + mode-drifted unit is corrected idempotently.
+        unit = Path(self.tmp) / 'units' / 'aee-gateway.service'
+        installer.apply_args(self._args(dry_run=False, apply=True))
+        os.chmod(unit, 0o600)
+        receipt, _ = installer.apply_args(self._args(dry_run=False, apply=True))
+        self.assertEqual(unit.stat().st_mode & 0o777, 0o644)
+        self.assertTrue(any('chmod 0644' in c for c in receipt['changed']))
+
+    def test_rollback_requires_profile(self):
+        # N-2: a shared backup root must never be rolled back profile-less.
+        args = self._args()
+        args.profile = None
+        receipt, code = installer.rollback_last(args)
+        self.assertEqual(receipt['result'], 'ROLLBACK_REQUIRES_PROFILE')
+        self.assertEqual(code, 1)
+
+    def test_rollback_declines_out_of_provenance_and_sha_mismatch(self):
+        # N-3: a crafted BACKUP-META.json cannot overwrite arbitrary files
+        # (provenance filter) or restore a damaged backup (sha check).
+        py2 = Path(self.tmp + '/fakepython2')
+        py2.write_text('#!/bin/sh\nexit 0\n')
+        py2.chmod(0o755)
+        installer.apply_args(self._args(dry_run=False, apply=True))
+        installer.apply_args(self._args(dry_run=False, apply=True, python=str(py2),
+                                        upgrade_authorized=True))
+        stamp = sorted((Path(self.tmp) / 'backups').iterdir())[-1]
+        meta_path = stamp / 'BACKUP-META.json'
+        meta = json.loads(meta_path.read_text())
+        victim = Path(self.tmp) / 'victim.txt'
+        victim.write_text('precious')
+        meta['entries'] = [{'original': str(victim),
+                            'backup': meta['entries'][0]['backup'],
+                            'sha256': meta['entries'][0]['sha256'],
+                            'mode': '0o1777'}]
+        meta_path.write_text(json.dumps(meta))
+        receipt, code = installer.rollback_last(self._args())
+        self.assertEqual((receipt['result'], code), ('ROLLBACK_BLOCKED', 1))
+        self.assertTrue(any('out-of-provenance' in d for d in receipt['declined']))
+        self.assertEqual(victim.read_text(), 'precious')
+        meta['entries'] = [{'original': meta['unit_path'],
+                            'backup': meta['entries'][0]['backup'],
+                            'sha256': '0' * 64, 'mode': '0o644'}]
+        meta_path.write_text(json.dumps(meta))
+        receipt, code = installer.rollback_last(self._args())
+        self.assertEqual((receipt['result'], code), ('ROLLBACK_BLOCKED', 1))
+        self.assertTrue(any('integrity mismatch' in d for d in receipt['declined']))
+
 
 if __name__ == '__main__':
     unittest.main()

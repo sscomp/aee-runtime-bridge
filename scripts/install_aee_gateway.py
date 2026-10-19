@@ -321,7 +321,12 @@ def apply_args(args):
     env_path = Path(args.env_path).expanduser().resolve()
     workdir = Path(args.state_dir or env_path.parent).resolve()
     unit_path = _unit_path(args)
-    unit_text = _render_unit(args, env_path, workdir)
+    try:
+        unit_text = _render_unit(args, env_path, workdir)
+    except (OSError, ValueError, KeyError, IndexError) as exc:
+        return {'result': 'PREFLIGHT_FAILED',
+                'errors': [f'unit render failed: {type(exc).__name__}: {exc}'],
+                'warnings': [], 'facts': []}, 1
     errors, warnings, facts = preflight(args)
     if errors:
         return {'result': 'PREFLIGHT_FAILED', 'errors': errors, 'warnings': warnings,
@@ -333,6 +338,7 @@ def apply_args(args):
     existing_sha = _sha256(unit_path) if unit_path.exists() else None
     sidecar_path = Path(str(unit_path) + '.aee-installer.json')
     unit_changed = existing_sha != unit_sha
+    prefix = '' if args.apply else 'would-'
 
     # Backups: only files about to change are copied (never the operator env).
     backup_ref, made_backups = None, []
@@ -341,68 +347,105 @@ def apply_args(args):
                       'env_path': str(env_path)}
         backup_ref, made_backups = _backup([unit_path], backups_dir, provenance=provenance)
 
-    if args.apply:
-        # env file: only permissions are managed (values are operator-owned;
-        # the prior mode is recorded here instead of copying secret material).
-        if (env_path.stat().st_mode & 0o777) != 0o600:
-            prior_mode = oct(env_path.stat().st_mode & 0o777)
-            os.chmod(env_path, 0o600)
-            changed.append(f'chmod 0600 {env_path} (prior mode {prior_mode})')
+    try:
+        if args.apply:
+            # env file: only permissions are managed (values are operator-
+            # owned; the prior mode is recorded, never copied or archived).
+            if (env_path.stat().st_mode & 0o777) != 0o600:
+                prior_mode = oct(env_path.stat().st_mode & 0o777)
+                os.chmod(env_path, 0o600)
+                changed.append(f'chmod 0600 {env_path} (prior mode {prior_mode})')
 
-    if args.profile == 'os-native':
-        if args.apply and unit_changed:
-            unit_path.parent.mkdir(parents=True, exist_ok=True)
-            unit_path.write_text(unit_text)
+        # Apply-time TOCTOU guard: refuse to write over a unit whose
+        # managed-ness changed between preflight and this write.
+        if (args.apply and unit_path.exists() and existing_sha is not None
+                and not _sidecar_matches(unit_path, sidecar_path)
+                and not args.upgrade_authorized):
+            return {'result': 'APPLY_FAILED',
+                    'errors': ['unit/its marker changed between preflight and '
+                               'apply; refusing write (re-run to re-preflight)'],
+                    'backups_dir': backup_ref,
+                    'backups': [b['original'] for b in made_backups]}, 2
+
+        # Unit mode is idempotently corrected even when bytes are identical
+        # (a drifted 0600 unit must not stay 0600 with changed: []).
+        if args.apply and unit_path.exists() and (unit_path.stat().st_mode & 0o777) != 0o644:
             os.chmod(unit_path, 0o644)
-        if unit_changed:
-            changed.append(f'write unit {unit_path}')
-        marker = {'marker': RECEIPT_SCHEMA, 'unit_sha256': unit_sha}
+            changed.append(f'chmod 0644 {unit_path}')
+
+        if args.profile == 'os-native':
+            if args.apply and unit_changed:
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_path.write_text(unit_text)
+                os.chmod(unit_path, 0o644)
+            if unit_changed:
+                changed.append(f'{prefix}write unit {unit_path}')
+            env_fields = parse_env(env_path.read_text())
+            jobs_dir = env_fields.get('A3_JOB_STORE_DIR')
+            if jobs_dir and not Path(jobs_dir).exists():
+                if args.apply:
+                    Path(jobs_dir).mkdir(parents=True, exist_ok=True)
+                    os.chmod(jobs_dir, 0o700)
+                changed.append(f'{prefix}create operator job-store dir {jobs_dir} '
+                               '(A3_JOB_STORE_DIR, 0700)')
+            systemctl_actions = _maybe_systemctl(args, unit_path)
+        else:
+            # restricted: stage the canonical P2C unit + print operator
+            # commands; the operator's env is installed BY THE OPERATOR
+            # (never copied here). Sidecar marker applies to staging too, so
+            # a re-run is idempotent rather than refused as unmanaged.
+            if args.apply and unit_changed:
+                staging = Path(args.staging_dir).expanduser().resolve()
+                staging.mkdir(parents=True, exist_ok=True, mode=0o700)
+                unit_path.write_text(unit_text)
+                os.chmod(unit_path, 0o644)
+            if unit_changed:
+                changed.append(f'{prefix}stage restricted unit → {unit_path}')
+            elif args.apply:
+                changed.append('stage restricted unit: byte-identical, '
+                               f'{unit_path} left untouched (no backup taken)')
+            systemctl_actions = ['operator commands printed; no systemctl action taken',
+                                 f'sudo install -o root -g root -m 0644 {unit_path} /etc/systemd/system/aee-p2c-gateway@.service',
+                                 f'sudo install -o root -g root -m 0600 {env_path} /etc/aee/gateway-restricted.env',
+                                 'sudo systemctl daemon-reload && sudo systemctl enable --now aee-p2c-gateway@restricted.service',
+                                 'broker unit + runtime slice + accounts + manifests + deployment gate '
+                                 'are prerequisites: docs/deployment.md §3–4 and docs/fresh-host-bootstrap.md']
+
+        # Sidecar marker, both profiles (written next to the managed unit;
+        # for restricted it lives in the staging dir): makes a re-run an
+        # idempotent no-op instead of an unmanaged-collision refusal.
         try:
             prior_marker = json.loads(sidecar_path.read_text())
         except (OSError, ValueError):
-            prior_marker = {}
-        marker_changed = not (prior_marker.get('marker') == RECEIPT_SCHEMA and
-                              prior_marker.get('unit_sha256') == unit_sha)
+            prior_marker = None
+        marker_changed = not (isinstance(prior_marker, dict)
+                              and prior_marker.get('marker') == RECEIPT_SCHEMA
+                              and prior_marker.get('unit_sha256') == unit_sha)
         if marker_changed:
             if args.apply:
+                if args.profile == 'restricted' and not unit_path.parent.exists():
+                    unit_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 sidecar_path.write_text(json.dumps(
                     {'marker': RECEIPT_SCHEMA,
                      'installed_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                      'unit_sha256': unit_sha}, indent=1))
                 os.chmod(sidecar_path, 0o644)
-            changed.append(f'write sidecar {sidecar_path.name}')
-        env_fields = parse_env(env_path.read_text())
-        jobs_dir = env_fields.get('A3_JOB_STORE_DIR')
-        if jobs_dir and args.apply and not Path(jobs_dir).exists():
-            Path(jobs_dir).mkdir(parents=True, exist_ok=True)
-            os.chmod(jobs_dir, 0o700)
-            changed.append(f'create operator job-store dir {jobs_dir} (0700)')
-        systemctl_actions = _maybe_systemctl(args, unit_path)
-    else:
-        # restricted: stage the canonical P2C unit + print operator commands;
-        # the operator's env is installed BY THE OPERATOR (never copied here).
-        if args.apply and unit_changed:
-            staging = Path(args.staging_dir).expanduser().resolve()
-            staging.mkdir(parents=True, exist_ok=True, mode=0o700)
-            staged_unit = unit_path
-            staged_unit.write_text(unit_text)
-            os.chmod(staged_unit, 0o644)
-            changed.append(f'staged restricted unit → {staged_unit}')
-        elif not unit_changed:
-            changed.append(f'staged restricted unit → {unit_path} (byte-identical, left untouched)')
-        systemctl_actions = ['operator commands printed; no systemctl action taken',
-                             f'sudo install -o root -g root -m 0644 {unit_path} /etc/systemd/system/aee-p2c-gateway@.service',
-                             f'sudo install -o root -g root -m 0600 {env_path} /etc/aee/gateway-restricted.env',
-                             'sudo systemctl daemon-reload && sudo systemctl enable --now aee-p2c-gateway@restricted.service',
-                             'broker unit + runtime slice + accounts + manifests + deployment gate '
-                             'are prerequisites: docs/deployment.md §3–4 and docs/fresh-host-bootstrap.md']
+            changed.append(f'{prefix}write sidecar {sidecar_path.name}')
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        # N-4: no bare traceback on apply; the APPLY_FAILED receipt (exit 2)
+        # preserves the backup pointer so the operator can roll back.
+        return {'result': 'APPLY_FAILED',
+                'errors': [f'{type(exc).__name__}: {exc}'],
+                'backups_dir': backup_ref,
+                'backups': [b['original'] for b in made_backups],
+                'note': 'backups (if any) are preserved; recover with --rollback-last'}, 2
 
     receipt = {
         'result': 'OK',
         'schema': RECEIPT_SCHEMA,
         'created_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'profile': args.profile,
-        'mode': 'apply' if args.apply else 'dry-run',
+        'mode': 'apply' if args.apply else ('check' if getattr(args, 'check', False) else 'dry-run'),
         'release_dir': str(Path(args.release_dir).resolve()),
         'env_path': str(env_path),
         'env_keys': sorted(parse_env(env_path.read_text())) if env_path.exists() else [],
@@ -461,7 +504,19 @@ def _maybe_systemctl(args, unit_path):
 
 
 def rollback_last(args):
-    """Restore the most recent backup stamp that matches the requested profile."""
+    """Restore the most recent backup stamp that matches the requested profile.
+
+    Hardened: profile is REQUIRED (no cross-profile restore by omission); a
+    stamp's entries are restored only to the manifest's own provenance
+    unit path, with backup content verified against the recorded sha256
+    before any copy — a tampered or foreign BACKUP-META.json cannot be used
+    to overwrite arbitrary files or apply arbitrary modes.
+    """
+    if not args.profile:
+        return {'result': 'ROLLBACK_REQUIRES_PROFILE',
+                'note': 'pass the profile(s) recorded in the BACKUP-META.json of '
+                        'the backups to restore; refusing a profile-less '
+                        'rollback over a shared backup root'}, 1
     backup_root = Path(args.backup_dir or '~/.local/state/aee-installer/backups').expanduser()
     stamps = sorted((d for d in backup_root.iterdir() if d.is_dir()),
                     key=lambda d: d.name, reverse=True) if backup_root.is_dir() else []
@@ -470,21 +525,41 @@ def rollback_last(args):
             meta = json.loads((stamp / 'BACKUP-META.json').read_text())
         except (OSError, ValueError):
             continue
-        if args.profile and meta.get('profile') and meta.get('profile') != args.profile:
+        if meta.get('profile') != args.profile:
             continue  # never cross-profile restore (shared backup roots happen)
-        restored = []
+        if not meta.get('unit_path'):
+            continue  # legacy/foreign stamp without provenance: fail closed
+        restored, declined = [], []
         for entry in meta.get('entries') or []:
             src, dst = Path(entry['backup']), Path(entry['original'])
-            dstdir = dst.parent
-            dstdir.mkdir(parents=True, exist_ok=True)
+            if str(dst) != str(meta['unit_path']):
+                declined.append(f'declined out-of-provenance restore target: {dst}')
+                continue
+            if not src.is_file():
+                declined.append(f'backup copy missing: {src}')
+                continue
+            try:
+                if _sha256(src) != entry.get('sha256'):
+                    declined.append(f'backup integrity mismatch (sha256): {src}')
+                    continue
+            except OSError as exc:
+                declined.append(f'backup unreadable: {src} ({exc})')
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             os.chmod(dst, int(entry.get('mode', '0o644'), 8))
             restored.append({'restored': str(dst), 'from': str(src),
                              'mode': entry.get('mode', '0o644')})
         if not restored:
+            if declined:
+                return {'result': 'ROLLBACK_BLOCKED', 'stamp': stamp.name,
+                        'declined': declined,
+                        'note': 'backup stamp failed integrity/provenance checks; '
+                                'nothing was modified'}, 1
             continue
         return {'result': 'ROLLBACK_OK', 'stamp': stamp.name,
-                'profile': meta.get('profile'), 'restored': restored}, 0
+                'profile': meta.get('profile'), 'restored': restored,
+                'declined': declined}, 0
     if not stamps:
         return {'result': 'ROLLBACK_NOTHING_TO_RESTORE'}, 1
     return {'result': 'ROLLBACK_NOTHING_TO_RESTORE',
@@ -496,20 +571,27 @@ def uninstall(args):
     if not args.profile:
         args.profile = 'os-native'  # default: the os-native user unit
     unit_path = _unit_path(args)
-    removed = []
-    if unit_path.exists() and args.apply:
-        unit_path.unlink()
-        removed.append(str(unit_path))
     sidecar = Path(str(unit_path) + '.aee-installer.json')
-    if sidecar.exists() and args.apply:
-        sidecar.unlink()
-        removed.append(str(sidecar))
-    if unit_path.exists() or sidecar.exists():
+    removed, would = [], []
+    for path in (unit_path, sidecar):
+        if path.exists():
+            if args.apply:
+                path.unlink()
+                removed.append(str(path))
+            else:
+                would.append(f'would-remove {path}')
+        else:
+            would.append(f'{path} (absent)')
+    if args.apply:
+        state = 'UNINSTALL_OK'
+        listed = removed
+    elif any('would-remove' in w for w in would):
         state = 'UNINSTALL_DRY_RUN'
+        listed = would
     else:
-        state = 'UNINSTALL_OK' if args.apply else 'UNINSTALL_NOTHING_INSTALLED'
-    return {'result': state, 'removed': removed if args.apply else
-            [str(unit_path), str(sidecar)],
+        state = 'UNINSTALL_NOTHING_INSTALLED'
+        listed = would
+    return {'result': state, 'removed': listed,
             'note': 'env file and job state are operator data; never auto-removed'}, 0
 
 
@@ -550,10 +632,20 @@ def main():
     args = parser.parse_args()
     args.unit_mode_user = args.unit_mode == 'user'
 
+    selected = [n for n in ('check', 'dry_run', 'apply', 'rollback_last', 'uninstall')
+                if getattr(args, n)]
+    if len(selected) > 1:
+        parser.error('at most one of --check/--dry-run/--apply/--rollback-last/'
+                     '--uninstall may be given')
+
     if args.rollback_last or args.uninstall:
         # Maintenance modes: provenance comes from backup METAs; the release
-        # tree and env are irrelevant, and uninstall uses the profile to pick
-        # the unit path (pass --profile os-native or omitted? keep optional).
+        # tree and env are irrelevant. Rollback MUST carry the profile (the
+        # BACKUP-META profile filter is fail-closed otherwise).
+        if args.rollback_last and not args.profile:
+            parser.error('--rollback-last requires --profile (os-native or '
+                         'restricted) so a shared backup root never restores '
+                         'another profile\'s stamp')
         if args.rollback_last:
             receipt, code = rollback_last(args)
         else:

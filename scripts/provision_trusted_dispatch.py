@@ -71,13 +71,22 @@ def _load_existing(policy_path: Path, *, overwrite_invalid=False):
                          f'({type(exc).__name__}); the gateway fails closed on it. '
                          'Rebuilding would drop its principals — pass '
                          '--overwrite-invalid to replace it deliberately.')
-    if isinstance(data, dict) and data.get('schema') != 'aee-secure-mcp-trusted-dispatch-v1':
+    if not isinstance(data, dict):
+        # Valid JSON that is not a policy object (array/string/number/null)
+        # would have been silently taken for an empty policy and rebuilt
+        # over — refuse like any other invalid policy.
+        if overwrite_invalid:
+            return {}
+        raise SystemExit('existing policy file is valid JSON but not a policy '
+                         'object; the gateway fails closed on it. Pass '
+                         '--overwrite-invalid to replace it deliberately.')
+    if data.get('schema') != 'aee-secure-mcp-trusted-dispatch-v1':
         if overwrite_invalid:
             return {}
         raise SystemExit(f"existing policy schema {data.get('schema')!r} is unknown "
                          'to this tool; pass --overwrite-invalid to replace it '
                          'deliberately.')
-    return data if isinstance(data, dict) else {}
+    return data
 
 
 def build_policy(existing, args, fingerprint):
@@ -176,7 +185,7 @@ def main():
     if not args.dry_run:
         policy_path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(policy_path.parent, 0o700)
-        tmp = policy_path.with_suffix('.tmp')
+        tmp = policy_path.with_name(f'{policy_path.name}.tmp-{os.getpid()}')
         with open(tmp, 'w') as handle:
             json.dump(policy, handle, indent=1)
         os.chmod(tmp, 0o600)

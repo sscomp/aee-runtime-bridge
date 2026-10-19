@@ -143,7 +143,11 @@ fail-before-write (env schema, 0600 mode, `--port` vs env `AEE_MCP_PORT`
 cross-check, port bind probe, disk headroom,
 unmanaged-collision refusal verified by sidecar marker **and** recorded unit
 hash), apply is an idempotent transaction (byte-identical unit and sidecar
-rewrite nothing; only files that actually change are backed up), and receipts
+rewrite nothing; only files that actually change are backed up — mode drift
+is corrected even when bytes are identical; the sidecar marker exists in the
+staging dir too, so restricted re-runs are no-ops, not refusals), rollback
+restores only profile-matched, sha-verified, provenance-listed unit paths
+from `BACKUP-META.json`, and receipts
 record env var *names*, never values.
 
 ```bash
