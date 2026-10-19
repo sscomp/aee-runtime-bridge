@@ -1,0 +1,226 @@
+{
+  "schema": "aee-deployment-profile-schema-v1",
+  "description": "Machine-checkable contract for the two first-class AEE MCP gateway deployment profiles. The installer preflight and CI validate env files against this schema. Secret VALUES never appear here or in any example file - only placeholders.",
+  "value_placeholder_prefix": "<",
+  "profiles": {
+    "os-native": {
+      "display_name": "OS-native (default general-purpose install)",
+      "default": true,
+      "service_model": "systemd --user service under an explicitly chosen existing OS identity (recommended parity baseline), or any existing identity that owns the agent toolchain",
+      "working_directory_policy": "any absolute existing directory enterable/readable by the executor identity; no mandatory allowlist; AEE-internal regions excluded by ownership and admission checks",
+      "allowlist_default": "unset",
+      "env": {
+        "required": [
+          {
+            "name": "AEE_MCP_HOST",
+            "value": "127.0.0.1",
+            "fixed": true
+          },
+          {
+            "name": "AEE_MCP_REQUIRE_AUTH",
+            "value": "true",
+            "fixed": true
+          },
+          {
+            "name": "AEE_MCP_SURFACE",
+            "value": "restricted",
+            "fixed": true
+          },
+          {
+            "name": "AEE_MCP_PORT",
+            "placeholder": "<port>",
+            "default_hint": "8791",
+            "value": "8791"
+          },
+          {
+            "name": "MCP_BRIDGE_API_KEY",
+            "placeholder": "<provision-private-mcp-key>",
+            "secret": true
+          },
+          {
+            "name": "AEE_DEPLOYMENT_PROFILE",
+            "value": "os-native",
+            "fixed": true
+          },
+          {
+            "name": "A3_JOB_STORE_DIR",
+            "placeholder": "<operator-state-dir>/jobs"
+          }
+        ],
+        "optional": [
+          {
+            "name": "AEE_TRUSTED_DISPATCH_POLICY",
+            "placeholder": "<0600-policy-json-path>",
+            "note": "required on this host for trusted write/autonomous admission; absence leaves write/autonomous subject to the legacy fail-closed gates"
+          },
+          {
+            "name": "AEE_EXECUTION_POLICY",
+            "placeholder": "<execution-budget-json-path>"
+          },
+          {
+            "name": "A3_ADAPTER_CODEX_BIN",
+            "placeholder": "<absolute-executable-path>"
+          },
+          {
+            "name": "A3_ADAPTER_CLAUDE_BIN",
+            "placeholder": "<absolute-executable-path>"
+          },
+          {
+            "name": "A3_ADAPTER_HERMES_BIN",
+            "placeholder": "<absolute-executable-path>"
+          },
+          {
+            "name": "A3_ADAPTER_PI_BIN",
+            "placeholder": "<absolute-executable-path>"
+          },
+          {
+            "name": "A3_CODEX_BIN",
+            "placeholder": "<absolute-executable-path>"
+          },
+          {
+            "name": "A3_DISPATCH_ALLOWED_ROOTS",
+            "placeholder": "<optional-explicit-root-list>",
+            "note": "optional; os-native installs must not be provisioned with an implicit workspace allowlist"
+          },
+          {
+            "name": "ANTHROPIC_BASE_URL",
+            "placeholder": "<provider-url>",
+            "secret": true
+          },
+          {
+            "name": "ANTHROPIC_AUTH_TOKEN",
+            "placeholder": "<provider-token>",
+            "secret": true
+          },
+          {
+            "name": "ANTHROPIC_MODEL",
+            "placeholder": "<model-id>",
+            "secret": true
+          },
+          {
+            "name": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "placeholder": "<model-id>",
+            "secret": true
+          },
+          {
+            "name": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "placeholder": "<model-id>",
+            "secret": true
+          },
+          {
+            "name": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "placeholder": "<model-id>",
+            "secret": true
+          }
+        ],
+        "forbidden_defaults": [
+          {
+            "name": "A3_WORKSPACE_MANIFEST",
+            "note": "restricted-profile artifact; not provisioned by os-native"
+          },
+          {
+            "name": "AEE_RUNTIME_MANIFEST",
+            "note": "restricted-profile artifact; not provisioned by os-native"
+          },
+          {
+            "name": "AEE_BROKER_CONTROL",
+            "note": "restricted-profile artifact; not provisioned by os-native"
+          }
+        ]
+      },
+      "systemd": {
+        "scope": "user",
+        "hardening_baseline": [
+          "NoNewPrivileges=yes"
+        ],
+        "documented_residual_risk": "gateway and adapter workers share the service OS identity by design; DAC/ACL and agent-side sandboxes are the access boundary - the same UID can access the gateway's own state, so state dirs, env and policy files MUST be 0700/0600 owner-private"
+      }
+    },
+    "restricted": {
+      "display_name": "Restricted (explicit opt-in hardened profile)",
+      "default": false,
+      "service_model": "dedicated system accounts (aee-gateway/aee-broker), broker + workspace snapshot + manifests, ProtectHome/ProtectSystem sandbox",
+      "working_directory_policy": "explicit operator-configured A3_DISPATCH_ALLOWED_ROOTS confinement for non-autonomous modes",
+      "allowlist_default": "required",
+      "env": {
+        "required": [
+          {
+            "name": "AEE_MCP_HOST",
+            "value": "127.0.0.1",
+            "fixed": true
+          },
+          {
+            "name": "AEE_MCP_REQUIRE_AUTH",
+            "value": "true",
+            "fixed": true
+          },
+          {
+            "name": "AEE_MCP_SURFACE",
+            "value": "restricted",
+            "fixed": true
+          },
+          {
+            "name": "AEE_MCP_PORT",
+            "placeholder": "<port>",
+            "default_hint": "8791",
+            "value": "8791"
+          },
+          {
+            "name": "MCP_BRIDGE_API_KEY",
+            "placeholder": "<provision-private-restricted-key>",
+            "secret": true
+          },
+          {
+            "name": "AEE_DEPLOYMENT_PROFILE",
+            "value": "restricted",
+            "fixed": true
+          },
+          {
+            "name": "A3_DISPATCH_ALLOWED_ROOTS",
+            "placeholder": "<confinement-root-list>"
+          },
+          {
+            "name": "A3_JOB_STORE_DIR",
+            "placeholder": "<AEE-owned-state-dir>/jobs"
+          },
+          {
+            "name": "A3_CODEX_BIN",
+            "placeholder": "<immutable-release-absolute-path>/runner/codex"
+          },
+          {
+            "name": "A3_WORKSPACE_MANIFEST",
+            "placeholder": "<release>/workspace-manifest.json"
+          },
+          {
+            "name": "AEE_RUNTIME_MANIFEST",
+            "placeholder": "<release>/deployment-manifest.json"
+          },
+          {
+            "name": "AEE_BROKER_CONTROL",
+            "value": "/run/aee-broker/control.sock",
+            "fixed": true
+          }
+        ],
+        "optional": [],
+        "forbidden_defaults": []
+      },
+      "systemd": {
+        "scope": "system",
+        "note": "system units require root; the installer stages unit files and prints operator commands - it never acquires privileges itself",
+        "hardening_baseline": [
+          "ProtectHome=yes",
+          "ProtectSystem=strict",
+          "NoNewPrivileges=yes",
+          "CapabilityBoundingSet=",
+          "PrivateTmp=yes"
+        ]
+      }
+    }
+  },
+  "secret_keys": [
+    "MCP_BRIDGE_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL"
+  ],
+  "no_secret_values_rule": "Every provisioning artifact must keep placeholder values; real values live only in operator-owned 0600 files on the target host and never in Git, receipts, logs or diff output."
+}
