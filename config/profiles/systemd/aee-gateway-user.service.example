@@ -1,0 +1,45 @@
+# AEE MCP gateway — OS-NATIVE profile systemd *user* unit template
+#
+# Rendered by scripts/install_aee_gateway.py (placeholders <...> substituted
+# with the operator's release/env paths). Managed at
+# ~/.config/systemd/user/aee-gateway.service under the service OS identity.
+#
+# Isolation model (documented, deliberate): this unit runs as an existing OS
+# identity that owns the agent toolchain — OS DAC/ACL/MAC plus each adapter's
+# own technical sandbox are the access boundary. The gateway and its adapter
+# workers intentionally share that UID; there is NO gateway/worker privilege
+# separation and none must be claimed. Protect the gateway's own state with
+# owner-private 0700/0600 permissions.
+
+[Unit]
+Description=AEE MCP gateway (profile: os-native)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Operator-owned env file (0600): transport key, job store path, adapter
+# overrides, optional trusted-dispatch policy pointer. Schema:
+# config/profiles/profile-schema.json
+EnvironmentFile=<ENV_FILE>
+ExecStart=<PYTHON> <RELEASE_DIR>/mcp_gateway.py
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+NoNewPrivileges=yes
+
+# Resource accounting without DAC changes (per-profile budgets live in
+# AEE_EXECUTION_POLICY for job-level limits).
+MemoryAccounting=yes
+TasksAccounting=yes
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+
+# Boot persistence: a user unit starts at login/graphical session and starts
+# at boot ONLY with user lingering enabled — an explicit operator choice:
+#   loginctl enable-linger <user>
+# This installer never enables lingering automatically.
