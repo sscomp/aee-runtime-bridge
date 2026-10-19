@@ -13,10 +13,15 @@
 
 [Unit]
 Description=AEE MCP gateway (profile: os-native)
-After=network-online.target
-Wants=network-online.target
+# User-manager units are started by the user manager, not at network
+# configuration time; network-online.target has no ordering meaning in the
+# user manager (systemd skips it there) — bind failures, if any, surface in
+# the service itself and Restart=on-failure covers them.
 
 [Service]
+# The gateway binds the loopback bearer-only listener on 127.0.0.1; keep the
+# operator's umask hardening private-by-default (matches installer job store).
+UMask=0077
 # Operator-owned env file (0600): transport key, job store path, adapter
 # overrides, optional trusted-dispatch policy pointer. Schema:
 # config/profiles/profile-schema.json

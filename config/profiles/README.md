@@ -23,7 +23,7 @@ preflight).
 Selection:
 
 ```bash
-scripts/install-aee-gateway.sh --profile os-native --release-dir <release> \
+scripts/install_aee_gateway.py --profile os-native --release-dir <release> \
   --env-path <0600-env> --check
 ```
 

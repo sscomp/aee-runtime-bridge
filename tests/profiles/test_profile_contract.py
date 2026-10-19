@@ -57,6 +57,73 @@ class ShippedExamples(unittest.TestCase):
             self.assertNotIn('Bearer ', text)
 
 
+class ParseEnvSystemdAlignment(unittest.TestCase):
+    """parse_env must match systemd EnvironmentFile consumer semantics
+    (P4 review F-2 / F-14): a quoted or export-prefixed placeholder must not
+    sneak past the placeholder rules, and legitimate quoting must not make
+    the validator reject values the consumer would accept."""
+
+    _base = ['AEE_MCP_HOST=127.0.0.1', 'AEE_MCP_PORT=8791',
+             'AEE_MCP_SURFACE=restricted', 'AEE_MCP_REQUIRE_AUTH=true',
+             'AEE_DEPLOYMENT_PROFILE=os-native', 'A3_JOB_STORE_DIR=/srv/aee/jobs']
+
+    def _key_line(self, value):
+        return [f'MCP_BRIDGE_API_KEY={value}']
+
+    def _validate(self, lines):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'gw.env'
+            path.write_text('\n'.join(lines) + '\n')
+            path.chmod(0o600)
+            return validate_env_path(path, 'os-native')
+
+    def test_quoted_placeholder_rejected(self):
+        # F-2: systemd would dequote; a quoted placeholder is still a
+        # placeholder in the deployed env.
+        errors = self._validate(self._base[:1] + ['AEE_MCP_PORT="8791"']
+                                + self._base[2:] + self._key_line('"<>REPLACE<>"'))
+        self.assertTrue(any('placeholder' in e for e in errors))
+
+    def test_quoted_real_values_accepted(self):
+        errors = self._validate(
+            self._base[:1] + ['AEE_MCP_PORT="8791"'] + self._base[2:]
+            + self._key_line("'real-operator-value-00000000000000'"))
+        self.assertEqual(errors, [])
+
+    def test_export_prefix_ignored(self):
+        # systemd ignores a leading `export `; validator must treat
+        # `export KEY=value` as KEY=value (a divergent key name would
+        # misreport a valid env as missing keys).
+        errors = self._validate(
+            self._base[:1] + ['export AEE_MCP_PORT=8791'] + self._base[2:]
+            + self._key_line('real-operator-value-00000000000000'))
+        self.assertEqual(errors, [])
+        fields = parse_env('export A=1\nB=2\n')
+        self.assertEqual(fields, {'A': '1', 'B': '2'})
+
+    def test_nonsecret_placeholder_rejected_in_operator_env(self):
+        # F-25: ANY required key still carrying a placeholder on a deployed
+        # env is an error (A3_JOB_STORE_DIR here, a secret-key-style check
+        # would have let it slip).
+        errors = self._validate(self._base[:-1]
+                                + self._key_line('real-operator-value-00000000000000')
+                                + ['A3_JOB_STORE_DIR=<operator-state-dir>/jobs'])
+        self.assertTrue(any('placeholder' in e for e in errors))
+
+
+class ParseEnvRejection(unittest.TestCase):
+
+    def test_not_keyvalue_line_raises(self):
+        with self.assertRaises(ValueError):
+            parse_env('JUST_TOKENS\n')
+
+    def test_inline_hash_is_value(self):
+        self.assertEqual(parse_env('A=1# tail\n'), {'A': '1# tail'})
+
+    def test_last_key_wins(self):
+        self.assertEqual(parse_env('A=1\nA=2\n'), {'A': '2'})
+
+
 class OperatorEnvSemantics(unittest.TestCase):
 
     def _write(self, tmp, text):

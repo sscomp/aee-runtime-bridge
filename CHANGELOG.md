@@ -9,10 +9,13 @@
   `A3_DISPATCH_ALLOWED_ROOTS`). Schema: `config/profiles/profile-schema.json`;
   shipped examples validated by `scripts/validate_profiles.py`.
 - Add the canonical stdlib installer `scripts/install_aee_gateway.py`
-  (+ `install-aee-gateway.sh` wrapper): fail-before-write preflight, idempotent
-  apply with backups and rollback, unmanaged-collision refusal, restricted
-  profile stages system artifacts without executing sudo, receipts carry env
-  var names only.
+  (+ `install-aee-gateway.sh` wrapper): fail-before-write preflight,
+  idempotent apply (byte-identical inputs rewrite nothing; only changed
+  installer-managed unit files are backed up), rollback by provenance-stamped
+  stamp, uninstall (operator data never touched), unmanaged-collision refusal
+  (verified by sidecar marker + unit hash), restricted profile stages the
+  canonical P2C unit template and prints operator sudo commands without
+  executing them, receipts carry env var names only.
 - Add `scripts/provision_trusted_dispatch.py` (fingerprint-only policy
   onboarding with runtime re-validation) and `scripts/audit_adapters.py`
   (adapter resolution report; `A3_ADAPTER_<NAME>_BIN` documented).

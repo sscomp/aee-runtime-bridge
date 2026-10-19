@@ -5,17 +5,24 @@ Idempotent, preflighted, receipt-producing, rollback-capable installation of
 the AEE MCP gateway for one of the two first-class deployment profiles
 (`config/profiles/profile-schema-v1`).
 
-Design boundaries (work order AEE_V2_PHASE3_* / Phase 1-2 design):
+Design boundaries (work order AEE_V2_PHASE3_* / Phase 4 remediation):
 - user-scope actions only: never acquires privileges (no sudo/setuid). The
   restricted profile's system units are STAGED plus printed as operator
   commands, never installed by this tool.
-- secret VALUES are never generated, printed, archived or copied: the
-  operator's env file (0600) is validated by name schema only.
-- idempotent: re-running with unchanged inputs changes nothing and never
-  restarts or reloads.
-- rollback: every apply takes timestamped backups; `--rollback-last` restores
-  the previous receipt's backups; `--uninstall` removes what was installed.
+- secret VALUES are never generated, printed, or copied by this tool: the
+  operator's env file (0600) is validated by name schema only. Backups cover
+  installer-managed unit files ONLY — the operator env is never copied into
+  backups or staging areas (its values are operator data; a mode correction
+  is recorded, not archived).
+- idempotent: re-running with unchanged inputs rewrites nothing (unit and
+  sidecar are hash-compared) and never restarts or reloads.
+- rollback: an apply backs up ONLY files it is about to change (timestamped,
+  provenance-stamped stamps); `--rollback-last` restores the most recent
+  matching stamp; `--uninstall` removes the unit and sidecar only.
 - SSH is never used or required by this installer.
+- fresh-host prerequisites (release tree with locked venv, operator-written
+  0600 env, adapter toolchain, cold-boot lingering) are enforced fail-closed
+  by preflight and documented in docs/deployment-profiles.md.
 
 Exit codes: 0 ok, 1 preflight/validation failure (nothing written), 2 apply
 failure (backups preserved).
@@ -28,8 +35,8 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +46,6 @@ from scripts.validate_profiles import (  # noqa: E402
     load_schema, validate_env_path, validate_examples, parse_env)
 
 RECEIPT_SCHEMA = 'aee-gateway-installer-receipt-v1'
-NOCHANGE = 'nochange'
 
 
 def _sha256(path):
@@ -48,6 +54,13 @@ def _sha256(path):
         for chunk in iter(lambda: handle.read(65536), b''):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _default_units_dir():
+    """Systemd user-manager unit dir; honors XDG_CONFIG_HOME like systemd does."""
+    xdg = os.environ.get('XDG_CONFIG_HOME')
+    base = Path(xdg).expanduser() if xdg else Path.home() / '.config'
+    return base / 'systemd' / 'user'
 
 
 # ---------------------------------------------------------------------------
@@ -80,14 +93,15 @@ def preflight(args, *, identity_report=None):
     else:
         facts.append(f'release_dir={release}')
         facts.append(f'gateway_script_sha256={_sha256(gateway)}')
-    py_bin = Path(args.python or (release / '.venv' / 'bin' / 'python'))
+    py_bin = Path(args.python or (release / '.venv' / 'bin' / 'python')).expanduser().resolve()
     if not py_bin.is_file():
         errors.append(f'interpreter missing: {py_bin} (release build should contain .venv/bin/python)')
     else:
         facts.append(f'python={py_bin}')
 
-    # Env file: schema-conformant (var names/shape only; values not recorded).
+    # Env file: schema-conformant (var names/shape only; values are not recorded).
     env_path = Path(args.env_path).expanduser().resolve()
+    env_fields = None
     if not env_path.is_file():
         errors.append(
             f'env file missing: {env_path}. Start from '
@@ -102,9 +116,23 @@ def preflight(args, *, identity_report=None):
         if mode != 0o600:
             errors.append(f'env file mode is {oct(mode)}; must be 0600 (operator-owned secrets)')
         facts.append(f'env_path={env_path}')
-        facts.append('env_keys=' + ','.join(sorted(parse_env(env_path.read_text()))))
+        try:
+            env_fields = parse_env(env_path.read_text())
+            facts.append('env_keys=' + ','.join(sorted(env_fields)))
+        except (OSError, ValueError) as exc:
+            errors.append(f'env file unreadable or malformed: {exc}')
 
-    # Port availability: bind probe, never reads credential material.
+    # Port availability: bind probe, never reads credential material. The
+    # probe port must agree with the env's own AEE_MCP_PORT when present.
+    if env_fields and 'AEE_MCP_PORT' in env_fields:
+        try:
+            env_port = int(env_fields['AEE_MCP_PORT'])
+        except ValueError:
+            errors.append(f"env AEE_MCP_PORT is not an integer: {env_fields['AEE_MCP_PORT']!r}")
+        else:
+            if env_port != args.port:
+                errors.append(f'--port {args.port} does not match env AEE_MCP_PORT={env_port}; '
+                              'pass the same --port the gateway env declares')
     probe = socket.socket()
     try:
         probe.bind(('127.0.0.1', args.port))
@@ -123,8 +151,9 @@ def preflight(args, *, identity_report=None):
 
     # systemd reachability (user scope) — read-only probe.
     if profile == 'os-native':
-        default_units = '~/.config/systemd/user'
-        units_dir = Path(args.user_unit_dir or default_units).expanduser()
+        if not getattr(args, 'unit_mode_user', True):
+            errors.append('os-native profile installs a user unit; use --unit-mode user')
+        units_dir = Path(args.user_unit_dir or _default_units_dir()).expanduser()
         if not units_dir.is_dir():
             warnings.append(f'systemd user unit dir {units_dir} does not exist yet (created on apply)')
         if args.systemd_bin and shutil.which(args.systemd_bin) is None:
@@ -159,27 +188,51 @@ def preflight(args, *, identity_report=None):
         facts.append(f'trusted_dispatch_policy={p} exists={p.is_file()}')
         if not p.is_file():
             warnings.append('AEE_TRUSTED_DISPATCH_POLICY points at a missing file: '
-                            'write/autonomous admission will fail closed at runtime '
-                            '(TrustedDispatch.configured() refuses invalid/empty policy)')
+                            'admission policy() raises at runtime and write/autonomous '
+                            'dispatch fails closed (the gateway never runs degraded)')
     else:
         warnings.append('AEE_TRUSTED_DISPATCH_POLICY not set in this environment: '
                         'without the trusted policy, write/autonomous stay subject to '
                         'legacy per-job fail-closed gates (never silently enabled)')
 
-    # Install collision: distinguish this installer's own units (sidecar
-    # receipt marker) from unmanaged pre-existing units.
+    # Install collision: distinguish this installer's own units (verified
+    # sidecar marker + unit hash) from unmanaged pre-existing units.
     unit_path = _unit_path(args)
     sidecar = Path(str(unit_path) + '.aee-installer.json')
-    if unit_path.exists() and not sidecar.exists() and not args.upgrade_authorized:
+    if unit_path.exists() and not _sidecar_matches(unit_path, sidecar) and not args.upgrade_authorized:
         errors.append(f'existing unmanaged installation found: {unit_path}; this installer is '
                       'idempotent for its own units but an unmanaged unit is present — '
                       'pass --upgrade-authorized after review, or --check to inspect')
-    elif unit_path.exists() and sidecar.exists():
+    elif unit_path.exists() and _sidecar_matches(unit_path, sidecar):
         warnings.append(f'existing own installation {unit_path}; idempotent re-run '
                         '(byte-identical unit produces no change; changes take a backup)')
     elif unit_path.exists():
         warnings.append(f'upgrading over existing unit {unit_path} (pre-change backup taken)')
     return errors, warnings, facts
+
+
+def _sidecar_matches(unit_path, sidecar):
+    """True only when the sidecar is this installer's intact marker FOR this unit.
+
+    Existence alone is not enough: the marker must parse, carry this receipt
+    schema, and its recorded unit_sha256 must equal the on-disk unit — a
+    planted or stale marker does not make a foreign unit 'managed'.
+    """
+    if not sidecar.is_file():
+        return False
+    try:
+        data = json.loads(sidecar.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict) or data.get('marker') != RECEIPT_SCHEMA:
+        return False
+    recorded = data.get('unit_sha256')
+    if not recorded:
+        return False
+    try:
+        return recorded == _sha256(unit_path)
+    except OSError:
+        return False
 
 
 def _adapter_discovery_report():
@@ -204,11 +257,10 @@ def _adapter_discovery_report():
 def _unit_path(args):
     if args.profile == 'os-native':
         unit_name = args.user_unit_name or 'aee-gateway.service'
-        return Path(args.user_unit_dir or
-                    '~/.config/systemd/user').expanduser().resolve() / unit_name
+        return Path(args.user_unit_dir or _default_units_dir()).expanduser().resolve() / unit_name
     staging = Path(args.staging_dir).expanduser().resolve() if args.staging_dir \
         else Path('/tmp/aee-restricted-staging')
-    return staging / 'etc-systemd-system-aee-p2c-gateway@.service'
+    return staging / 'aee-p2c-gateway@.service'
 
 
 # ---------------------------------------------------------------------------
@@ -221,27 +273,27 @@ def _render_unit(args, env_path, workdir):
         text = template.read_text()
         substitutions = {
             '<RELEASE_DIR>': str(Path(args.release_dir).resolve()),
-            '<PYTHON>': str(Path(args.python or (Path(args.release_dir) / '.venv' / 'bin' / 'python'))),
+            '<PYTHON>': str(Path(args.python or
+                                 (Path(args.release_dir) / '.venv' / 'bin' / 'python'))
+                             .expanduser().resolve()),
             '<ENV_FILE>': str(env_path),
             '<STATE_DIR>': str(Path(args.state_dir or Path(args.env_path).expanduser().parent).resolve()),
         }
         for key, value in substitutions.items():
             text = text.replace(key, value)
-        left = sorted({m for m in _placeholders(text)})
+        left = sorted({m[1:] for m in __import__('re').findall(r'<[A-Z_]+>', text)})
         if left:
             raise ValueError(f'unfilled placeholders remain in rendered unit: {left}')
         return text
-    # restricted: reuse the canonical reviewed P2C unit template verbatim.
+    # restricted: reuse the canonical reviewed P2C unit template verbatim
+    # (static paths; the operator places env/units/account prerequisites).
     template = ROOT / 'config' / 'p2c' / 'systemd' / 'aee-p2c-gateway@.service'
     return template.read_text()
 
 
-def _placeholders(text):
-    return [m[1:] for m in __import__('re').findall(r'<[A-Z_]+>', text)]
-
-
-def _backup(paths, backup_root):
-    stamp = time.strftime('%Y%m%dT%H%M%S', time.gmtime())
+def _backup(paths, backup_root, *, provenance=None):
+    """Copy ONLY the named managed files into a provenance-stamped backup."""
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%f')  # microsecond
     dest = Path(backup_root).expanduser().resolve() / stamp
     made = []
     for p in paths:
@@ -250,12 +302,16 @@ def _backup(paths, backup_root):
             dest.mkdir(parents=True, exist_ok=True)
             target = dest / p.name
             shutil.copy2(p, target)
-            os.chmod(target, 0o600)
+            os.chmod(target, 0o644)
             made.append({'original': str(p), 'backup': str(target),
-                         'sha256': _sha256(p)})
-    dest.mkdir(parents=True, exist_ok=True)
+                         'sha256': _sha256(p), 'mode': oct(p.stat().st_mode & 0o777)})
+    if not made:
+        return None, []  # nothing to back up => no stamp, no churn (F-4)
     (dest / 'BACKUP-META.json').write_text(json.dumps(
         {'created_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+         'profile': (provenance or {}).get('profile'),
+         'unit_path': (provenance or {}).get('unit_path'),
+         'env_path': (provenance or {}).get('env_path'),
          'entries': made}, indent=1))
     return str(dest), made
 
@@ -273,55 +329,73 @@ def apply_args(args):
 
     changed = []
     backups_dir = Path(args.backup_dir or '~/.local/state/aee-installer/backups').expanduser()
-    backup_ref, made_backups = None, []
-    if args.apply:
-        prior = [p for p in (unit_path,) if p.exists()]
-        if prior or env_path.exists():
-            backup_ref, made_backups = _backup([*prior, env_path], backups_dir)
+    unit_sha = hashlib.sha256(unit_text.encode()).hexdigest()
+    existing_sha = _sha256(unit_path) if unit_path.exists() else None
+    sidecar_path = Path(str(unit_path) + '.aee-installer.json')
+    unit_changed = existing_sha != unit_sha
 
-    # env file: only permissions are managed (values are operator-owned).
+    # Backups: only files about to change are copied (never the operator env).
+    backup_ref, made_backups = None, []
+    if args.apply and unit_changed:
+        provenance = {'profile': args.profile, 'unit_path': str(unit_path),
+                      'env_path': str(env_path)}
+        backup_ref, made_backups = _backup([unit_path], backups_dir, provenance=provenance)
+
     if args.apply:
+        # env file: only permissions are managed (values are operator-owned;
+        # the prior mode is recorded here instead of copying secret material).
         if (env_path.stat().st_mode & 0o777) != 0o600:
+            prior_mode = oct(env_path.stat().st_mode & 0o777)
             os.chmod(env_path, 0o600)
-            changed.append(f'chmod 0600 {env_path}')
+            changed.append(f'chmod 0600 {env_path} (prior mode {prior_mode})')
 
     if args.profile == 'os-native':
-        if args.apply:
+        if args.apply and unit_changed:
             unit_path.parent.mkdir(parents=True, exist_ok=True)
-        if not (unit_path.exists() and _sha256(unit_path) ==
-                hashlib.sha256(unit_text.encode()).hexdigest()):
-            if args.apply:
-                unit_path.write_text(unit_text)
-                os.chmod(unit_path, 0o644)
+            unit_path.write_text(unit_text)
+            os.chmod(unit_path, 0o644)
+        if unit_changed:
             changed.append(f'write unit {unit_path}')
-        if args.apply:
-            unit_path.with_name(unit_path.name + '.aee-installer.json').write_text(
-                json.dumps({'marker': RECEIPT_SCHEMA,
-                            'installed_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                            'unit_sha256': hashlib.sha256(unit_text.encode()).hexdigest()},
-                           indent=1))
-            os.chmod(unit_path.with_name(unit_path.name + '.aee-installer.json'), 0o644)
+        marker = {'marker': RECEIPT_SCHEMA, 'unit_sha256': unit_sha}
+        try:
+            prior_marker = json.loads(sidecar_path.read_text())
+        except (OSError, ValueError):
+            prior_marker = {}
+        marker_changed = not (prior_marker.get('marker') == RECEIPT_SCHEMA and
+                              prior_marker.get('unit_sha256') == unit_sha)
+        if marker_changed:
+            if args.apply:
+                sidecar_path.write_text(json.dumps(
+                    {'marker': RECEIPT_SCHEMA,
+                     'installed_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                     'unit_sha256': unit_sha}, indent=1))
+                os.chmod(sidecar_path, 0o644)
+            changed.append(f'write sidecar {sidecar_path.name}')
         env_fields = parse_env(env_path.read_text())
         jobs_dir = env_fields.get('A3_JOB_STORE_DIR')
-        if jobs_dir and not Path(jobs_dir).exists() and args.apply:
+        if jobs_dir and args.apply and not Path(jobs_dir).exists():
             Path(jobs_dir).mkdir(parents=True, exist_ok=True)
             os.chmod(jobs_dir, 0o700)
             changed.append(f'create operator job-store dir {jobs_dir} (0700)')
-        elif not jobs_dir:
-            errors.append('env schema validator should have required A3_JOB_STORE_DIR')
         systemctl_actions = _maybe_systemctl(args, unit_path)
     else:
-        staging = Path(args.staging_dir).expanduser().resolve()
-        if args.apply:
-            staging.mkdir(parents=True, exist_ok=True)
-        staged_env = staging / 'etc-aee-gateway-restricted.env.example'
-        if args.apply:
-            staged_env.write_text(env_path.read_text())
-            os.chmod(staged_env, 0o600)
-        changed.append(f'staged restricted env example → {staged_env}')
+        # restricted: stage the canonical P2C unit + print operator commands;
+        # the operator's env is installed BY THE OPERATOR (never copied here).
+        if args.apply and unit_changed:
+            staging = Path(args.staging_dir).expanduser().resolve()
+            staging.mkdir(parents=True, exist_ok=True, mode=0o700)
+            staged_unit = unit_path
+            staged_unit.write_text(unit_text)
+            os.chmod(staged_unit, 0o644)
+            changed.append(f'staged restricted unit → {staged_unit}')
+        elif not unit_changed:
+            changed.append(f'staged restricted unit → {unit_path} (byte-identical, left untouched)')
         systemctl_actions = ['operator commands printed; no systemctl action taken',
-                             'sudo install -o root -g root -m 0644 <staged unit> /etc/systemd/system/aee-p2c-gateway@.service',
-                             'sudo systemctl daemon-reload && sudo systemctl enable --now aee-p2c-gateway@restricted.service']
+                             f'sudo install -o root -g root -m 0644 {unit_path} /etc/systemd/system/aee-p2c-gateway@.service',
+                             f'sudo install -o root -g root -m 0600 {env_path} /etc/aee/gateway-restricted.env',
+                             'sudo systemctl daemon-reload && sudo systemctl enable --now aee-p2c-gateway@restricted.service',
+                             'broker unit + runtime slice + accounts + manifests + deployment gate '
+                             'are prerequisites: docs/deployment.md §3–4 and docs/fresh-host-bootstrap.md']
 
     receipt = {
         'result': 'OK',
@@ -333,7 +407,7 @@ def apply_args(args):
         'env_path': str(env_path),
         'env_keys': sorted(parse_env(env_path.read_text())) if env_path.exists() else [],
         'unit_path': str(unit_path),
-        'unit_sha256': hashlib.sha256(unit_text.encode()).hexdigest(),
+        'unit_sha256': unit_sha,
         'changed': changed,
         'unchanged': ['env values (operator-owned; installer touches permissions only)',
                       'existing jobs/state', 'credentials of any kind'],
@@ -342,15 +416,24 @@ def apply_args(args):
         'systemctl': systemctl_actions,
         'warnings': warnings,
         'facts': facts,
-        'rollback_command': f'{Path(__file__).name} --rollback-last --backup-dir {backups_dir}',
+        'rollback_command': f'{Path(__file__).name} --profile {args.profile} --rollback-last '
+                            f'--backup-dir {backups_dir}',
+        'rollback_scope': 'restores installer-managed unit files changed by the last apply; '
+                          'env values and job state are operator data and are never backed up '
+                          'or altered by this tool',
         'cold_boot_note': ('os-native: survives reboot only with user lingering '
                            '(loginctl enable-linger) - operator decision, never automatic'
                            if args.profile == 'os-native' else
                            'restricted: system units enabled by operator commands'),
-        'idempotency': 'safe to re-run; identical inputs produce no changes and no restarts',
+        'idempotency': 'safe to re-run; byte-identical inputs rewrite nothing '
+                       '(unit and sidecar hash-compared) and never restart or reload',
     }
     if args.receipt:
         Path(args.receipt).expanduser().resolve().write_text(json.dumps(receipt, indent=1))
+    if errors and args.apply:
+        receipt = {'result': 'APPLY_FAILED', 'errors': errors,
+                   'backups_dir': backup_ref, 'backups': [b['original'] for b in made_backups]}
+        return receipt, 2
     return receipt, 0
 
 
@@ -368,33 +451,50 @@ def _maybe_systemctl(args, unit_path):
                            f"rc={proc.returncode}")
     else:
         actions.append('enable step skipped (pass --enable to run `systemctl --user '
-                       'daemon-reload && systemctl --user enable aee-gateway.service`)')
+                       f'daemon-reload && systemctl --user enable {unit_path.name}`)')
     if args.start and systemctl:
-        proc = subprocess.run([systemctl, '--user', 'restart', 'aee-gateway.service'],
+        proc = subprocess.run([systemctl, '--user', 'restart', unit_path.name],
                               capture_output=True, text=True)
-        actions.append(f"{'ok' if proc.returncode == 0 else 'failed'}: user restart aee-gateway "
+        actions.append(f"{'ok' if proc.returncode == 0 else 'failed'}: user restart {unit_path.name} "
                        f"rc={proc.returncode} — restart only on explicit --start")
     return actions
 
 
 def rollback_last(args):
+    """Restore the most recent backup stamp that matches the requested profile."""
     backup_root = Path(args.backup_dir or '~/.local/state/aee-installer/backups').expanduser()
     stamps = sorted((d for d in backup_root.iterdir() if d.is_dir()),
                     key=lambda d: d.name, reverse=True) if backup_root.is_dir() else []
+    for stamp in stamps:
+        try:
+            meta = json.loads((stamp / 'BACKUP-META.json').read_text())
+        except (OSError, ValueError):
+            continue
+        if args.profile and meta.get('profile') and meta.get('profile') != args.profile:
+            continue  # never cross-profile restore (shared backup roots happen)
+        restored = []
+        for entry in meta.get('entries') or []:
+            src, dst = Path(entry['backup']), Path(entry['original'])
+            dstdir = dst.parent
+            dstdir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            os.chmod(dst, int(entry.get('mode', '0o644'), 8))
+            restored.append({'restored': str(dst), 'from': str(src),
+                             'mode': entry.get('mode', '0o644')})
+        if not restored:
+            continue
+        return {'result': 'ROLLBACK_OK', 'stamp': stamp.name,
+                'profile': meta.get('profile'), 'restored': restored}, 0
     if not stamps:
         return {'result': 'ROLLBACK_NOTHING_TO_RESTORE'}, 1
-    meta = json.loads((stamps[0] / 'BACKUP-META.json').read_text())
-    restored = []
-    for entry in meta['entries']:
-        src, dst = Path(entry['backup']), Path(entry['original'])
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        os.chmod(dst, 0o600 if dst.suffix == '.env' else 0o644)
-        restored.append({'restored': str(dst), 'from': str(src)})
-    return {'result': 'ROLLBACK_OK', 'stamp': stamps[0].name, 'restored': restored}, 0
+    return {'result': 'ROLLBACK_NOTHING_TO_RESTORE',
+            'note': f'no backup stamps matching profile {args.profile!r} under '
+                    f'{backup_root} (never crossing profiles)'}, 1
 
 
 def uninstall(args):
+    if not args.profile:
+        args.profile = 'os-native'  # default: the os-native user unit
     unit_path = _unit_path(args)
     removed = []
     if unit_path.exists() and args.apply:
@@ -417,17 +517,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--profile', choices=sorted(load_schema()['profiles']),
-                        required=True, help='deployment profile name')
-    parser.add_argument('--release-dir', required=True,
-                        help='prepared immutable release tree containing mcp_gateway.py')
+                        help='deployment profile name (required for check/dry-run/apply)')
+    parser.add_argument('--release-dir',
+                        help='prepared immutable release tree containing mcp_gateway.py '
+                             '(required for check/dry-run/apply)')
     parser.add_argument('--python', help='interpreter path (default <release>/.venv/bin/python)')
-    parser.add_argument('--env-path', required=True, help='operator-owned env file (0600)')
+    parser.add_argument('--env-path', help='operator-owned env file (0600) '
+                                           '(required for check/dry-run/apply)')
     parser.add_argument('--port', type=int, default=8791)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--check', action='store_true', help='preflight only; no writes')
     mode.add_argument('--dry-run', action='store_true', help='full plan without writes')
     mode.add_argument('--apply', action='store_true', help='perform the installation transaction')
-    parser.add_argument('--user-unit-dir', help='override ~/.config/systemd/user')
+    parser.add_argument('--user-unit-dir', help='override the systemd user unit dir '
+                                                '(default: XDG_CONFIG_HOME or ~/.config + /systemd/user)')
     parser.add_argument('--user-unit-name', help='override aee-gateway.service unit name')
     parser.add_argument('--state-dir', help='mutable state hint recorded in receipt')
     parser.add_argument('--staging-dir', help='restricted profile: staging directory')
@@ -439,7 +542,7 @@ def main():
     parser.add_argument('--enable', action='store_true', help='also daemon-reload + enable (user scope)')
     parser.add_argument('--start', action='store_true', help='ALSO restart the user unit (explicit opt-in)')
     parser.add_argument('--upgrade-authorized', action='store_true',
-                        help='acknowledge replacing an existing unit (backup taken)')
+                        help='acknowledge replacing a pre-existing/foreign unit (backup taken)')
     parser.add_argument('--rollback-last', action='store_true')
     parser.add_argument('--uninstall', action='store_true')
     parser.add_argument('--backup-dir', help='backup root (default ~/.local/state/aee-installer/backups)')
@@ -447,13 +550,22 @@ def main():
     args = parser.parse_args()
     args.unit_mode_user = args.unit_mode == 'user'
 
-    if args.rollback_last:
-        receipt, code = rollback_last(args)
-    elif args.uninstall:
-        receipt, code = uninstall(args)
-    elif not (args.check or args.dry_run or args.apply):
-        parser.error('one of --check, --dry-run or --apply is required')
+    if args.rollback_last or args.uninstall:
+        # Maintenance modes: provenance comes from backup METAs; the release
+        # tree and env are irrelevant, and uninstall uses the profile to pick
+        # the unit path (pass --profile os-native or omitted? keep optional).
+        if args.rollback_last:
+            receipt, code = rollback_last(args)
+        else:
+            receipt, code = uninstall(args)
     else:
+        if not (args.check or args.dry_run or args.apply):
+            parser.error('one of --check, --dry-run or --apply is required')
+        missing = [n for n in ('profile', 'release_dir', 'env_path')
+                   if getattr(args, n) is None]
+        if missing:
+            parser.error('the following are required for ' +
+                         ('--check/--dry-run/--apply: ' + ', '.join(missing)))
         receipt, code = apply_args(args)
     print(json.dumps(receipt, indent=1))
     sys.exit(code)

@@ -30,17 +30,38 @@ def load_schema():
     return schema
 
 
+def _dequote(value):
+    """Systemd EnvironmentFile-style single-level quote removal.
+
+    systemd removes a matching wrapping quote pair from assigned values
+    (which would otherwise hide e.g. a placeholder like "<...>" from schema
+    checks or a real bearer inside quotes from the placeholder rejection;
+    dequoting first keeps validator semantics aligned with the consumer).
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 def parse_env(text):
-    """Return {key: value} for KEY=VALUE lines (comments/blanks ignored)."""
+    """Return {key: value} for KEY=VALUE lines (comments/blanks ignored).
+
+    Aligns with systemd EnvironmentFile consumer semantics: a leading
+    `export ` prefix is ignored, and wrapping quotes are removed (see
+    _dequote). The inline-`#`-is-value and last-key-wins behaviors match
+    systemd as-is.
+    """
     fields = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith('#'):
             continue
+        if line.startswith('export '):
+            line = line[len('export '):].strip()
         if '=' not in line:
             raise ValueError(f'not a KEY=VALUE line: {line[:40]!r}')
         key, value = line.split('=', 1)
-        fields[key.strip()] = value.strip()
+        fields[key.strip()] = _dequote(value.strip())
     return fields
 
 
@@ -90,7 +111,7 @@ def validate_fields(fields, profile, *, source='example'):
         elif operator_env:
             if not value:
                 errors.append(f'{profile}/{source}: {name} must have a provisioned value')
-            if item.get('secret') and name in schema['secret_keys'] and value.startswith(prefix):
+            elif value.startswith(prefix):
                 errors.append(f'{profile}/{source}: {name} still carries a placeholder; '
                               'provision the real operator-owned value (0600 file)')
         elif not _placeholder_ok(value, item):

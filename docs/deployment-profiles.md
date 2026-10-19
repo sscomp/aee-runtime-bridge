@@ -63,8 +63,12 @@ python3 scripts/validate_profiles.py --env-path /etc/aee/gw.env --profile os-nat
 Key semantics: fixed boundary keys (`AEE_MCP_HOST`, `AEE_MCP_REQUIRE_AUTH`,
 `AEE_MCP_SURFACE`, `AEE_DEPLOYMENT_PROFILE`, `AEE_BROKER_CONTROL` on
 restricted) must render their documented values; `<...>` placeholders are
-valid only in shipped/staged artifacts, never in an operator env with a real
-secret key.
+**required** in shipped/staged artifacts and **rejected** in an operator env
+for *every* required key (not only secret keys) — a placeholder anywhere in a
+deployed env means the operator skipped provisioning, fail before write.
+Values are parsed with systemd EnvironmentFile semantics (`export ` prefixes
+ignored, one wrapping quote level removed, inline `#` literal, last key
+wins), so a quoted placeholder cannot hide from these checks.
 
 ## Adapter provisioning (`A3_ADAPTER_<NAME>_BIN`)
 
@@ -109,8 +113,14 @@ printf 'OPERATOR_TOKEN' | python3 scripts/provision_trusted_dispatch.py \
   written to the policy, echoed to output or stored anywhere.
 - The runtime key comes from `--key-env <VARNAME>` or `--key-stdin`, never
   argv; a too-short key is refused.
-- The gate is explicit opt-in: without `--enable-write-autonomous` the
-  policy records `enabled: false` and write/autonomous stay fail-closed.
+- The gate is explicit opt-in: the policy's `enabled` flag is set to true
+  ONLY by `--enable-write-autonomous`. On later runs a previously enabled
+  policy stays enabled (an explicit opt-in is, by design, preserved) unless
+  `--disable-write-autonomous` revokes it; passing both flags at once is
+  refused. It is never enabled implicitly.
+- If the policy file already exists but is corrupt or carries an unknown
+  schema, provisioning refuses (that policy fails closed at runtime too);
+  a deliberate replacement requires `--overwrite-invalid`.
 - Policy file mode 0600, parent 0700, atomic replace; `--revoke <fp>` removes
   one principal.
 
@@ -123,16 +133,23 @@ of running on a degraded policy.
 
 The installer (`scripts/install_aee_gateway.py`, wrapper
 `scripts/install-aee-gateway.sh`) never acquires privileges: the os-native
-profile writes a user unit, the restricted profile **stages** artifacts and
-prints the operator's sudo commands without running them. Preflight runs
-fail-before-write (env schema, 0600 mode, port bind probe, disk headroom,
-unmanaged-collision refusal), apply is an idempotent transaction with a
-backup, and receipts record env var *names*, never values.
+profile writes a user unit, the restricted profile **stages the canonical
+P2C unit template verbatim** (`config/p2c/systemd/aee-p2c-gateway@.service`
+— a fully static file, no installer substitutions) next to the
+`UNINSTALLED` release tree, prints the complete operator sudo sequence, and
+executes none of it. Backups cover installer-managed unit files only — the
+operator env is never copied or archived by the installer. Preflight runs
+fail-before-write (env schema, 0600 mode, `--port` vs env `AEE_MCP_PORT`
+cross-check, port bind probe, disk headroom,
+unmanaged-collision refusal verified by sidecar marker **and** recorded unit
+hash), apply is an idempotent transaction (byte-identical unit and sidecar
+rewrite nothing; only files that actually change are backed up), and receipts
+record env var *names*, never values.
 
 ```bash
 # inspect (no writes)
 scripts/install-aee-gateway.sh --profile os-native --check \
-  --release-dir /opt/aee/current --env-path /etc/aee/gw.env --dry-run
+  --release-dir /opt/aee/current --env-path /etc/aee/gw.env
 
 # install the os-native user unit (enable/start remain explicit opt-ins)
 scripts/install-aee-gateway.sh --profile os-native --apply \
@@ -143,6 +160,18 @@ scripts/install-aee-gateway.sh --profile os-native --apply \
 scripts/install-aee-gateway.sh --profile restricted --apply \
   --release-dir /opt/aee/current --env-path /etc/aee/gateway-restricted.env \
   --staging-dir /tmp/aee-restricted-staging --unit-mode system
+
+# After the staging step the OPERATOR (not the installer) runs the printed
+# sequence, including placing the env at the path the template expects:
+#   sudo install -o root -g root -m 0644 \
+#     <staging>/aee-p2c-gateway@.service /etc/systemd/system/aee-p2c-gateway@.service
+#   sudo install -o root -g root -m 0600 /etc/aee/gateway-restricted.env \
+#     /etc/aee/gateway-restricted.env
+#   sudo systemctl daemon-reload && sudo systemctl enable --now aee-p2c-gateway@restricted.service
+# Broker units, the runtime slice, dedicated accounts, manifests and the
+# deployment gate are prerequisites — see docs/deployment.md §3–4; production
+# admission for that line remains gated by its runtime manifest
+# (STAGE1_NOT_DEPLOYABLE until the evidence chain completes).
 
 # revert the last transaction, or remove the unit (operator data is never touched)
 scripts/install-aee-gateway.sh --profile os-native --rollback-last \

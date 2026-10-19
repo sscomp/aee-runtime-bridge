@@ -11,10 +11,15 @@ Boundaries (work order AEE_V2_PHASE3_*):
   printed, logged, archived, echoed, or copied across hosts; only its SHA-256
   fingerprint is stored in the policy
 - no principal wildcard: every admission is a fingerprint -> principal-name map
-- write/autonomous stay DISABLED unless --enable-write-autonomous is passed
-  explicitly by the operator
-- a missing/empty/invalid policy file fails closed at runtime; this tool never
-  "repairs" a policy that the runtime would refuse
+- write/autonomous run ONLY when the policy's `enabled` flag is true; this
+  tool sets that flag to true exclusively via an explicit
+  --enable-write-autonomous (a prior opt-in is preserved on later runs;
+  --disable-write-autonomous revokes it). It is never enabled implicitly.
+- a missing/empty/invalid policy file fails closed at runtime; this tool
+  never silently "repairs" an invalid policy the runtime would refuse —
+  rebuilding over one requires --overwrite-invalid
+- an existing policy file that is valid JSON but carries an unknown schema is
+  likewise refused without --overwrite-invalid
 """
 import argparse
 import hashlib
@@ -51,17 +56,34 @@ def _read_key(args):
     return data
 
 
-def _load_existing(policy_path: Path):
+def _load_existing(policy_path: Path, *, overwrite_invalid=False):
+    """Load an existing policy; refuse to silently reuse/rebuild over an
+    invalid one (the gateway rejects invalid policies at runtime, and a
+    rebuild would silently drop its principals)."""
     if not policy_path.is_file():
         return {}
     try:
-        return json.loads(policy_path.read_text())
-    except (OSError, ValueError):
-        # Runtime refuses invalid policies; provisioning never silently reuses one.
-        return {}
+        data = json.loads(policy_path.read_text())
+    except (OSError, ValueError) as exc:
+        if overwrite_invalid:
+            return {}
+        raise SystemExit(f'existing policy file is unreadable or corrupt '
+                         f'({type(exc).__name__}); the gateway fails closed on it. '
+                         'Rebuilding would drop its principals — pass '
+                         '--overwrite-invalid to replace it deliberately.')
+    if isinstance(data, dict) and data.get('schema') != 'aee-secure-mcp-trusted-dispatch-v1':
+        if overwrite_invalid:
+            return {}
+        raise SystemExit(f"existing policy schema {data.get('schema')!r} is unknown "
+                         'to this tool; pass --overwrite-invalid to replace it '
+                         'deliberately.')
+    return data if isinstance(data, dict) else {}
 
 
 def build_policy(existing, args, fingerprint):
+    if args.enable_write_autonomous and args.disable_write_autonomous:
+        raise SystemExit('--enable-write-autonomous and --disable-write-autonomous '
+                         'are mutually exclusive')
     principals = dict(existing.get('principals') or {})
     for fp in args.revoke or []:
         if fp in principals:
@@ -76,8 +98,13 @@ def build_policy(existing, args, fingerprint):
         raise SystemExit(f'unknown agents {invalid}; allowed: {ALLOWED_AGENTS}')
     if not agents:
         agents = ['claude']
-    enabled = True if args.enable_write_autonomous else \
-        bool(existing.get('enabled')) if not args.disable_write_autonomous else False
+    # enabled flag: an explicit operator flag wins; otherwise a prior opt-in
+    # (already enabled policy) is preserved — never implicitly enabled here.
+    enabled = bool(existing.get('enabled'))
+    if args.enable_write_autonomous:
+        enabled = True
+    if args.disable_write_autonomous:
+        enabled = False
     return {
         'schema': 'aee-secure-mcp-trusted-dispatch-v1',
         'policy': 'secure_mcp_trusted_dispatch',
@@ -109,12 +136,22 @@ def main():
                         '(comma-separated; default: keep existing or claude)')
     parser.add_argument('--set-agents', help='replace the trusted agent set exactly')
     parser.add_argument('--enable-write-autonomous', action='store_true',
-                        help='explicit operator opt-in; omitted means write/autonomous stay disabled')
-    parser.add_argument('--disable-write-autonomous', action='store_true')
+                        help='explicit operator opt-in for write/autonomous (first '
+                             'time; a previously enabled policy stays enabled on '
+                             're-runs unless --disable-write-autonomous is passed)')
+    parser.add_argument('--disable-write-autonomous', action='store_true',
+                        help='revoke the enabled flag (write/autonomous fail closed)')
     parser.add_argument('--revoke', action='append', default=[],
                         help='principal fingerprint (sha256 hex) to revoke; repeatable')
+    parser.add_argument('--overwrite-invalid', action='store_true',
+                        help='explicitly replace an existing unreadable/corrupt/unknown-'
+                             'schema policy file (its principals are NOT recoverable)')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
+
+    if args.enable_write_autonomous and args.disable_write_autonomous:
+        raise SystemExit('--enable-write-autonomous and --disable-write-autonomous '
+                         'are mutually exclusive')
 
     policy_path = Path(args.policy_path).expanduser().resolve()
     fingerprint = None
@@ -124,7 +161,7 @@ def main():
         bearer = _read_key(args)
         fingerprint = _fingerprint(bearer)
         del bearer
-    existing = _load_existing(policy_path)
+    existing = _load_existing(policy_path, overwrite_invalid=args.overwrite_invalid)
     policy = build_policy(existing, args, fingerprint)
     if fingerprint and fingerprint not in policy['principals']:
         raise SystemExit('internal error: new principal fingerprint missing from policy')
