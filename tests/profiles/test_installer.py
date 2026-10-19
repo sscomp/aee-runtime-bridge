@@ -383,6 +383,23 @@ class RestrictedStaging(InstallerFixture):
         self.assertTrue(any('malformed entry' in d for d in receipt['declined']))
         self.assertEqual(unit.read_text(), before)
 
+    def test_rollback_skips_non_dict_meta_scans_older_stamps(self):
+        # R4-N1: a BACKUP-META.json parsing to a non-dict must not raise an
+        # uncaught AttributeError aborting the rollback search; older valid
+        # stamps are still found.
+        py2 = Path(self.tmp + '/fakepython2')
+        py2.write_text('#!/bin/sh\nexit 0\n')
+        py2.chmod(0o755)
+        installer.apply_args(self._args(dry_run=False, apply=True))
+        installer.apply_args(self._args(dry_run=False, apply=True, python=str(py2),
+                                        upgrade_authorized=True))
+        installer.apply_args(self._args(dry_run=False, apply=True))  # 2nd stamp
+        stamps = sorted((Path(self.tmp) / 'backups').iterdir())
+        stamps[0].joinpath('BACKUP-META.json').write_text('"a plain string"')
+        receipt, code = installer.rollback_last(self._args())
+        self.assertEqual((receipt['result'], code), ('ROLLBACK_OK', 0))
+        self.assertEqual(receipt['stamp'], stamps[-1].name)
+
     def test_rollback_declines_out_of_provenance_and_sha_mismatch(self):
         # N-3: a crafted BACKUP-META.json cannot overwrite arbitrary files
         # (provenance filter) or restore a damaged backup (sha check).

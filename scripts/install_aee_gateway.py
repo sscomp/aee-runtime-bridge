@@ -25,7 +25,9 @@ Design boundaries (work order AEE_V2_PHASE3_* / Phase 4 remediation):
   by preflight and documented in docs/deployment-profiles.md.
 
 Exit codes: 0 ok, 1 preflight/validation failure (nothing written), 2 apply
-failure (backups preserved).
+failure or receipt-write failure (backups preserved; `APPLY_OK_RECEIPT_FAILED`
+means the installation itself completed and only the receipt file could not
+be written).
 """
 import argparse
 import hashlib
@@ -539,6 +541,9 @@ def rollback_last(args):
             meta = json.loads((stamp / 'BACKUP-META.json').read_text())
         except (OSError, ValueError):
             continue
+        if not isinstance(meta, dict):
+            continue  # a non-dict BACKUP-META is not one of our stamps; skip
+                      # it (and keep scanning older stamps) instead of raising
         if meta.get('profile') != args.profile:
             continue  # never cross-profile restore (shared backup roots happen)
         if not meta.get('unit_path'):
