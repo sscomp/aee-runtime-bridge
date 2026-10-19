@@ -50,9 +50,9 @@ surface: `aee_status`, `aee_agents`, `aee_dispatch`, `aee_job_cancel`,
 policy provisioned, approved Secure MCP principals may dispatch
 `read_only`/`write`/`autonomous` without per-job tokens
 ([A2 deploy and verification](docs/a2-secure-mcp-deploy-verify.md)); without
-that policy only `codex` / `read_only` dispatch is supported. `aee_exec`
-remains local/full only
-on port 8790. Follow [host setup](docs/deployment.md) to run the gateway and —
+that policy only `codex` / `read_only` dispatch is supported.
+`aee_exec` remains local/full only on port 8790. Follow
+[host setup](docs/deployment.md) to run the gateway and —
 for real dispatch — the inference broker; [validation](docs/agent-operations.md) and
 [agent operations](docs/agent-operations.md) cover health, MCP handshake,
 agent discovery, safe dispatch and completed-result verification.

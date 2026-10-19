@@ -147,10 +147,23 @@ class WriteDispatchContract(unittest.TestCase):
     def test_write_rejects_aee_operational_regions(self):
         # An AEE-owned operational region is denied even if the operator's
         # root list accidentally contains it (defense in depth).
-        token = self.configure_write(root=Path.home() / "aee")
+        # Hermetic: the fixture builds its own region inside a TemporaryDirectory
+        # and patches _WRITE_FORBIDDEN_ROOTS (frozen at import from the real
+        # Path.home()) to match, so the assertion cannot depend on the operator
+        # host or the CI runner layout, and never touches the host's real
+        # AEE state.
+        region = Path(self.temp.name) / "aee" / "releases"
+        region.mkdir(parents=True)
+        allowed_patch = patch.object(self.gateway, "A3_DISPATCH_ALLOWED_ROOTS", [])
+        allowed_patch.start()
+        self.addCleanup(allowed_patch.stop)
+        forbidden_patch = patch.object(self.gateway, "_WRITE_FORBIDDEN_ROOTS", [region])
+        forbidden_patch.start()
+        self.addCleanup(forbidden_patch.stop)
+        token = self.configure_write(root=region)
         with self.assertRaises(self.gateway._JobError) as error:
             self.dispatch(metadata={"approval": token},
-                          workdir=str(Path.home() / "aee" / "releases"))
+                          workdir=str(region))
         self.assertEqual(error.exception.code, "INVALID_WRITE_SCOPE")
 
     def test_write_metadata_must_be_object(self):
