@@ -1,0 +1,130 @@
+# Use cases and scenario matrix
+
+What ChatGPT (and approved Secure MCP principals) can actually do on an AEE
+host, per deployment profile and dispatch mode. The scenario matrix is the
+navigation table; each scenario below states its preconditions, the profile
+and mode it uses, its boundaries, and what evidence backs the claim.
+Evidence labels follow the
+[runtime capability matrix](runtime-capability-matrix.md):
+**Reported** = operator acceptance receipt / job record, not re-executed by
+the doc author; **Confirmed** = independently inspected contract/code;
+**Not Tested** = open gate.
+
+## Scenario matrix
+
+| # | Scenario | Profile / mode | Adapter(s) | Evidence status |
+|---|---|---|---|---|
+| 1 | ChatGPT remote read-only dispatch (A2 / A3) | os-native or restricted / `read_only` | codex; claude where policy allows | Reported (A3 E2E job, exit 0) |
+| 2 | Read-only audit of a source tree | os-native / `read_only` (trusted principal) or restricted broker path | codex (native sandbox), claude (tool allowlist), pi (tool denylist) | Reported for codex+claude; pi = untested E2E |
+| 3 | OS-native write / autonomous authorized actions | os-native / `write`, `autonomous` (trusted-dispatch policy) | codex (workspace-write), claude (acceptEdits) | Reported (A3 write E2E, proof file); autonomous E2E Not Tested |
+| 4 | Multi-host independent dispatch | any profile, per host | any admitted | Confirmed architecture (host-local contract); cross-host E2E Not Tested |
+| 5 | Deployment / reinstall of a host | os-native or restricted install | n/a | Reported (A3 clean reinstall 2026-10-20, PASS WITH CONDITIONS) |
+| 6 | Operational diagnostics | n/a (status/result tools + audits) | n/a | Reported (local gates G1–G8, 401 negatives, six-tool surface) |
+| 7 | Adapter unavailable / fail-closed | any | codex, claude, pi, hermes | Confirmed code paths; codex env-pin incident reported as real-world example |
+
+## Preconditions common to every remote scenario
+
+- A deployed gateway (loopback-only, restricted six-tool surface, bearer
+  auth) and, for ChatGPT, a provisioned Secure MCP Tunnel (outbound-only).
+- For `write`/`autonomous`: an explicitly provisioned trusted-dispatch
+  policy (`aee-secure-mcp-trusted-dispatch-v1`, 0600/0700, principal
+  fingerprint, per-agent list, `enabled: true` by explicit opt-in only).
+  Without a valid policy, only `codex`/`read_only` dispatch is supported.
+- The job `working_directory` must already exist and be accessible under the
+  service OS identity (os-native) or inside the allowed roots (restricted).
+- Provider credentials available to the service identity; on A3 the Claude
+  adapter additionally requires `ANTHROPIC_*` presentation env + user dbus,
+  while Codex uses its own `~/.codex/auth.json` (host-specific, see install
+  receipts).
+
+## 1. ChatGPT remote read-only dispatch
+
+ChatGPT's approved connector issues `aee_dispatch(agent=codex,
+mode=read_only, working_directory=…, task=…)`. Transport chain:
+ChatGPT → tunnel (outbound HTTPS) → loopback gateway → principal check →
+job → adapter. Acceptance requires `queued` + job ID first, then poll
+`aee_job_status`, then `aee_job_result` with `ok=true`, `status=completed`,
+exit 0, bounded summary, ordered timestamps and the `aee-completed-v1`
+proof. A concurrent second admission returns `BUSY`.
+Evidence: A3 E2E job `A3JOB-20261019-928c4174f778e8f7edba4049e2b7be28`
+(codex, exit 0, 2 native tool events started/completed, 0 failed) —
+Reported. A ChatGPT-*originated* External Plugin E2E remains Not Tested.
+
+## 2. Read-only audit
+
+An operator asks the agent to summarize/inspect a tree without modification.
+`read_only` retains its boundary on every adapter (claude restricted safe
+mode; codex native sandbox; pi denylist). The admitted snapshot/source is
+read-only; `/home/...` targets are rejected by design on restricted
+(ProtectHome) and fail DAC checks on os-native. Acceptance: result only,
+no writes, unchanged source. Evidence: Reported for codex and claude read
+E2E receipts; Pi E2E Not Tested (registry supports `read_only` only).
+
+## 3. OS-native write / autonomous authorized actions
+
+With write-autonomous enabled by the policy, a trusted principal may modify
+or operate in an authorized working directory: `write` uses the adapter's
+native write scope (codex `workspace-write` confined to the job directory
+and /tmp, network disabled by default; claude headless `acceptEdits`), and
+`autonomous` uses headless bypass flags inherited within the OS identity.
+Boundaries: DAC/ACL of the service identity (no escalation), TOCTOU
+directory-identity recheck at launch, sticky failures. Legacy
+per-job write gates are superseded when the policy is configured.
+Emergency stop is an atomic policy flip (`enabled: false`).
+Evidence: Reported — A3 real codex write job
+`A3JOB-20261019-c06ebe28…` (under the policy principal, no per-job token)
+created the proof file `trusted-write-proof.md` in its dedicated 0700
+workspace; hermes refused both modes, `/root` dispatch refused
+`INVALID_WORKING_DIRECTORY`; per-host install receipts 2026-10-20
+(PASS WITH CONDITIONS). Dedicated `autonomous`-mode E2E receipts: Not Tested.
+
+## 4. Multi-host independent dispatch
+
+Each host runs its own gateway, tunnel client, adapters, job store and
+policy; jobs never cross hosts and there is no central dispatcher. Dispatch
+to host A cannot observe or affect host B. SSH is optional
+administration/debug transport only. Acceptance per host is separate (each
+host's own gates). Evidence: architecture Confirmed (this contract is pinned
+in the deployment-profile code/docs); a multi-host simultaneous E2E exercise
+is Not Tested. Prior A2 parity audit reports real jobs for Claude/Codex/
+Hermes on the A2 host — Reported historical evidence, distinguish it from
+fresh per-host revalidation.
+
+## 5. Deployment / reinstall
+
+Canonical sequence: clone a reviewed commit (record `git rev-parse HEAD`),
+hash-locked `uv pip sync --require-hashes requirements-mcp.lock`,
+credential-free smoke, then either profile install path (installer never
+acquires privileges; restricted staging prints an operator sudo sequence it
+never executes) with preflight fail-before-write, idempotent apply, receipts
+(env names only) and rollback. Acceptance: clean worktree, schema validation
+`PASS`, secret scan `PASS`, post-install `/health` + six-tool handshake +
+read-only E2E. Evidence: Reported — A3 clean reinstall 2026-10-20 from
+commit `2b123e21` (os-native, evidence bundle
+`~/AEE_A3_REINSTALL_EVIDENCE_20261020/`).
+
+## 6. Operational diagnostics
+
+`aee_status` / `aee_agents` (discovery is informational, not authorization),
+`aee_job_status` / `aee_job_result` for job state, `aee_job_cancel` for
+cancellation, `scripts/audit_adapters.py` for adapter resolution under the
+service identity, the `REQUIRED_TOOL_FAILED` attribution runbook in
+[troubleshooting](troubleshooting.md) for fail-shot analysis, and
+operator-only `journalctl`. Evidence: Reported — A3 local/tunnel gates
+G1–G8 parity, six-tool surface, 401 negatives, restart persistence, fresh
+job-store continuity all PASS (2026-10-20 receipts).
+
+## 7. Adapter unavailable / fail-closed
+
+When an adapter cannot be resolved or cannot honestly enforce a mode, dispatch
+refuses before launch (`ADAPTER_NOT_INSTALLED`, `ADAPTER_UNSUPPORTED`) —
+availability does not silently downgrade mode. Real-world instance: the A3
+registry had previously declared codex `dispatchable=true` (static policy)
+while the pinned binary was the npm JS wrapper, so native-ELF resolution
+rejected it as unavailable until the operator repinned both
+`A3_CODEX_BIN`/`A3_ADAPTER_CODEX_BIN` to the native 0.160.0 ELF; the
+subsequent read-only E2E completed exit 0 under `NATIVE_SANDBOX`.
+Acceptance: refusing is the passing behavior for any unresolvable or
+unsupported combination. Evidence: Confirmed code paths
+(`job_adapters.py::refuse_unsupported`, `resolve_adapter`); incident
+Reported with job ID `A3JOB-20261019-8a218391…`.
