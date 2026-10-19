@@ -364,14 +364,23 @@ def apply_args(args):
             return {'result': 'APPLY_FAILED',
                     'errors': ['unit/its marker changed between preflight and '
                                'apply; refusing write (re-run to re-preflight)'],
+                    'note': 'the env file mode was already corrected to 0600 as '
+                            'part of this transaction (fail-closed direction; '
+                            'only permissions, values untouched)',
                     'backups_dir': backup_ref,
                     'backups': [b['original'] for b in made_backups]}, 2
 
         # Unit mode is idempotently corrected even when bytes are identical
-        # (a drifted 0600 unit must not stay 0600 with changed: []).
-        if args.apply and unit_path.exists() and (unit_path.stat().st_mode & 0o777) != 0o644:
-            os.chmod(unit_path, 0o644)
-            changed.append(f'chmod 0644 {unit_path}')
+        # (a drifted 0600 unit must not stay 0600 with changed: []); dry-run
+        # reports the same would-be correction.
+        if unit_path.exists() and (unit_path.stat().st_mode & 0o777) != 0o644:
+            if args.apply:
+                os.chmod(unit_path, 0o644)
+            changed.append(f'{prefix}chmod 0644 {unit_path}')
+
+        # Parsed once inside the guarded region; values are used only for
+        # the job-store path, never recorded in the receipt.
+        env_fields = parse_env(env_path.read_text())
 
         if args.profile == 'os-native':
             if args.apply and unit_changed:
@@ -380,7 +389,6 @@ def apply_args(args):
                 os.chmod(unit_path, 0o644)
             if unit_changed:
                 changed.append(f'{prefix}write unit {unit_path}')
-            env_fields = parse_env(env_path.read_text())
             jobs_dir = env_fields.get('A3_JOB_STORE_DIR')
             if jobs_dir and not Path(jobs_dir).exists():
                 if args.apply:
@@ -448,7 +456,7 @@ def apply_args(args):
         'mode': 'apply' if args.apply else ('check' if getattr(args, 'check', False) else 'dry-run'),
         'release_dir': str(Path(args.release_dir).resolve()),
         'env_path': str(env_path),
-        'env_keys': sorted(parse_env(env_path.read_text())) if env_path.exists() else [],
+        'env_keys': sorted(env_fields),
         'unit_path': str(unit_path),
         'unit_sha256': unit_sha,
         'changed': changed,
@@ -472,11 +480,15 @@ def apply_args(args):
                        '(unit and sidecar hash-compared) and never restart or reload',
     }
     if args.receipt:
-        Path(args.receipt).expanduser().resolve().write_text(json.dumps(receipt, indent=1))
-    if errors and args.apply:
-        receipt = {'result': 'APPLY_FAILED', 'errors': errors,
-                   'backups_dir': backup_ref, 'backups': [b['original'] for b in made_backups]}
-        return receipt, 2
+        try:
+            Path(args.receipt).expanduser().resolve().write_text(json.dumps(receipt, indent=1))
+        except OSError as exc:
+            return {'result': 'APPLY_FAILED',
+                    'errors': [f'receipt write failed: {type(exc).__name__}: {exc}'],
+                    'backups_dir': backup_ref,
+                    'backups': [b['original'] for b in made_backups],
+                    'note': 'the installation itself completed; re-run with a '
+                            'writable receipt path if a receipt is required'}, 2
     return receipt, 0
 
 
@@ -531,6 +543,15 @@ def rollback_last(args):
             continue  # legacy/foreign stamp without provenance: fail closed
         restored, declined = [], []
         for entry in meta.get('entries') or []:
+            try:
+                mode = int(entry.get('mode', '0o644'), 8)
+            except (ValueError, TypeError):
+                declined.append(f"declined malformed mode {entry.get('mode')!r} "
+                                f'for {entry.get("original")!r}')
+                continue
+            if not isinstance(mode, int) or mode > 0o7777:
+                declined.append(f'declined out-of-range mode {entry.get("mode")!r}')
+                continue
             src, dst = Path(entry['backup']), Path(entry['original'])
             if str(dst) != str(meta['unit_path']):
                 declined.append(f'declined out-of-provenance restore target: {dst}')
@@ -545,9 +566,11 @@ def rollback_last(args):
             except OSError as exc:
                 declined.append(f'backup unreadable: {src} ({exc})')
                 continue
+            # copy LAST: every validation that can decline has passed, so a
+            # half-completed restore on a malformed entry is impossible
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
-            os.chmod(dst, int(entry.get('mode', '0o644'), 8))
+            os.chmod(dst, mode)
             restored.append({'restored': str(dst), 'from': str(src),
                              'mode': entry.get('mode', '0o644')})
         if not restored:
