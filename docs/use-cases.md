@@ -16,7 +16,7 @@ the doc author; **Confirmed** = independently inspected contract/code;
 |---|---|---|---|---|
 | 1 | ChatGPT remote read-only dispatch (A2 / A3) | os-native or restricted / `read_only` | codex; claude where policy allows | Reported (A3 E2E job, exit 0) |
 | 2 | Read-only audit of a source tree | os-native / `read_only` (trusted principal) or restricted broker path | codex (native sandbox), claude (tool allowlist), pi (tool denylist) | Reported for codex+claude; pi = untested E2E |
-| 3 | OS-native write / autonomous authorized actions | os-native / `write`, `autonomous` (trusted-dispatch policy) | codex (workspace-write), claude (acceptEdits) | Reported (A3 write E2E, proof file); autonomous E2E Not Tested |
+| 3 | OS-native write / autonomous authorized actions | os-native / `write`, `autonomous` (trusted-dispatch policy) | codex (workspace-write), claude (acceptEdits) | Reported (A3 write E2E, proof file; Claude autonomous docs job exit 0); codex `autonomous` dedicated E2E Not Tested |
 | 4 | Multi-host independent dispatch | any profile, per host | any admitted | Confirmed architecture (host-local contract); cross-host E2E Not Tested |
 | 5 | Deployment / reinstall of a host | os-native or restricted install | n/a | Reported (A3 clean reinstall 2026-10-20, PASS WITH CONDITIONS) |
 | 6 | Operational diagnostics | n/a (status/result tools + audits) | n/a | Reported (local gates G1–G8, 401 negatives, six-tool surface) |
@@ -29,9 +29,17 @@ the doc author; **Confirmed** = independently inspected contract/code;
 - For `write`/`autonomous`: an explicitly provisioned trusted-dispatch
   policy (`aee-secure-mcp-trusted-dispatch-v1`, 0600/0700, principal
   fingerprint, per-agent list, `enabled: true` by explicit opt-in only).
-  Without a valid policy, only `codex`/`read_only` dispatch is supported.
+  Policy-state semantics: **absent** policy falls back to the legacy
+  authorization gates (read-only across supported adapters; write/autonomous
+  only with the legacy per-job operator approval); a **configured-but-
+  malformed** policy blocks all new dispatch, including `read_only`;
+  **`enabled: false`** preserves read-only and refuses new
+  write/autonomous; a **revoked principal** is refused for every mode.
 - The job `working_directory` must already exist and be accessible under the
-  service OS identity (os-native) or inside the allowed roots (restricted).
+  service OS identity (os-native) or inside the allowed roots (restricted);
+  autonomous and trusted-policy `write` dispatch validate the path directly
+  and skip the allowed-roots list (see scenario 3 and the
+  [capability matrix](runtime-capability-matrix.md)).
 - Provider credentials available to the service identity; on A3 the Claude
   adapter additionally requires `ANTHROPIC_*` presentation env + user dbus,
   while Codex uses its own `~/.codex/auth.json` (host-specific, see install
@@ -44,21 +52,39 @@ mode=read_only, working_directory=…, task=…)`. Transport chain:
 ChatGPT → tunnel (outbound HTTPS) → loopback gateway → principal check →
 job → adapter. Acceptance requires `queued` + job ID first, then poll
 `aee_job_status`, then `aee_job_result` with `ok=true`, `status=completed`,
-exit 0, bounded summary, ordered timestamps and the `aee-completed-v1`
-proof. A concurrent second admission returns `BUSY`.
+exit 0, bounded summary, ordered timestamps and a successful completion
+proof — `adapter_proof` for adapter-path jobs (all agents) or the
+`aee-completed-v1` native/broker contract for the approved codex broker path.
+A concurrent second admission returns `BUSY`.
 Evidence: A3 E2E job `A3JOB-20261019-928c4174f778e8f7edba4049e2b7be28`
 (codex, exit 0, 2 native tool events started/completed, 0 failed) —
-Reported. A ChatGPT-*originated* External Plugin E2E remains Not Tested.
+Reported. External ChatGPT Plugin `read_only` E2E passed for codex
+(`928c4174…`) and claude (`A3JOB-20261019-6929c5831f9b3c8937cd6a0ee06ee6b9`,
+exit 0) — Reported (2026-10-19 receipts, Secure MCP transport); plugin-path
+`write`/`autonomous` E2E and a fresh ChatGPT-originated plugin revalidation
+after the 2026-10-20 reinstall remain Not Tested.
 
 ## 2. Read-only audit
 
 An operator asks the agent to summarize/inspect a tree without modification.
 `read_only` retains its boundary on every adapter (claude restricted safe
-mode; codex native sandbox; pi denylist). The admitted snapshot/source is
-read-only; `/home/...` targets are rejected by design on restricted
-(ProtectHome) and fail DAC checks on os-native. Acceptance: result only,
-no writes, unchanged source. Evidence: Reported for codex and claude read
-E2E receipts; Pi E2E Not Tested (registry supports `read_only` only).
+mode; codex native sandbox; pi denylist). Two working-directory models exist:
+generic adapter jobs run the agent on the **actual working directory**, gated
+only by the service OS identity's real DAC/ACL permissions as checked at
+admission — on os-native the service identity is an existing OS user that can
+normally read its **own** home directory, so `/home/<user>/...` targets
+succeed there (admission also requires the directory to be enterable/readable
+by the executor OS user, plus the optional `A3_DISPATCH_ALLOWED_ROOTS` list
+when configured; without it no path roots are imposed); on the **restricted
+broker path**, and only there, the codex job instead sees an admitted
+read-only snapshot inside a hardened namespace where host HOME
+(`ProtectHome`) is excluded. A directory the service identity cannot enter
+(e.g. `/root` from a non-root service identity) fails DAC at admission
+(`INVALID_WORKING_DIRECTORY` — receipt on A3). Residual risk of same-UID
+execution remains: the agent inherits everything that OS user can read.
+Acceptance: result only, no writes, unchanged source. Evidence: Reported for
+codex and claude read E2E receipts; Pi E2E Not Tested (registry supports
+`read_only` only).
 
 ## 3. OS-native write / autonomous authorized actions
 
@@ -76,13 +102,22 @@ Evidence: Reported — A3 real codex write job
 created the proof file `trusted-write-proof.md` in its dedicated 0700
 workspace; hermes refused both modes, `/root` dispatch refused
 `INVALID_WORKING_DIRECTORY`; per-host install receipts 2026-10-20
-(PASS WITH CONDITIONS). Dedicated `autonomous`-mode E2E receipts: Not Tested.
+(PASS WITH CONDITIONS). A dedicated Claude `autonomous` E2E receipt exists:
+job `A3JOB-20261019-5f8b72872cd103dbedf364d5de90c430` (the A3 documentation
+Git workflow) completed exit 0 — Reported — recording 57 completed tool
+events and 4 failed tool events (native structured events; the failed events
+are part of the record and are not concealed). Codex `autonomous` and
+Claude `write` dedicated E2E receipts: Not Tested.
 
 ## 4. Multi-host independent dispatch
 
 Each host runs its own gateway, tunnel client, adapters, job store and
-policy; jobs never cross hosts and there is no central dispatcher. Dispatch
-to host A cannot observe or affect host B. SSH is optional
+policy; jobs never cross hosts and there is no central dispatcher. AEE does
+not automatically route jobs, share job state or share policy between hosts
+— dispatching on host A neither reads nor writes host B's store. This is not
+an isolation guarantee from host B itself: B's dispatched agents run with
+host B's service-identity permissions (including its network access), and B
+is reached only by whoever independently dispatches there. SSH is optional
 administration/debug transport only. Acceptance per host is separate (each
 host's own gates). Evidence: architecture Confirmed (this contract is pinned
 in the deployment-profile code/docs); a multi-host simultaneous E2E exercise
@@ -118,10 +153,14 @@ job-store continuity all PASS (2026-10-20 receipts).
 
 When an adapter cannot be resolved or cannot honestly enforce a mode, dispatch
 refuses before launch (`ADAPTER_NOT_INSTALLED`, `ADAPTER_UNSUPPORTED`) —
-availability does not silently downgrade mode. Real-world instance: the A3
+availability does not silently downgrade mode. Two distinct checks are in
+play: dispatch-time resolution is the registry's executable/`--help` probe
+and mode refusal (which accepts any executable absolute path, including a
+script wrapper), while the **native-ELF expectation is an operator
+provenance check** on the resolved binary. Real-world instance: the A3
 registry had previously declared codex `dispatchable=true` (static policy)
-while the pinned binary was the npm JS wrapper, so native-ELF resolution
-rejected it as unavailable until the operator repinned both
+while the pinned binary was the npm JS wrapper, so the operator's
+native-ELF identity check flagged it and the operator repinned both
 `A3_CODEX_BIN`/`A3_ADAPTER_CODEX_BIN` to the native 0.160.0 ELF; the
 subsequent read-only E2E completed exit 0 under `NATIVE_SANDBOX`.
 Acceptance: refusing is the passing behavior for any unresolvable or

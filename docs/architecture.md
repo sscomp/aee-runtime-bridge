@@ -2,8 +2,10 @@
 
 ChatGPT → OpenAI Secure MCP Tunnel → host `tunnel-client` → authenticated
 loopback gateway → leased job → host-local agent adapter CLI → per-job Unix
-socket broker (restricted profile) or provider env (os-native) → OpenAI
-Responses. Results return through MCP and the tunnel. Each host retains its
+socket broker (restricted profile) or provider env (os-native) → the
+inference provider each path is configured for (OpenAI Responses on the
+approved broker contract; generic adapters use their own configured
+provider). Results return through MCP and the tunnel. Each host retains its
 own private job records; ChatGPT receives bounded redacted projections. See
 [deployment](deployment.md) and [privacy](security-model.md).
 
@@ -31,6 +33,7 @@ One canonical source, one six-tool surface, two deployment profiles — see
 | Boundary model | OS DAC/ACL + each adapter's native enforcement | systemd sandbox hardening + mandatory workspace confinement (`A3_DISPATCH_ALLOWED_ROOTS`) |
 | Broker control socket | not used | `/run/aee-broker/control.sock` |
 | Manifests | not required (`AEE_RUNTIME_MANIFEST` unset) | `A3_WORKSPACE_MANIFEST`, `AEE_RUNTIME_MANIFEST` required |
+| Dispatch routing | generic adapter path against the actual working directory; codex additionally requires an approved manifest or is refused `DEPLOYMENT_GATE_CLOSED` | codex under the approved manifest runs the broker snapshot contract (`read_only` only — codex `write` is refused there); every other agent/mode uses the generic adapter path |
 | Write/autonomous | trusted-dispatch policy | trusted-dispatch policy + broker approval chain |
 
 Both profiles pin loopback-only bind (`AEE_MCP_HOST=127.0.0.1`), required
@@ -46,15 +49,31 @@ them, and each layer fails closed independently:
    (schema `aee-secure-mcp-trusted-dispatch-v1`): principal = SHA-256
    fingerprint of the dedicated gateway bearer, per-agent allowlist, checked
    before CLI probes, after probes, at worker start (TOCTOU revalidation) and
-   immediately before execution. Malformed, absent or revoked policy ⇒ no
-   write/autonomous admission; read-only and status/result/cancel are
-   unaffected. See [trusted dispatch](mcp-runtime-autonomous.md).
+   immediately before execution. The four policy states differ:
+   - **Absent** (`AEE_TRUSTED_DISPATCH_POLICY` unset): no trusted admission;
+     dispatch falls back to the legacy authorization gates — read-only across
+     supported adapters, and `write`/`autonomous` only with the legacy per-job
+     operator approval (write approval token + write roots, autonomous
+     authority token).
+   - **Configured but malformed/unreadable**: fail closed — admission is
+     blocked for **every** mode, including `read_only`
+     (`TRUSTED_DISPATCH_NOT_CONFIGURED`).
+   - **Valid but `enabled: false`**: `read_only`, status, result and cancel
+     remain available; new `write`/`autonomous` admissions refuse
+     (`TRUSTED_DISPATCH_DISABLED`) — the emergency-stop case.
+   - **Revoked principal**: a bearer whose fingerprint is no longer listed is
+     refused for every mode (`TRUSTED_DISPATCH_CALLER_UNVERIFIED`).
+   See [trusted dispatch](mcp-runtime-autonomous.md).
 2. **OS DAC/ACL.** The job's `working_directory` is canonicalized at
    admission and re-verified by device/inode identity immediately before
    launch (`INVALID_WORKING_DIRECTORY` when it changed). The worker runs
    under the service OS identity and inherits its actual DAC/ACL privileges
    — without escalation. os-native takes this layer as the primary boundary;
-   restricted confines it further with the allowed-roots list.
+   restricted confines it further with the allowed-roots list — except that
+   autonomous dispatch, and `write` dispatch under the trusted-dispatch
+   policy, validate the working directory directly (must be absolute) without
+   the allowed-roots list, so their working directory can in principle sit
+   anywhere the service OS identity can enter and read.
 3. **Agent-native enforcement.** The adapter CLI itself restricts tool use:
    Codex native sandbox (`read-only`, `workspace-write`, or approval bypass
    only in `autonomous`), Claude restricted safe mode with `Read/Glob/Grep`
@@ -111,16 +130,30 @@ without retrying jobs.
 
 Records are bounded and private: ≤65,536-byte schema-validated atomic JSON,
 task ≤8,000 chars, summary ≤4,000 chars, log excerpt ≤2,000 chars, store
-directory `0700`. Accepted success requires the `aee-completed-v1`
-native/broker completion proof at every boundary — a completed label alone is
-not a successful result. Since the R3 revision an accepted Code Mode success
-also records an `operation_attestation` grade, cross-matching the pinned
-binary's machine-verified completion evidence; anything without it fails
-closed (`REQUIRED_OPERATION_UNVERIFIABLE`).
+directory `0700`. Accepted success requires a structured completion proof at
+every boundary — a completed label alone is not a successful result. Two
+proof formats exist and both validate through the same `validate_success`
+contract (`aee/mcp_runtime/result_contract.py`):
+
+- **Generic adapter jobs** (all agents on the adapter path) record an
+  `adapter_proof` — adapter/mode/enforcement identity, matching exit code,
+  final-turn completion and working directory; `autonomous` results
+  additionally require the scoped authorization proof and the child's
+  process-identity fields.
+- **The approved codex broker contract** records the `aee-completed-v1`
+  result contract with native-tool-receipt evidence and, since the R3
+  revision, an `operation_attestation` grade cross-matching the pinned
+  binary's machine-verified completion evidence; anything without it fails
+  closed (`REQUIRED_OPERATION_UNVERIFIABLE`).
+
+The store's SHA-256 integrity seal detects accidental/post-write changes to a
+record; it is **not authentication** against a writer able to replace both
+the record and its digest.
 
 Observability surfaces (all bounded, all bearer-authenticated unless noted):
-the six-tool MCP set (`aee_status`, `aee_agents`, `aee_job_status`,
-`aee_job_result`, `aee_job_cancel`), durable per-event streaming with a
+the six-tool MCP set (`aee_status`, `aee_agents`, `aee_dispatch`,
+`aee_job_status`, `aee_job_result`, `aee_job_cancel`), durable per-event
+streaming with a
 spool for budgeted jobs (tool events recorded as evidence), and non-secret
 audit fields: principal, transport, agent, mode, task digest, resolved
 cwd/inode, OS identity, admission time, worker start/end. `journalctl` on the
@@ -173,8 +206,12 @@ Arbitrary local `aee_exec` is never exposed to ChatGPT: it launches
 allowlisted argv without a shell and must be treated as a trusted local
 operator capability.
 
-Production startup and admission require native/companion identity, resource
-and sandbox revisions, enforced inherited cgroup bounds, verified failure
-semantics and an operator approval identifier. The fixture path without a
-deployment manifest exists for isolated tests; it is not a production
-installation path.
+Production startup and admission on the **reviewed broker deployment**
+(restricted profile, approved Stage-2 contract) require native/companion
+identity, resource and sandbox revisions, enforced inherited cgroup bounds,
+verified failure semantics and an operator approval identifier. That
+manifest-and-approval chain belongs to the broker contract specifically — an
+`os-native` production install is itself a supported production path
+(installer contract: service identity, bounded state, loopback bind, required
+auth) and does not require a deployment manifest; this matches the profile
+table above.

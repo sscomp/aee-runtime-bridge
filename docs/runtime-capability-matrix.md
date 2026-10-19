@@ -46,24 +46,26 @@ npm JS wrapper failed native-ELF identity checks).
 
 | Capability | Status | Evidence (source / date / ID) |
 |---|---|---|
-| Codex `read_only` E2E dispatch | **Reported** — completed exit 0, `NATIVE_SANDBOX` | Read-only work order receipt: job `A3JOB-20261019-928c4174f778e8f7edba4049e2b7be28` — 2 native tool events started/completed, 0 failed. Reinstall-order receipt: job `A3JOB-20261019-5e7862f0…` queued→running→completed, exit 0, exec via native codex 0.160.0 (sha recorded). Adjacent codex repin E2E `A3JOB-20261019-8a218391…` completed exit 0. All 2026-10-19/20. |
+| Codex `read_only` E2E dispatch | **Reported** — completed exit 0, `NATIVE_SANDBOX` | Read-only work order receipt: job `A3JOB-20261019-928c4174f778e8f7edba4049e2b7be28` — 2 native tool events started/completed, 0 failed, executed via the **native ELF** (`executable_sha256` `12eb3e81…`). Reinstall-order receipt: job `A3JOB-20261019-5e7862f0…` queued→running→completed, exit 0, but its recorded executable was the **npm JS wrapper** (`…/node/26.7.0/bin/codex`, `executable_sha256` `61b0194f…`, a `#!/usr/bin/env node` script — not the native ELF); it ran with the wrapper's recorded version `codex-cli 0.160.0`. Adjacent codex repin E2E `A3JOB-20261019-8a218391…` completed exit 0 via the native ELF (sha `12eb3e81…`). All 2026-10-19/20. |
 | Claude Code `read_only` E2E dispatch | **Reported** — completed exit 0, `TOOL_ALLOWLIST` | Work order: job `A3JOB-20261019-6929c5831f9b3c8937cd6a0ee06ee6b9` completed exit 0 (Claude Code 2.1.295). Reinstall-order receipt: job `A3JOB-20261019-53c1e559…` restricted safe mode Read/Glob/Grep + empty strict MCP config. Claude auth on this host requires `ANTHROPIC_*` env + user dbus (install receipt conditions). |
-| Codex `write` (trusted dispatch) | **Reported** — real write job created a proof file under trusted policy | Install verification record, 2026-10-20. |
+| Codex `write` (trusted dispatch) | **Reported** — real write job created a proof file under trusted policy | Install verification record, 2026-10-20: job `A3JOB-20261019-c06ebe28…` exit 0. Note: like `5e7862f0…`, its recorded executable was the npm JS wrapper (`…/bin/codex`, sha `61b0194f…`), not the native ELF; the record's enforcement label is `NATIVE_SANDBOX`. |
 | Claude `write` | **Not Tested** as E2E (registry `write_enforcement` = NATIVE_SANDBOX) | Registry support confirmed in code only. |
-| Codex / Claude `autonomous` | **Not Tested** as dedicated E2E | Policy `write-autonomous` enabled and verified by a write-mode job; no separate autonomous receipt cited. |
+| Codex `autonomous` | **Not Tested** as dedicated E2E | Policy `write-autonomous` enabled and verified by a write-mode job; no codex autonomous receipt cited. |
+| Claude `autonomous` | **Reported** — completed exit 0 | Job `A3JOB-20261019-5f8b72872cd103dbedf364d5de90c430` (A3 documentation Git workflow, 2026-10-19): completed exit 0; native structured tool events recorded 57 tools completed, **4 tools failed** (failures are part of the receipt and are not concealed). |
 | Pi dispatch | **Not Tested**; registry `read_only` only, `write` unsupported | Adapter availability Reported — installed (audit resolves absolute bin); autonomous dispatch disabled per operator record 2026-10-20; no Pi E2E receipt cited. |
 | Hermes dispatch | **Fail-closed by design** (Confirmed refusal path) | Registry `read_only` = UNSUPPORTED; host verification Reported — hermes refused both modes, 2026-10-20. |
 | Six-tool surface + 401 negatives | **Reported** — PASS | A3 local/tunnel gates G1–G8, 2026-10-20 receipts. |
 | Trusted-dispatch DAC boundary | **Reported** — `/root` dispatch refused `INVALID_WORKING_DIRECTORY` | Install verification, 2026-10-20. |
 | Restart persistence + fresh job-store continuity | **Reported** — PASS | A3 gates, 2026-10-20. |
-| ChatGPT-originated External Plugin E2E | **Not Tested** — open gate | Receipts 2026-10-20; plugin may cache a rotated bearer (refresh flow). |
+| External ChatGPT Plugin `read_only` E2E | **Reported** — passed | A3 receipts 2026-10-19: codex `A3JOB-20261019-928c4174…` and claude `A3JOB-20261019-6929c583…` both completed exit 0 through the Secure MCP transport. Post-2026-10-20-reinstall fresh ChatGPT-originated revalidation remains Not Tested; plugin may cache a rotated bearer (refresh flow). |
+| Plugin-path `write`/`autonomous` E2E | **Not Tested** — open gate | No receipt exists for a ChatGPT-plugin-originated write/autonomous job. |
 | Cold boot (linger + reboot cycle) | **Not Tested** — open gate; reboot not yet authorized | `loginctl enable-linger` is required for os-native units to survive reboot; installer reports lingering state and never enables it. |
 
 ## A2 host (restricted Secure MCP deployment)
 
 | Capability | Status | Evidence (source / date) |
 |---|---|---|
-| Real jobs across Claude / Codex / Hermes | **Reported (historical)** — prior parity audit reports real jobs; distinguish from fresh revalidation | Prior A2 parity audit record; not revalidated in this cycle. |
+| Real jobs across Claude / Codex / Hermes | **Reported (historical, unverified)** — a previous agent reported a prior A2 parity audit running real jobs; distinguish from fresh revalidation | No artifact path, date, job IDs or per-mode receipts for that audit were locatable by the documentation or review authors; treat it as an earlier agent's report explicitly **not independently verified** in this cycle. |
 | Trusted dispatch chain (ChatGPT connector → tunnel → bearer → policy principal) | **Confirmed** contract (`docs/mcp-runtime-autonomous.md` @ 2b123e21); host gate status follows that deployment's receipts | Policy checked 4× per job; fail-closed on malformed/revoked policy. |
 | ChatGPT-originated external E2E | **Not Tested** — final external ChatGPT E2E must be performed independently; local MCP tests do not satisfy that gate | Stated in the trusted-dispatch contract itself. |
 
@@ -76,13 +78,23 @@ npm JS wrapper failed native-ELF identity checks).
 - **Redaction is best effort**, not a data-classification system; secrets and
   sensitive source may still pass through permitted task output.
 - **Static availability ≠ dispatchability**: registry declares agent
-  install/supported modes statically; native-ELF/probe checks at dispatch can
-  still refuse (the A3 codex npm-wrapper incident).
-- Bounded I/O everywhere: 65,536-byte stdout/stderr/result caps, 4,000-char
-  summary, 2,000-char log, 8,000-char task, snapshot bounds 10,000 files /
-  4 MiB per file / 64 MiB total; Codex timeout ≤ 900 s.
-- **Not production-readiness claims**: ChatGPT-originated Plugin E2E and
-  cold boot remain open; `write`/`autonomous` remain policy-gated per
-  principal and per host. Never claim unrestricted write access from any of
+  install/supported modes statically; at dispatch the executable/`--help`
+  probe, mode refusal and identity re-check can still refuse (the A3 codex
+  npm-wrapper incident). The native-ELF expectation itself is an operator
+  provenance check, not a dispatch-time gate — generic dispatch resolution
+  accepts any executable absolute path, wrapper included.
+- Bounded I/O, per path: the **job store** bounds every record ≤65,536-byte
+  JSON, task ≤8,000 chars, summary ≤4,000 chars, log excerpt ≤2,000 chars.
+  **Snapshot bounds** (10,000 files / 4 MiB per file / 64 MiB total) apply to
+  the restricted broker snapshot path. **Generic adapter jobs** run on the
+  operator-configurable execution budget (defaults: wall timeout 3,600 s,
+  per-stream spool 64 MiB, per-job spool 96 MiB, capture 65,536 bytes,
+  inline result 16,384 bytes) — the Codex ≤ 900 s cap belongs to the P2C
+  broker resource profile, not to generic adapter jobs.
+- **Not production-readiness claims**: a fresh post-reinstall
+  ChatGPT-originated Plugin E2E, plugin-path write/autonomous, and cold boot
+  remain open; `write`/`autonomous` remain policy-gated per
+  principal and per host, and A2/A3 multi-host parity is not universally
+  verified. Never claim unrestricted write access from any of
   the above — os-native write authority is exactly the service OS identity's
   DAC/ACL scope plus the adapter's native write confinement.

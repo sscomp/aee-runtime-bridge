@@ -3,9 +3,10 @@
 **AEE lets ChatGPT dispatch AI coding agents to real Linux hosts through the
 OpenAI Secure MCP Tunnel: the MCP gateway, the agent CLIs, the sandbox and the
 job store all run on each host; inference runs at the provider; no inbound
-ports are opened on any host.** Tasks, admitted source content and bounded,
-redacted results are the only things that cross the tunnel boundary. See
-[security and privacy](docs/security-model.md).
+ports are opened on any host.** Tasks, admitted source content, and bounded,
+redacted results cross the tunnel boundary alongside the same bearer-authenticated
+job-control metadata (status, discovery, cancel/result payloads) — all under
+the same restricted surface. See [security and privacy](docs/security-model.md).
 
 The current deployment target is **Linux x86_64, systemd with cgroup v2,
 CPython 3.13.x**, rootless user/mount/PID/network namespaces, GCC and
@@ -15,8 +16,12 @@ vendored Bubblewrap artifact in
 binary versions/hosts require a reviewed policy change. Host adapter audits report the
 resolved native Codex binary each host actually runs (see the
 [runtime capability matrix](docs/runtime-capability-matrix.md)); registry
-support alone does not prove an end-to-end job in a given mode. A
-ChatGPT-originated Plugin E2E is **not yet validated** (Stage 3B).
+support alone does not prove an end-to-end job in a given mode. External
+ChatGPT Plugin `read_only` E2E on A3 **passed** (codex job
+`A3JOB-20261019-928c4174…`, claude job `A3JOB-20261019-6929c583…`, both exit 0,
+Reported receipts through the Secure MCP transport). A fresh ChatGPT-originated
+Plugin E2E since the 2026-10-20 reinstall (Stage 3B revalidation) and the
+cold-boot gate remain open.
 
 ## How a dispatch flows (architecture in one paragraph)
 
@@ -67,11 +72,18 @@ Gateway installs choose exactly one of two canonical deployment profiles
   as a systemd *user* unit. The boundary is the OS itself: DAC/ACL on the
   dispatch working directory plus each adapter's own native enforcement
   (Codex native sandbox, Claude tool allowlist/acceptEdits, Pi tool
-  denylist). Manifests and the broker control socket are not required.
+  denylist). Manifests and the broker control socket are not required;
+  adapter jobs (including codex without an approved manifest) run on the
+  generic adapter path against the actual working directory, not a snapshot.
 - **`restricted` (explicit opt-in)** — dedicated system accounts
   (`aee-gateway`, `aee-broker`), full systemd sandbox hardening, mandatory
   `A3_DISPATCH_ALLOWED_ROOTS` workspace confinement, per-job broker socket,
-  deployment manifests and an operator approval gate.
+  deployment manifests and an operator approval gate. The per-job broker
+  snapshot path is reserved to the approved codex contract (`read_only` only —
+  codex `write` is refused there); everything else dispatches through the
+  generic adapter path. Autonomous dispatch — and `write` dispatch under the
+  trusted-dispatch policy — validates the working directory directly as the
+  service OS identity and does not apply the allowed-roots list.
 
 Do not mix profiles on one host. Write and autonomous dispatch require an
 explicitly provisioned [trusted-dispatch policy](docs/mcp-runtime-autonomous.md)
@@ -93,6 +105,8 @@ If `uv` is missing, install it user-level (no root): `curl -LsSf https://astral.
 — `uv venv --python 3.13` downloads and manages its own CPython 3.13 when the host
 Python is another version. Full details in [host setup](docs/deployment.md).
 
+The packager emits `STAGE1_NOT_DEPLOYABLE`; tests never authorize deployment.
+
 Then audit what the *service identity* can actually resolve — a CLI installed
 on the host is not automatically available to every service identity:
 
@@ -101,14 +115,24 @@ python3 scripts/audit_adapters.py                       # resolution facts, JSON
 python3 scripts/audit_adapters.py --strict --expect claude,codex
 ```
 
-Configure `config/p2c/gateway-restricted.env.example` privately, retaining
+Configure the private gateway env file for the profile you chose —
+[`config/profiles/os-native.env.example`](config/profiles/os-native.env.example)
+(os-native) or
+[`config/profiles/restricted.env.example`](config/profiles/restricted.env.example)
+(restricted, which also points at the broker/manifest template
+`config/p2c/gateway-restricted.env.example`) — retaining
 `127.0.0.1:8791/mcp (restricted)`, authentication and exactly the six-tool
 surface: `aee_status`, `aee_agents`, `aee_dispatch`, `aee_job_cancel`,
 `aee_job_status`, `aee_job_result`. With the A2 private trusted-dispatch
 policy provisioned, approved Secure MCP principals may dispatch
 `read_only`/`write`/`autonomous` without per-job tokens
-([A2 deploy and verification](docs/a2-secure-mcp-deploy-verify.md)); without
-that policy only `codex` / `read_only` dispatch is supported.
+([A2 deploy and verification](docs/a2-secure-mcp-deploy-verify.md)). Without
+that policy, dispatch falls back to the legacy authorization gates (still
+implemented): read-only jobs across supported adapters require no policy, and
+write/autonomous need the legacy per-job operator approval
+(`AEE_WRITE_APPROVAL_TOKEN`/`AEE_WRITE_ALLOWED_ROOTS` and the autonomous
+authority token). A configured-but-malformed policy blocks all new dispatch —
+see [trusted dispatch](docs/mcp-runtime-autonomous.md).
 `aee_exec` remains local/full only on port 8790.
 [Validation](docs/agent-operations.md) covers health, MCP handshake, agent
 discovery, safe dispatch and completed-result verification.
@@ -132,6 +156,13 @@ required. See [troubleshooting and rollback](docs/troubleshooting.md).
   remote surface. `/health` and `/status` expose diagnostics and must remain
   loopback-only.
 
+History note: the [security model](docs/security-model.md) paragraphs that
+state remote execution is "Codex/read_only only" and that write is "rejected"
+describe the earlier Stage-1 candidate contract. Trusted-dispatch policy
+(above) and the two deployment profiles supersede them: `write`/`autonomous`
+are admitted under an explicitly provisioned policy, and the approved broker
+contract alone remains `read_only`-only.
+
 Full model: [security model](docs/security-model.md) ·
 [architecture](docs/architecture.md) ·
 [trusted dispatch](docs/mcp-runtime-autonomous.md).
@@ -142,9 +173,14 @@ Acceptance evidence is labeled per claim in the
 [runtime capability matrix](docs/runtime-capability-matrix.md)
 (`Confirmed` = independently inspected contract/code, `Reported` = operator
 receipt/job record not re-executed, `Not Tested` = open gate). Known open
-gates at time of writing: ChatGPT-originated External Plugin E2E and the
-cold-boot/linger gate. Registry support does **not** by itself prove an
-end-to-end job in a given mode.
+gates at time of writing: a fresh ChatGPT-originated External Plugin E2E after
+the 2026-10-20 reinstall (the earlier A3 plugin `read_only` E2E receipts passed
+on 2026-10-19), plugin-path `write`/`autonomous` E2E, the cold-boot/linger
+gate, and `write`/`autonomous` E2E across every adapter (codex `autonomous`,
+Claude `write`, and all Pi modes lack receipts). A2/A3 multi-host parity is not
+universally verified — no multi-host simultaneous E2E exercise exists.
+Registry support does **not** by itself prove an end-to-end job in a given
+mode.
 
 ## Repository map and verification
 
