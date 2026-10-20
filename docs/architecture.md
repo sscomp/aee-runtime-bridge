@@ -2,8 +2,9 @@
 
 ChatGPT → OpenAI Secure MCP Tunnel → host `tunnel-client` → authenticated
 loopback gateway → leased job → host-local agent adapter CLI → per-job Unix
-socket broker (restricted profile) or provider env (os-native) → the
-inference provider each path is configured for (OpenAI Responses on the
+socket broker (approved codex `read_only` snapshot contract, on a
+manifest-managed host only) or provider env (every generic adapter path) →
+the inference provider each path is configured for (OpenAI Responses on the
 approved broker contract; generic adapters use their own configured
 provider). Results return through MCP and the tunnel. Each host retains its
 own private job records; ChatGPT receives bounded redacted projections. See
@@ -15,7 +16,7 @@ own private job records; ChatGPT receives bounded redacted projections. See
 | Admission and store | `aee/mcp_runtime/store.py` | One active lease; bounded private JSON; restart handling |
 | Agent adapter registry | `aee/mcp_runtime/job_adapters.py` | Per-agent specs; honest mode enforcement; fail-closed resolution |
 | Executor and sandbox | `aee/mcp_runtime/executor.py`, `sandbox.py`, `process.py` | Trusted immutable source, stdin task, namespaces, finite output/time/process limits |
-| Result contract | `aee/mcp_runtime/result_contract.py` | Exit zero alone is insufficient; independent completion proof; failures sticky |
+| Result contract | `aee/mcp_runtime/result_contract.py` | Exit zero alone is insufficient; independent completion proof; fail-shot tool-failure semantics (broker/native contract — see Failure semantics) |
 | Broker | `aee/mcp_runtime/broker.py` | Dedicated credential owner; per-job socket, UID/lease and request policy |
 | Trusted dispatch | `aee/mcp_runtime/trusted_dispatch.py` | Explicit policy admission; never inferred from request metadata |
 | Packaging and deployment | `aee/mcp_runtime/packaging.py`, `config/p2c/systemd/` | Committed source, immutable metadata, closed default approval gate |
@@ -33,11 +34,19 @@ One canonical source, one six-tool surface, two deployment profiles — see
 | Boundary model | OS DAC/ACL + each adapter's native enforcement | systemd sandbox hardening + mandatory workspace confinement (`A3_DISPATCH_ALLOWED_ROOTS`) |
 | Broker control socket | not used | `/run/aee-broker/control.sock` |
 | Manifests | not required (`AEE_RUNTIME_MANIFEST` unset) | `A3_WORKSPACE_MANIFEST`, `AEE_RUNTIME_MANIFEST` required |
-| Dispatch routing | generic adapter path against the actual working directory; codex additionally requires an approved manifest or is refused `DEPLOYMENT_GATE_CLOSED` | codex under the approved manifest runs the broker snapshot contract (`read_only` only — codex `write` is refused there); every other agent/mode uses the generic adapter path |
-| Write/autonomous | trusted-dispatch policy | trusted-dispatch policy + broker approval chain |
+| Dispatch routing | generic adapter path against the actual working directory (`AEE_RUNTIME_MANIFEST` unset ⇒ no deployment-policy gate) | broker snapshot contract for approved codex `read_only` only; codex `write` refused there; everything else uses the generic adapter path |
+| Write/autonomous | trusted-dispatch policy; legacy per-job gates when the policy is absent | same policy admission; the broker approval chain belongs to the approved codex `read_only` contract, not to write/autonomous dispatch |
 
 Both profiles pin loopback-only bind (`AEE_MCP_HOST=127.0.0.1`), required
 auth (`AEE_MCP_REQUIRE_AUTH=true`) and the restricted six-tool surface.
+
+Dispatch routing is decided by agent, mode and manifest approval, not by the
+profile name alone (`mcp_gateway.py` admission): manifest absent ⇒ codex
+uses the generic adapter path; manifest present but unapproved ⇒
+non-autonomous codex dispatch is refused (`DEPLOYMENT_GATE_CLOSED`);
+manifest approved ⇒ codex `read_only` runs the broker snapshot contract
+while codex `write` is refused there; `autonomous` and every non-codex agent
+always use the generic adapter path.
 
 ## Authorization layers, and how they differ
 
@@ -65,8 +74,15 @@ them, and each layer fails closed independently:
      refused for every mode (`TRUSTED_DISPATCH_CALLER_UNVERIFIED`).
    See [trusted dispatch](mcp-runtime-autonomous.md).
 2. **OS DAC/ACL.** The job's `working_directory` is canonicalized at
-   admission and re-verified by device/inode identity immediately before
-   launch (`INVALID_WORKING_DIRECTORY` when it changed). The worker runs
+   admission. The admission-to-launch device/inode identity re-verification
+   (`INVALID_WORKING_DIRECTORY` when it changed; launch against a pinned
+   `/proc/<pid>/fd` alias) applies to `autonomous` jobs and to jobs admitted
+   through the trusted-dispatch policy (all modes, under the
+   `aee-secure-mcp-admission-v1` proof). Legacy generic `read_only`/`write`
+   (policy absent) validate the directory once at admission and do not
+   re-verify it at launch. The worker runs
+   under the service OS identity and inherits its actual DAC/ACL privileges
+   — without escalation. os-native takes this layer as the primary boundary;
    under the service OS identity and inherits its actual DAC/ACL privileges
    — without escalation. os-native takes this layer as the primary boundary;
    restricted confines it further with the allowed-roots list — except that
@@ -106,8 +122,10 @@ through the approved Stage-2 Codex broker path:
   happens to be installed. Registry support does **not** by itself prove an
   E2E job succeeded in that mode; see the
   [capability matrix](runtime-capability-matrix.md).
-- The child runs with `cwd=<working_directory>` (pinned inode via
-  `/proc/<pid>/fd`); the task always travels on **stdin**, never argv, so it
+- The child runs with `cwd=<working_directory>` (for `autonomous` and
+  trusted-admission jobs the launcher pins the admitted inode via
+  `/proc/<pid>/fd`; legacy adapter-path jobs resolve the directory directly
+  — see Authorization layers); the task always travels on **stdin**, never argv, so it
   never appears in `/proc/*/cmdline`.
 - The child env strips every `AEE_*`, `A3_*` and `MCP_BRIDGE_*` key — the
   control plane never enters the worker's environment; provider credentials
@@ -161,13 +179,23 @@ gateway/broker units is an operator-only private check.
 
 ## Failure semantics
 
-Failures are sticky and classified; they are never relabeled or recovered by
-override (sandbox profile `tool_failures: sticky-fail-closed-no-recovery-override`):
+Failures are classified per adapter and execution path; they are never
+relabeled or recovered by override (the restricted broker sandbox profile
+records `tool_failures: sticky-fail-closed-no-recovery-override`):
 
 - `exit_code=0` together with a `failed` status is **intentional** — the
-  fail-shot contract: an agent ran a native command that exited nonzero and
-  the job fails (`REQUIRED_TOOL_FAILED`) rather than silently treating the
-  expected negative as success. Re-run with exit-zero-guarded task phrasing.
+  fail-shot contract. It applies to the broker/native executor and to the
+  codex/hermes/pi adapter parsers: a required native command exiting nonzero,
+  or a failed/declined event, fails the job (`REQUIRED_TOOL_FAILED`) rather
+  than silently treating the expected negative as success. Re-run with
+  exit-zero-guarded task phrasing.
+- **Claude tool errors are not sticky at job level.** The Claude adapter
+  parser counts individual tool-level errors in the job's tool-event record
+  but accepts a successful final result, so a job can complete exit 0 while
+  some tools failed (both cited A3 documentation jobs completed exit 0
+  carrying 4 and 2 recorded tool errors respectively). A Claude job fails
+  terminally only on an error `result` event, turn-budget exhaustion
+  (`TURN_BUDGET_EXHAUSTED`) or the execution-bound checks below.
 - Unsupported agent/mode and unresolved adapters fail **before admission**:
   `INVALID_AGENT`, `INVALID_MODE`, `ADAPTER_NOT_INSTALLED`,
   `ADAPTER_UNSUPPORTED` (Hermes cannot serve `read_only`; Pi cannot serve

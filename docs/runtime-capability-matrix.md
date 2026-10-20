@@ -34,7 +34,7 @@ under the intended service identity.
 **Registry support does NOT prove an E2E job succeeded in that mode.**
 Live dispatchability below is always per host and dated.
 
-## A3 (omarchy-a3, os-native profile, installed from `2b123e21` on 2026-10-20)
+## A3 (omarchy-a3, os-native profile, installed from `2b123e21`; evidence bundle dated 2026-10-20, installer receipt `2026-10-19T17:19:46Z` UTC)
 
 Install verdict: **PASS WITH CONDITIONS** (operator evidence bundle
 `~/AEE_A3_REINSTALL_EVIDENCE_20261020/`, 0700, zip + SHA-256). Conditions
@@ -57,7 +57,7 @@ npm JS wrapper failed native-ELF identity checks).
 | Six-tool surface + 401 negatives | **Reported** — PASS | A3 local/tunnel gates G1–G8, 2026-10-20 receipts. |
 | Trusted-dispatch DAC boundary | **Reported** — `/root` dispatch refused `INVALID_WORKING_DIRECTORY` | Install verification, 2026-10-20. |
 | Restart persistence + fresh job-store continuity | **Reported** — PASS | A3 gates, 2026-10-20. |
-| External ChatGPT Plugin `read_only` E2E | **Reported** — passed | A3 receipts 2026-10-19: codex `A3JOB-20261019-928c4174…` and claude `A3JOB-20261019-6929c583…` both completed exit 0 through the Secure MCP transport. Post-2026-10-20-reinstall fresh ChatGPT-originated revalidation remains Not Tested; plugin may cache a rotated bearer (refresh flow). |
+| External ChatGPT Plugin `read_only` E2E | **Reported** — passed (jobs postdate the reinstall) | A3 receipts 2026-10-19: codex `A3JOB-20261019-928c4174…` (started `18:02:21Z`) and claude `A3JOB-20261019-6929c583…` (started `17:35:30Z`) both completed exit 0 through the Secure MCP transport, after the install receipt `2026-10-19T17:19:46Z`. A fresh ChatGPT-originated revalidation since those receipts remains Not Tested (Secure-MCP provenance and task descriptions support the Reported attribution; they do not independently authenticate a specific ChatGPT UI session); plugin may cache a rotated bearer (refresh flow). |
 | Plugin-path `write`/`autonomous` E2E | **Not Tested** — open gate | No receipt exists for a ChatGPT-plugin-originated write/autonomous job. |
 | Cold boot (linger + reboot cycle) | **Not Tested** — open gate; reboot not yet authorized | `loginctl enable-linger` is required for os-native units to survive reboot; installer reports lingering state and never enables it. |
 
@@ -91,9 +91,9 @@ npm JS wrapper failed native-ELF identity checks).
   per-stream spool 64 MiB, per-job spool 96 MiB, capture 65,536 bytes,
   inline result 16,384 bytes) — the Codex ≤ 900 s cap belongs to the P2C
   broker resource profile, not to generic adapter jobs.
-- **Not production-readiness claims**: a fresh post-reinstall
-  ChatGPT-originated Plugin E2E, plugin-path write/autonomous, and cold boot
-  remain open; `write`/`autonomous` remain policy-gated per
+- **Not production-readiness claims**: a fresh ChatGPT-originated Plugin
+  E2E since the 2026-10-19 receipts, plugin-path write/autonomous, and cold
+  boot remain open; `write`/`autonomous` remain policy-gated per
   principal and per host, and A2/A3 multi-host parity is not universally
   verified. Never claim unrestricted write access from any of
   the above — os-native write authority is exactly the service OS identity's

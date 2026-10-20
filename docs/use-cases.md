@@ -60,9 +60,11 @@ Evidence: A3 E2E job `A3JOB-20261019-928c4174f778e8f7edba4049e2b7be28`
 (codex, exit 0, 2 native tool events started/completed, 0 failed) —
 Reported. External ChatGPT Plugin `read_only` E2E passed for codex
 (`928c4174…`) and claude (`A3JOB-20261019-6929c5831f9b3c8937cd6a0ee06ee6b9`,
-exit 0) — Reported (2026-10-19 receipts, Secure MCP transport); plugin-path
+exit 0) — Reported (2026-10-19 receipts, Secure MCP transport — the claude job started
+`17:35:30Z` and the codex job `18:02:21Z`, after the install receipt
+`2026-10-19T17:19:46Z`, so they already postdate the reinstall); plugin-path
 `write`/`autonomous` E2E and a fresh ChatGPT-originated plugin revalidation
-after the 2026-10-20 reinstall remain Not Tested.
+since those receipts remain Not Tested.
 
 ## 2. Read-only audit
 
@@ -94,7 +96,13 @@ native write scope (codex `workspace-write` confined to the job directory
 and /tmp, network disabled by default; claude headless `acceptEdits`), and
 `autonomous` uses headless bypass flags inherited within the OS identity.
 Boundaries: DAC/ACL of the service identity (no escalation), TOCTOU
-directory-identity recheck at launch, sticky failures. Legacy
+directory-identity recheck at launch (applies to `autonomous` and
+trusted-admission jobs, including trusted-policy `write` — not to legacy
+generic jobs without the policy), and per-adapter failure semantics: failed
+tool events are recorded without failing a job whose final result succeeds
+(Claude), while codex/hermes/pi and the broker contract treat a failed
+required operation as `REQUIRED_TOOL_FAILED` — see
+[Failure semantics](architecture.md). Legacy
 per-job write gates are superseded when the policy is configured.
 Emergency stop is an atomic policy flip (`enabled: false`).
 Evidence: Reported — A3 real codex write job
