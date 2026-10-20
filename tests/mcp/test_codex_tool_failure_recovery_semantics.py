@@ -11,13 +11,19 @@ command evidence (failed/declined with no exit code) fails closed.
 Both native parser paths stay under the same contract: the streamed
 budget parser (``mcp_runtime/event_stream``) and the buffered codex
 finalizer (``executor.final_agent_message``).
+
+Contract v2 additions (remediation of review findings F01-F03): a
+table-driven streamed/buffered parity matrix over the same event fixtures
+(final-answer placement, malformed exit_code values, fatal-event
+precedence, multi-turn recovery), and process-level tests locking the EOF
+precedence — process-exit mapping before the parser verdict on both paths.
 """
 import json
 import unittest
 
 from aee.mcp_runtime.event_stream import EventParser
 from aee.mcp_runtime.executor import final_agent_message
-from aee.mcp_runtime.process import Limits
+from aee.mcp_runtime.process import Limits, run_streamed
 from aee.mcp_runtime.store import JobError
 
 
@@ -369,6 +375,214 @@ class BufferedFinalizerSemantics(unittest.TestCase):
         with self.assertRaises(JobError) as error:
             final_agent_message(stdout, Limits())
         self.assertEqual(error.exception.code, 'EXECUTION_FAILED')
+
+
+def _command_item(exit_code='MISSING', status='failed'):
+    item = {'type': 'command_execution', 'status': status}
+    if exit_code != 'MISSING':
+        item['exit_code'] = exit_code
+    return {"type": "item.completed", "item": item}
+
+
+def _message(text):
+    return {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+
+
+def decide(events):
+    """Run the identical event fixture through both native decision paths."""
+    def streamed():
+        parser = EventParser('codex', 16384)
+        parser.feed(codex_stream(*events), eof=True)
+        return parser.result()
+
+    def buffered():
+        return final_agent_message(codex_stream(*events), Limits())
+    outcomes = {}
+    for name, fn in (('streamed', streamed), ('buffered', buffered)):
+        try:
+            outcomes[name] = ('completed', fn())
+        except JobError as exc:
+            outcomes[name] = ('failed', {'code': exc.code})
+    return outcomes
+
+
+class StreamedBufferedParityMatrix(unittest.TestCase):
+    """Contract v2 parity matrix: same fixture, both paths, same verdict.
+
+    Locked precedence (SEMANTICS_CONTRACT v2):
+      process exit mapping -> fatal agent events -> terminal event + answer.
+    Error-code differences between paths are allowed only where the contract
+    names the per-path code (missing answer: streamed PARSER_ERROR,
+    buffered EXECUTION_FAILED); verdict direction (completed/failed) and the
+    recovered-evidence semantics must agree everywhere.
+    """
+
+    def assertAgree(self, events, expect, *, msg=None):
+        outcomes = decide(events)
+        for name, outcome in outcomes.items():
+            self.assertEqual(outcome, expect,
+                             f'{name} disagreed: {outcome} != {expect}' + (f' ({msg})' if msg else ''))
+
+    def test_parity_malformed_exit_code_never_resolves_success(self):
+        # exit_code table per contract: only a substantiated integer is a
+        # command outcome; every non-integer (including missing) is ambiguous,
+        # stays a sticky REQUIRED_TOOL_FAILED on both paths, and is never a
+        # silent success.
+        for value in (None, [], {}, "1", 1.5, True, False, 'missing', 0.0):
+            events = ('{"type":"turn.started"}', _command_item(value),
+                      _message('ok'), '{"type":"turn.completed"}', )
+            self.assertAgree(events, ('failed', {'code': 'REQUIRED_TOOL_FAILED'}),
+                             msg=f'exit_code={value!r}')
+
+    def test_parity_integer_exit_codes_are_recovered_evidence(self):
+        for value in (-2, -1, 1, 7, 0):
+            events = ('{"type":"thread.started","thread_id":"t"}',
+                      '{"type":"turn.started"}', _command_item(value),
+                      _message('ok'), '{"type":"turn.completed"}')
+            self.assertAgree(events, ('completed', 'ok'))
+        parser = EventParser('codex', 16384)
+        parser.feed(codex_stream(
+            '{"type":"turn.started"}', _command_item(1), _command_item(0),
+            _message('ok'), '{"type":"turn.completed"}'), eof=True)
+        parser.result()
+        evidence = parser.tool_evidence()
+        self.assertEqual(evidence['tools_failed'], 1)
+        self.assertEqual(evidence['tools_completed'], 2)
+
+    def test_parity_final_answer_is_last_agent_message_of_final_turn(self):
+        # (a) Last final answer removed, earlier same-turn message retained:
+        # the native stream protocol never deletes an emitted event, so this
+        # control is a synthetic mutilation. Contract rule: the answer is the
+        # last nonblank agent_message text of the final turn — the earlier
+        # same-turn message is therefore emitted on BOTH paths (not the
+        # 4284-byte removed answer). This documents the corrected negative
+        # control that review finding F01 challenged.
+        events_a = ('{"type":"thread.started","thread_id":"t"}',
+                    '{"type":"turn.started"}', _command_item(1),
+                    _message('MID-TURN NARRATION'), _command_item(1),
+                    '{"type":"turn.completed"}')
+        self.assertAgree(events_a, ('completed', 'MID-TURN NARRATION'))
+
+    def test_parity_final_message_on_current_turn_wins(self):
+        # (d) with the final message present the newest answer is emitted.
+        events_d = ('{"type":"turn.started"}', _command_item(1),
+                    _message('FINAL ANSWER'), '{"type":"turn.completed"}')
+        self.assertAgree(events_d, ('completed', 'FINAL ANSWER'))
+
+    def test_parity_turn_without_any_agent_message_fails_closed(self):
+        # (b) No answer anywhere: both paths fail closed. Path-specific codes
+        # (streamed PARSER_ERROR / buffered EXECUTION_FAILED) are named by
+        # the contract's per-path error-code table.
+        events_b = ('{"type":"thread.started","thread_id":"t"}',
+                    '{"type":"turn.started"}', _command_item(1),
+                    '{"type":"turn.completed"}')
+        outcomes = decide(events_b)
+        self.assertEqual(outcomes['streamed'], ('failed', {'code': 'PARSER_ERROR'}))
+        self.assertEqual(outcomes['buffered'], ('failed', {'code': 'EXECUTION_FAILED'}))
+
+    def test_parity_blank_or_textless_message_cannot_publish_an_answer(self):
+        # An agent_message with blank/missing text yields NO pending answer;
+        # a later textful message restores it. A turn ending on a blank
+        # message has no answer and fails closed on both paths, with the
+        # contract's per-path missing-answer code.
+        outcomes = decide(('{"type":"turn.started"}', _command_item(1),
+                           _message('   '), '{"type":"turn.completed"}'))
+        self.assertEqual(outcomes['streamed'], ('failed', {'code': 'PARSER_ERROR'}))
+        self.assertEqual(outcomes['buffered'], ('failed', {'code': 'EXECUTION_FAILED'}))
+        self.assertAgree(('{"type":"turn.started"}', _message(['no']),
+                          _message('restored'), '{"type":"turn.completed"}'),
+                         ('completed', 'restored'))
+
+    def test_parity_multi_turn_recovery_emits_only_newest_turn_answer(self):
+        # (c) Legitimate recovery must keep working and must never emit the
+        # earlier TURN's answer after a subsequent turn.started (contract v2:
+        # cross-turn staleness is forbidden). Both paths agree.
+        events_c = ('{"type":"thread.started","thread_id":"t"}',
+                    '{"type":"turn.started"}', _message('STALE TURN-1 ANSWER'),
+                    '{"type":"turn.completed"}',
+                    '{"type":"turn.started"}', _command_item(1),
+                    _message('TURN-2 RECOVERED'), '{"type":"turn.completed"}')
+        self.assertAgree(events_c, ('completed', 'TURN-2 RECOVERED'))
+        parser = EventParser('codex', 16384)
+        parser.feed(codex_stream(*events_c), eof=True)
+        parser.result()
+        self.assertEqual(parser.tool_evidence()['tools_failed'], 1)
+
+    def test_parity_sticky_fatal_survives_a_new_turn(self):
+        # A fatal agent event is sticky: a later turn.started, completion or
+        # answer can never override it (buffered raises in place — same
+        # verdict deterministically).
+        events = ('{"type":"thread.started","thread_id":"t"}',
+                  '{"type":"turn.started"}', '{"type":"turn.failed"}',
+                  '{"type":"turn.started"}', _message('pretend fine'),
+                  '{"type":"turn.completed"}')
+        self.assertAgree(events, ('failed', {'code': 'EXECUTION_FAILED'}))
+
+
+class StreamedEofPrecedence(unittest.TestCase):
+    """run_streamed maps the process exit before the parser verdict (F03)."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from aee.mcp_runtime.spool import SpoolStore
+        self.temp = tempfile.TemporaryDirectory(prefix='aee-codex-precedence-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.store = SpoolStore(self.root / 'spool')
+        self.addCleanup(self.store.close)
+        self.counter = 0
+
+    def run_stream(self, body_events, exit_code):
+        import sys
+        from aee.mcp_runtime.budget import ExecutionBudget
+        body = ('import json,sys\nfor e in ' + json.dumps(list(body_events)) +
+                ':sys.stdout.write(json.dumps(e)+"\\n")\nsys.stdout.flush()\n'
+                f'sys.exit({exit_code})\n')
+        budget = ExecutionBudget(wall_timeout_seconds=30)
+        self.counter += 1
+        job = self.store.create('A3JOB-20261020-' + f'{self.counter:032x}', budget, 'fixture-policy')
+        self.addCleanup(job.close)
+        return run_streamed(
+            [sys.executable, '-c', body], env={}, stdin=b'', budget=budget, spool=job,
+            parser=EventParser('codex', budget.result_inline_bytes, budget.memory_capture_bytes),
+            cwd=str(self.root), cancel_event=None, redact=lambda v: v)
+
+    def test_nonzero_exit_outranks_parser_verdict(self):
+        # Clean parser verdict (turn.completed + answer would complete), but
+        # the process exited 1: the job fails on the exit mapping — the exit
+        # code is the strongest process-level outcome at EOF.
+        with self.assertRaises(JobError) as error:
+            self.run_stream(
+                [{"type": "turn.started"},
+                 _command_item(1),
+                 _message('ok'),
+                 {"type": "turn.completed"}], exit_code=1)
+        self.assertEqual(error.exception.code, 'EXECUTION_FAILED')
+        self.assertEqual(error.exception.exit_code, 1)
+
+    def test_nonzero_exit_outranks_ambiguous_command_evidence(self):
+        # Sticky parser fatal (ambiguous exit evidence) + process exit 1:
+        # the exit mapping outranks the parser verdict (buffered parity).
+        with self.assertRaises(JobError) as error:
+            self.run_stream(
+                [{"type": "turn.started"},
+                 _command_item('MISSING'),
+                 _message('ok'),
+                 {"type": "turn.completed"}], exit_code=1)
+        self.assertEqual(error.exception.code, 'EXECUTION_FAILED')
+        self.assertEqual(error.exception.exit_code, 1)
+
+    def test_zero_exit_defers_to_sticky_parser_fatal(self):
+        # Process exit 0: the sticky parser fatal decides (unchanged).
+        with self.assertRaises(JobError) as error:
+            self.run_stream(
+                [{"type": "turn.started"},
+                 _command_item('MISSING'),
+                 _message('ok'),
+                 {"type": "turn.completed"}], exit_code=0)
+        self.assertEqual(error.exception.code, 'REQUIRED_TOOL_FAILED')
+        self.assertEqual(error.exception.exit_code, 0)
 
 
 if __name__ == '__main__':

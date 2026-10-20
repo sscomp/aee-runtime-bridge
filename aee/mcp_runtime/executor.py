@@ -219,13 +219,19 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
                                        'Native executor reported a command outcome with no measurable exit code',
                                        exit_code=0, failure=bounded_failure(event, thread=thread))
                 elif ((item.get('type') == 'error')
-                      or item.get('status') in {'failed', 'declined'}):
+                      or (isinstance(item.get('status'), str) and
+                          item.get('status') in {'failed', 'declined'})):
                     raise JobError('REQUIRED_TOOL_FAILED', 'Native executor reported a failed required operation',
                                    exit_code=0, failure=bounded_failure(event, thread=thread))
             if isinstance(item, dict) and item.get("type") == "agent_message":
+                # Same final-answer rule as the buffered/streamed contract: each
+                # agent_message replaces the pending answer; an agent_message
+                # with missing, non-string or blank text yields no answer (a
+                # later textful message can still become the answer). Hashing
+                # the pending value is never attempted; malformed evidence
+                # cannot silently resurrect an older message as a success.
                 value = item.get("text")
-                if isinstance(value, str):
-                    message = value
+                message = value if isinstance(value, str) and value.strip() else None
     if not completed or not message or not message.strip():
         raise JobError("EXECUTION_FAILED", "Executor produced no final agent message")
     if require_receipt or receipt is not None:
