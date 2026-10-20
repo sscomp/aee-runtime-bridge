@@ -210,7 +210,7 @@ class ExecutorCarriesCollectorReasons(unittest.TestCase):
             '{"type":"thread.started","thread_id":"thr_reasons_exec"}',
             '{"type":"turn.started"}',
             '{"type":"turn.completed"}',
-            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            receipt,
             '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
         ]
         with self.assertRaises(JobError) as error:

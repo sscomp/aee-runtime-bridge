@@ -210,15 +210,18 @@ def run_streamed(argv, *, env, stdin, budget, spool, parser, cwd=None,
         if cancel_event is not None and cancel_event.is_set():
             raise JobError('EXECUTION_CANCELLED', 'Executor cancelled by its local owner')
         code = process.wait(timeout=5)
+        # Deterministic precedence at EOF (contract v2): the process-exit
+        # mapping runs before the parser verdict, matching the buffered path
+        # (which checks returncode before parsing stdout). Parser fatals only
+        # decide a job when the process exited cleanly.
+        if code in {-signal.SIGXCPU, 128 + signal.SIGXCPU, -signal.SIGXFSZ, 128 + signal.SIGXFSZ}:
+            raise JobError('RESOURCE_LIMIT_EXCEEDED', 'Executor exhausted inherited OS resource budget', exit_code=code)
+        if code != 0:
+            raise JobError('EXECUTION_FAILED', f'Executor exited {code}', exit_code=code)
         parser.feed(b'', eof=True)
         if parser.error is not None:
             raise parser.error
-        if code == 0:
-            final = parser.result()
-        elif code in {-signal.SIGXCPU, 128 + signal.SIGXCPU, -signal.SIGXFSZ, 128 + signal.SIGXFSZ}:
-            raise JobError('RESOURCE_LIMIT_EXCEEDED', 'Executor exhausted inherited OS resource budget', exit_code=code)
-        elif code != 0:
-            raise JobError('EXECUTION_FAILED', f'Executor exited {code}', exit_code=code)
+        final = parser.result()
     except JobError as exc:
         error = exc
     except OSError:

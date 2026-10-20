@@ -241,6 +241,8 @@ class EventParser:
         self.projected_bytes = 0
         self.projected_nodes = 0
         t = e.get('type')
+        if not isinstance(t, str):
+            self.fail('Event type must be a bounded string')
         # Bounded numeric evidence only: no command, arguments, outputs or tool names.
         if self.agent == 'codex':
             item = e.get('item') or {}
@@ -248,7 +250,11 @@ class EventParser:
                 if t == 'item.started': self.tools_started += 1
                 if t == 'item.completed':
                     self.tools_completed += 1
-                    if item.get('exit_code') not in {None, 0}: self.tools_failed += 1
+                    # Only a substantiated nonzero integer exit is a failed
+                    # command observation; membership tests that hash a
+                    # malformed value ([]) would raise TypeError mid-stream.
+                    exit_code = item.get('exit_code')
+                    if type(exit_code) is int and exit_code != 0: self.tools_failed += 1
         elif self.agent == 'claude':
             message = e.get('message') or {}
             content = message.get('content', []) if isinstance(message, dict) else []
@@ -264,8 +270,6 @@ class EventParser:
             if t in {'tool_result', 'tool_execution_end'}:
                 self.tools_completed += 1
                 if e.get('is_error') is True or e.get('isError') is True: self.tools_failed += 1
-        if not isinstance(t, str):
-            self.fail('Event type must be a bounded string')
         if t in {'turn.started', 'agent_start'}:
             self.completed = False
             self.final = None
@@ -292,8 +296,23 @@ class EventParser:
                 item = e.get('item') or {}
                 if not isinstance(item, dict):
                     self.fail()
-                if (item.get('type') == 'error' or item.get('status') in {'failed', 'declined'} or
-                    item.get('type') == 'command_execution' and item.get('exit_code') not in {None, 0}):
+                # Layered terminal semantics (codex tool-failure contract): a
+                # completed command_execution with a nonzero integer exit code
+                # is a recovered tool observation — Codex records the failed
+                # command and continues the same turn; tools_failed already
+                # counts it as evidence. It is not a job-terminal verdict. A
+                # command outcome whose exit evidence is missing, or not an
+                # integer per the native schema, is ambiguous and stays
+                # fail-closed. Fatal agent outcomes remain: error items,
+                # failed/declined non-command items, and turn.failed /
+                # top-level error events. Error is sticky — a later
+                # turn.completed can never override an earlier fatal event.
+                if item.get('type') == 'command_execution':
+                    if type(item.get('exit_code')) is not int:
+                        self.error = JobError('REQUIRED_TOOL_FAILED',
+                                              'Codex reported a command outcome with no measurable exit code')
+                elif item.get('type') == 'error' or (isinstance(item.get('status'), str) and
+                                                     item.get('status') in {'failed', 'declined'}):
                     self.error = JobError('REQUIRED_TOOL_FAILED', 'Codex reported failed required operation')
                 if item.get('type') == 'agent_message':
                     self._answer(item.get('text'))
@@ -314,7 +333,8 @@ class EventParser:
             if t == 'message_end':
                 msg = e.get('message') or {}
                 if isinstance(msg, dict) and msg.get('role') == 'assistant':
-                    if msg.get('stopReason') in {'error', 'aborted', 'length'}:
+                    if (isinstance(msg.get('stopReason'), str)
+                            and msg.get('stopReason') in {'error', 'aborted', 'length'}):
                         self.error = JobError('EXECUTION_FAILED', 'Pi reported failed execution')
                     parts = msg.get('content', [])
                     text = [p.get('text') for p in parts if isinstance(p, dict) and p.get('type') == 'text']

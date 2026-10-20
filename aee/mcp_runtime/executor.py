@@ -163,13 +163,20 @@ def bounded_failure(event=None, *, thread=None):
 
 
 def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt=None):
+    def no_duplicate_keys(pairs):
+        seen = {}
+        for key, value in pairs:
+            if key in seen:
+                raise ValueError('duplicate object member')
+            seen[key] = value
+        return seen
+
     message = None
     completed = False
-    started = False
     receipt, thread = None, None
     for line in stdout.splitlines():
         try:
-            event = json.loads(line)
+            event = json.loads(line, object_pairs_hook=no_duplicate_keys)
         except (ValueError, UnicodeError):
             raise JobError("EXECUTION_FAILED", "Executor emitted malformed event data") from None
         if not isinstance(event, dict):
@@ -180,7 +187,10 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
         if event.get("type") == "turn.completed":
             completed = True
         if event.get('type') == 'turn.started':
-            started = True
+            # Only the final turn's own terminal event and answer settle the
+            # stream: a new turn invalidates any earlier completion/message.
+            message = None
+            completed = False
         if event.get('type') == 'thread.started':
             if thread is not None:
                 raise JobError('EXECUTION_FAILED', 'Executor emitted multiple thread identities')
@@ -195,15 +205,33 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
             receipt = event
         if event.get("type") == "item.completed":
             item = event.get("item", {})
-            if isinstance(item, dict) and (
-                    (item.get('type') == 'error' and started) or item.get('status') in {'failed', 'declined'}
-                    or (item.get('type') == 'command_execution' and item.get('exit_code') not in {None, 0})):
-                raise JobError('REQUIRED_TOOL_FAILED', 'Native executor reported a failed required operation',
-                               exit_code=0, failure=bounded_failure(event, thread=thread))
+            if isinstance(item, dict):
+                # Layered terminal semantics (codex tool-failure contract): a
+                # completed command_execution with a nonzero integer exit code
+                # is a recovered tool observation, not a job-terminal verdict —
+                # the final turn verdict decides. Ambiguous command evidence
+                # (exit code missing or not an integer) stays fail-closed, as
+                # do error items, failed/declined non-command items and
+                # turn.failed / top-level error events.
+                if item.get('type') == 'command_execution':
+                    if type(item.get('exit_code')) is not int:
+                        raise JobError('REQUIRED_TOOL_FAILED',
+                                       'Native executor reported a command outcome with no measurable exit code',
+                                       exit_code=0, failure=bounded_failure(event, thread=thread))
+                elif ((item.get('type') == 'error')
+                      or (isinstance(item.get('status'), str) and
+                          item.get('status') in {'failed', 'declined'})):
+                    raise JobError('REQUIRED_TOOL_FAILED', 'Native executor reported a failed required operation',
+                                   exit_code=0, failure=bounded_failure(event, thread=thread))
             if isinstance(item, dict) and item.get("type") == "agent_message":
+                # Same final-answer rule as the buffered/streamed contract: each
+                # agent_message replaces the pending answer; an agent_message
+                # with missing, non-string or blank text yields no answer (a
+                # later textful message can still become the answer). Hashing
+                # the pending value is never attempted; malformed evidence
+                # cannot silently resurrect an older message as a success.
                 value = item.get("text")
-                if isinstance(value, str):
-                    message = value
+                message = value if isinstance(value, str) and value.strip() else None
     if not completed or not message or not message.strip():
         raise JobError("EXECUTION_FAILED", "Executor produced no final agent message")
     if require_receipt or receipt is not None:

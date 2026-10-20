@@ -1,12 +1,14 @@
 """Regression: bounded, secret-free native failure diagnostics on fail-shot paths.
 
-The R3 contract treats any nonzero command exit (or failed/declined/error item)
-as REQUIRED_TOOL_FAILED and fails the job — intentionally strict, and unchanged
-here. What was lost was attribution evidence: the failure record carried only
-``evidence_source``/``recovery_permitted``, so the exact failing native event
-could not be reconstructed after the sandbox was torn down. These tests pin the
-bounded diagnostics contract: a scalar-only summary of the failing event in
-``JobError.failure``, with no raw command output retained.
+The codex tool-failure semantics correction distinguishes tool observations
+from terminal verdicts: a completed ``command_execution`` with a nonzero exit
+code is evidence of a command the agent recovered from, so it no longer fails
+the job when an authentic ``turn.completed`` follows. What still fails closed
+under ``REQUIRED_TOOL_FAILED``: error items, failed/declined non-command
+items, and ambiguous command evidence (failed/declined with no exit code).
+These tests pin the bounded diagnostics contract on those remaining fail-shot
+paths: a scalar-only summary of the failing event in ``JobError.failure``,
+with no raw command output retained.
 """
 import json
 import unittest
@@ -31,12 +33,25 @@ class RequiredToolFailureDiagnostics(unittest.TestCase):
                 if isinstance(value, str):
                     self.assertLessEqual(len(value), 100, key)
 
-    def test_nonzero_command_exit_is_failed_and_names_the_event(self):
+    def test_nonzero_command_exit_is_a_recovered_observation(self):
+        # T01: a failed command followed by an authentic turn.completed no
+        # longer poisons the job; the command failure is tool evidence only.
         events = [
             '{"type":"thread.started","thread_id":"thr_probe_1"}',
             '{"type":"turn.started"}',
             '{"type":"item.completed","item":{"id":"item_7","type":"command_execution",'
             '"exit_code":2,"aggregate_output":"raw command output must not be retained"}}',
+            '{"type":"turn.completed"}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+        ]
+        self.assertEqual(final_agent_message(self.stream(events), Limits()), "done")
+
+    def test_ambiguous_command_outcome_fails_closed_and_names_the_event(self):
+        events = [
+            '{"type":"thread.started","thread_id":"thr_probe_1"}',
+            '{"type":"turn.started"}',
+            '{"type":"item.completed","item":{"id":"item_7","type":"command_execution",'
+            '"status":"failed","aggregate_output":"raw command output must not be retained"}}',
             '{"type":"turn.completed"}',
             '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
         ]
@@ -48,7 +63,7 @@ class RequiredToolFailureDiagnostics(unittest.TestCase):
         self.assertEqual(failure["evidence_source"], "native-jsonl")
         self.assertFalse(failure["recovery_permitted"])
         self.assertEqual(failure["failing_event"]["item_type"], "command_execution")
-        self.assertEqual(failure["failing_event"]["exit_code"], 2)
+        self.assertEqual(failure["failing_event"]["exit_code"], None)
         self.assertEqual(failure["thread_id"], "thr_probe_1")
         raw = json.dumps(failure)
         self.assertNotIn("raw command output must not be retained", raw)
@@ -123,7 +138,7 @@ class EvidenceValidationDiagnostics(unittest.TestCase):
             '{"type":"thread.started","thread_id":"thr_evidence_1"}',
             '{"type":"turn.started"}',
             '{"type":"turn.completed"}',
-            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            receipt,
             '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
         ]
         with self.assertRaises(JobError) as error:
@@ -170,7 +185,7 @@ class EvidenceValidationDiagnostics(unittest.TestCase):
             '{"type":"thread.started","thread_id":"thr_evidence_4"}',
             '{"type":"turn.started"}',
             '{"type":"turn.completed"}',
-            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            receipt,
             '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
         ]
         with self.assertRaises(JobError) as error:
@@ -196,7 +211,7 @@ class EvidenceValidationDiagnostics(unittest.TestCase):
             '{"type":"thread.started","thread_id":"thr_evidence_5"}',
             '{"type":"turn.started"}',
             '{"type":"turn.completed"}',
-            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            receipt,
             '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
         ]
         with self.assertRaises(JobError) as error:
@@ -222,7 +237,7 @@ class EvidenceValidationDiagnostics(unittest.TestCase):
             '{"type":"thread.started","thread_id":"thr_evidence_6"}',
             '{"type":"turn.started"}',
             '{"type":"turn.completed"}',
-            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            receipt,
             '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
         ]
         broker_receipt = {'valid': True, 'response_complete': True,
@@ -257,7 +272,7 @@ class EvidenceValidationDiagnostics(unittest.TestCase):
             '{"type":"thread.started","thread_id":"thr_evidence_3"}',
             '{"type":"turn.started"}',
             '{"type":"turn.completed"}',
-            '{"type":"aee.native_tool_receipt",' + receipt[1:-1] + '}',
+            receipt,
             '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
         ]
         # No broker receipt: accepted=False path validates lifecycle only.
