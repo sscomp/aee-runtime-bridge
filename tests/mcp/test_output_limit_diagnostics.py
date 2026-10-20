@@ -142,8 +142,9 @@ class FinalMessageDiagnostics(unittest.TestCase):
             self.assertEqual(error.exception.code, "EXECUTION_FAILED")
             self.assertIsNone(error.exception.context)
 
-    def test_required_tool_failure_semantics_unchanged_and_no_context(self):
-        events = [
+    def test_required_tool_failure_semantics_and_no_context(self):
+        # A recovered command failure is a tool observation, not a verdict.
+        recovered = [
             b'{"type":"thread.started","thread_id":"thr_probe_1"}',
             b'{"type":"turn.started"}',
             b'{"type":"item.completed","item":{"type":"command_execution","exit_code":2,'
@@ -151,12 +152,23 @@ class FinalMessageDiagnostics(unittest.TestCase):
             b'{"type":"turn.completed"}',
             b'{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
         ]
+        self.assertEqual(final_agent_message(b"\n".join(recovered) + b"\n", Limits()), "done")
+        # Ambiguous command evidence (failed with no exit code) stays fail-shot
+        # and carries no output-limit context.
+        ambiguous = [
+            b'{"type":"thread.started","thread_id":"thr_probe_1"}',
+            b'{"type":"turn.started"}',
+            b'{"type":"item.completed","item":{"type":"command_execution","status":"failed"}}',
+            b'{"type":"turn.completed"}',
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+        ]
         with self.assertRaises(JobError) as error:
-            final_agent_message(b"\n".join(events) + b"\n", Limits())
+            final_agent_message(b"\n".join(ambiguous) + b"\n", Limits())
         self.assertEqual(error.exception.code, "REQUIRED_TOOL_FAILED")
         self.assertEqual(error.exception.exit_code, 0)  # fail-shot, not process exit
         self.assertIsNone(error.exception.context)
         self.assertFalse(error.exception.failure["recovery_permitted"])
+        self.assertFalse(error.exception.failure["failing_event"]["exit_code"])
 
 
 class StoreRecordDiagnostics(unittest.TestCase):

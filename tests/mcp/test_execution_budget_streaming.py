@@ -112,9 +112,15 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(e.exception.code,'OUTPUT_LIMIT_EXCEEDED')
 
     def test_codex_failures_remain_failures(self):
-        for event in ({'type':'turn.failed'}, {'type':'item.completed','item':{'type':'command_execution','exit_code':1}}):
+        # Fatal agent outcomes stay fail-closed; a nonzero command exit is a
+        # recovered tool observation that a valid turn.completed resolves.
+        for event in ({'type':'turn.failed'}, {'type':'error'}, {'type':'item.completed','item':{'type':'error','message':'x'}}):
             raw=json.dumps(event)+'\n'+json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}})+'\n'+json.dumps({'type':'turn.completed'})
             with self.assertRaises(JobError):self.parse('codex',raw)
+        raw=json.dumps({'type':'item.completed','item':{'type':'command_execution','exit_code':1}})+'\n'+json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}})+'\n'+json.dumps({'type':'turn.completed'})
+        self.assertEqual(self.parse('codex',raw),'ok')
+        raw=json.dumps({'type':'item.completed','item':{'type':'command_execution','status':'failed'}})+'\n'+json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}})+'\n'+json.dumps({'type':'turn.completed'})
+        with self.assertRaises(JobError):self.parse('codex',raw)
 
     def test_pi_structured_result(self):
         raw=json.dumps({'type':'message_end','message':{'role':'assistant','content':[{'type':'thinking','text':'NO'},{'type':'text','text':'YES'}]}})+'\n'+json.dumps({'type':'agent_settled','aborted':False})
