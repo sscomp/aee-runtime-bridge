@@ -76,13 +76,21 @@ them, and each layer fails closed independently:
 2. **OS DAC/ACL.** The job's `working_directory` is canonicalized at
    admission. The admission-to-launch device/inode identity re-verification
    (`INVALID_WORKING_DIRECTORY` when it changed; launch against a pinned
-   `/proc/<pid>/fd` alias) applies to `autonomous` jobs and to jobs admitted
-   through the trusted-dispatch policy (all modes, under the
-   `aee-secure-mcp-admission-v1` proof). Legacy generic `read_only`/`write`
-   (policy absent) validate the directory once at admission and do not
-   re-verify it at launch. The worker runs
-   under the service OS identity and inherits its actual DAC/ACL privileges
-   — without escalation. os-native takes this layer as the primary boundary;
+   `/proc/<pid>/fd` alias) is performed by the generic adapter path only, and
+   there only for `autonomous` jobs and jobs admitted through the
+   trusted-dispatch policy (under the `aee-secure-mcp-admission-v1` proof,
+   which carries the admission-time directory identity the recheck compares
+   against). Other admitted jobs reach launch without a second directory
+   identity check:
+   - Approved-manifest codex `read_only` routes to the broker snapshot
+     contract whether it was admitted under the trusted-dispatch policy or
+     not; that path (`run_codex_job`) replays a reviewed workspace snapshot
+     whose entries `sandbox.py` hash-verifies against the manifest, but it
+     performs no admission-to-launch device/inode re-verification and no
+     `/proc/<pid>/fd` pinning.
+   - Legacy generic `read_only`/`write` (policy absent) validate the
+     directory once at admission and do not re-verify it at launch.
+   The worker runs
    under the service OS identity and inherits its actual DAC/ACL privileges
    — without escalation. os-native takes this layer as the primary boundary;
    restricted confines it further with the allowed-roots list — except that
@@ -123,8 +131,9 @@ through the approved Stage-2 Codex broker path:
   E2E job succeeded in that mode; see the
   [capability matrix](runtime-capability-matrix.md).
 - The child runs with `cwd=<working_directory>` (for `autonomous` and
-  trusted-admission jobs the launcher pins the admitted inode via
-  `/proc/<pid>/fd`; legacy adapter-path jobs resolve the directory directly
+  trusted-admission jobs on this path the launcher pins the admitted inode
+  via `/proc/<pid>/fd`; legacy adapter-path jobs resolve the directory
+  directly
   — see Authorization layers); the task always travels on **stdin**, never argv, so it
   never appears in `/proc/*/cmdline`.
 - The child env strips every `AEE_*`, `A3_*` and `MCP_BRIDGE_*` key — the
