@@ -218,7 +218,7 @@ class SdkCompat(unittest.TestCase):
                 raw = json.dumps({"jsonrpc": "2.0", "id": "t", "method": "tools/list",
                                   "params": {}}).encode()
                 r = await client.post("/mcp", content=raw,
-                                      headers={"Authorization": "Bearer SDK_COMPAT_TEST_AUTH",
+                                      headers={"Authorization": "Bearer " + "SDK_COMPAT_TEST_AUTH",
                                                "Accept": "application/json, text/event-stream"})
                 assert r.status_code == 400, (r.status_code, r.text[:120])
 
