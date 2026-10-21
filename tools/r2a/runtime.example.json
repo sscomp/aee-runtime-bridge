@@ -1,0 +1,49 @@
+{
+  "kind": "aee-r2a-runtime-v1",
+  "executor_uid": 20001,
+  "runtime_root": "/nonexistent/example/runtime",
+  "codex_home": "/nonexistent/example/profile",
+  "tunnel_executable": "/nonexistent/example/tunnel-client",
+  "key_file": "/nonexistent/example/runtime-key",
+  "supervisor_config": "/nonexistent/example/supervisor.conf",
+  "owner_subject": "example-owner-not-approved",
+  "targets": {
+    "stub": {
+      "pid": 41001,
+      "start_ticks": 10101,
+      "ppid": 1,
+      "executable": "/nonexistent/example/tunnel-client",
+      "role": "--embedded-stateless-mcp-stub"
+    },
+    "wrapper": {
+      "pid": 41002,
+      "start_ticks": 10102,
+      "ppid": 41001,
+      "executable": "/nonexistent/example/node",
+      "role": "app-server"
+    },
+    "appserver": {
+      "pid": 41003,
+      "start_ticks": 10103,
+      "ppid": 41002,
+      "executable": "/nonexistent/example/codex",
+      "role": "app-server"
+    }
+  },
+  "formal": {
+    "gateway": {
+      "pid": 42001,
+      "start_ticks": 10201
+    },
+    "tunnel": {
+      "pid": 42002,
+      "start_ticks": 10202
+    }
+  },
+  "ports": {
+    "stub": 29001,
+    "appserver": 29002,
+    "gateway": 29003,
+    "tunnel": 29004
+  }
+}
