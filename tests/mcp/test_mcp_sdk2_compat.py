@@ -109,16 +109,6 @@ class SdkCompat(unittest.TestCase):
                     body = {"jsonrpc": "2.0", "id": "t", "method": method, "params": params or {}}
                     return await client.post("/mcp", json=body, headers=h)
 
-                def body_tools(resp):
-                    text = resp.text
-                    if resp.status_code == 400 and "text/json" or True:
-                        try:
-                            d = json.loads(text)
-                            return d
-                        except Exception:
-                            pass
-                    return resp
-
                 # ---- legacy regressions (both SDK lines) ----
                 r = await rpc("initialize", {"protocolVersion": "2025-03-26",
                                              "capabilities": {},
@@ -139,10 +129,15 @@ class SdkCompat(unittest.TestCase):
                 assert not d["result"]["isError"], d
                 r = await rpc("tools/call", {"name": "aee_exec",
                                              "arguments": {"command": "true"}})
+                # Unconditional refusal assertion (independent review F2): the
+                # 200+isError form today; some non-200 transport rejection is
+                # also acceptable, but the refusal must be asserted either way.
                 if resp_ok(r):
                     d = first_json(r)
                     assert d["result"]["isError"], d
                     assert "not exposed" in d["result"]["content"][0]["text"], d
+                else:
+                    assert is_rejection(r), (r.status_code, r.text[:200])
 
                 # session continuity on the legacy path: initialize then reuse
                 r1 = await rpc("initialize", {"protocolVersion": "2025-03-26",
@@ -188,19 +183,31 @@ class SdkCompat(unittest.TestCase):
                 else:
                     assert r.status_code == 400, (r.status_code, r.text[:200])
 
-                # unknown/unrecognized protocol revision: explicit, safe failure
+                # unknown/unrecognized protocol revision: explicit, safe failure.
+                # Pinned on 2.x where the shipped SDK's transport rejection shape
+                # is observed (probe 2026-10-21: 400, envelope-borne unknown
+                # revision → -32022); 1.x keeps the documented-baseline predicate.
                 bad_env = {**ENVELOPE,
                            "io.modelcontextprotocol/protocolVersion": "2099-01-01"}
                 r = await rpc("tools/list", {"_meta": bad_env},
                               headers={"Mcp-Protocol-Version": "2099-01-01",
                                        "Mcp-Method": "tools/list"})
-                assert is_rejection(r), (r.status_code, r.text[:200])
+                if _SDK_MAJOR >= 2:
+                    assert r.status_code == 400, (r.status_code, r.text[:200])
+                    assert first_json(r)["error"]["code"] == -32022, r.text[:200]
+                else:
+                    assert is_rejection(r), (r.status_code, r.text[:200])
 
                 # legacy header with unknown value → same treatment
+                # (2.3.0: envelope/header version mismatch → -32020)
                 r = await rpc("tools/list", {"_meta": ENVELOPE},
                               headers={"Mcp-Protocol-Version": "9999-12-31",
                                        "Mcp-Method": "tools/list"})
-                assert is_rejection(r), (r.status_code, r.text[:200])
+                if _SDK_MAJOR >= 2:
+                    assert r.status_code == 400, (r.status_code, r.text[:200])
+                    assert first_json(r)["error"]["code"] == -32020, r.text[:200]
+                else:
+                    assert is_rejection(r), (r.status_code, r.text[:200])
 
                 # ---- security negatives ----
                 r = await rpc("tools/list", {}, key=None)
@@ -238,10 +245,6 @@ def resp_state_ok(r):
         return "error" not in d
     except Exception:
         return False
-
-
-for name in ("test_compatibility_battery",):
-    pass
 
 
 class SdkCompatTests(SdkCompat, unittest.TestCase):
