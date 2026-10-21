@@ -359,6 +359,38 @@ class BufferedFinalizerSemantics(unittest.TestCase):
             final_agent_message(stdout.encode(), Limits())
         self.assertEqual(error.exception.code, 'EXECUTION_FAILED')
 
+    def test_duplicate_item_id_member_is_not_verdict_evidence(self):
+        # Native codex 0.159.0 web_search items carry the turn-level item id
+        # and the internal exec id under the same `id` member name. Neither is
+        # projected on this decision path, so a duplicated `id` is the native
+        # CLI's shape, not ambiguous verdict evidence: both decision paths
+        # classify the stream identically (parity), keeping the exit_code /
+        # thread_id / type / status duplicate rejection fail-closed.
+        item_id = '"id":"item_2","type":"web_search","id":"exec-bb886692","query":"q"'
+        stdout = ('{"type":"thread.started","thread_id":"thr_w1"}\n'
+                  '{"type":"turn.started"}\n'
+                  '{"type":"item.started","item":{' + item_id + '}}\n'
+                  '{"type":"item.completed","item":{' + item_id + ',"query":"resolved"}}\n'
+                  '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n'
+                  '{"type":"turn.completed"}\n')
+        message = final_agent_message(stdout.encode(), Limits())
+        self.assertEqual(message, 'ok')
+        parser = EventParser('codex', 16384)
+        parser.feed(stdout.encode(), eof=True)
+        self.assertEqual(parser.result(), 'ok')
+
+    def test_duplicate_message_text_member_stays_fail_closed(self):
+        # A duplicated agent_message text would make the final answer
+        # ambiguous; the decision-critical duplicate rejection is retained.
+        stdout = ('{"type":"thread.started","thread_id":"thr_e15"}\n'
+                  '{"type":"turn.started"}\n'
+                  '{"type":"item.completed","item":{"type":"agent_message",'
+                  '"text":"a","text":"b"}}\n'
+                  '{"type":"turn.completed"}\n')
+        with self.assertRaises(JobError) as error:
+            final_agent_message(stdout.encode(), Limits())
+        self.assertEqual(error.exception.code, 'EXECUTION_FAILED')
+
     def test_malformed_stream_fails_closed(self):
         # T08: malformed native event data never resolves to success.
         with self.assertRaises(JobError) as error:
