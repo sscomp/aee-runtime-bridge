@@ -10,9 +10,13 @@ The Abacus-M2 MCP connector intermittently returned `unknown tool` for registere
 
 Retire the obsolete stub consumer **only after** its owner confirms no active turn or UI dependency, the operator approves the change window, and the exact target process identities have been refreshed. Do not modify the production gateway, authentication, A2 policy, runtime manifest, or broker as part of R2-A. Do not use SIGSTOP as a permanent fix.
 
-## Release artifacts still required for code review
+## Matched release artifacts for code review
 
-The current engineering handoff includes a host-specific retirement candidate and references to a publisher, snapshot launcher, and no-signal tests. The complete matched artifact set must be reviewed and committed together **only after sanitization and portability review**. In particular, do not commit host-specific PID/start-tick snapshots, private credentials, authorization records, user home/profile data, or machine fingerprints to this public repository. Use deploy-time configuration or a private release artifact for host-bound parameters.
+The sanitized candidate, publisher, snapshot launcher, 66 adapted original tests,
+20 additional configuration tests and fictional example are now in `tools/r2a/`.
+See `tools/r2a/README.md` for V4 configuration hash binding, verification evidence
+and remaining release prerequisites. Live configuration, approvals, raw outputs
+and host process identities remain private. No protected paths were provisioned.
 
 The handoff identifies these candidate hashes (provenance only; not approval):
 - Retirement candidate: `112bd4afbe90540675d6de18a84ab455650ea0cdbac7cbd04b680849ac8bb81c`
@@ -40,4 +44,10 @@ These hashes do not establish that the referenced files are present in GitHub, d
 
 ## Pull request scope
 
-This document captures the change-control requirements only. It intentionally does **not** contain a runnable retirement script or authorize production execution. Follow-up PR(s) should add a sanitized, reviewed implementation and tests.
+This Draft PR contains review candidates and synthetic verification only. It does
+not authorize publication or production execution. Local tests pass; original and
+revised mechanical dry-runs return 3 with zero signals. The revised check used a
+private in-memory configuration adapter and does not establish trusted-entry
+acceptance. Human review, protected publication/configuration, fresh V4 signatures,
+Owner release and Operator approval remain pending. Remote MCP validation and A2
+acceptance are NOT TESTED. Full details are in `tools/r2a/verification.json`.

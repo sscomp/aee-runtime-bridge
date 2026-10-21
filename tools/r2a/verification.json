@@ -1,0 +1,57 @@
+{
+  "scope": "review-only; no deployment or retirement",
+  "python": "system Python 3.11 -I -B",
+  "original_source_tests": {
+    "count": 66,
+    "exit_code": 0,
+    "result": "PASS"
+  },
+  "portable_tests": {
+    "count": 86,
+    "exit_code": 0,
+    "result": "PASS",
+    "command": "/usr/bin/python3.11 -I -B tools/r2a/test_final_candidate_no_signals.py -v",
+    "coverage": "original 66 adapted to synthetic identities plus 20 configuration/binding negative tests",
+    "real_signals": "DENIED_BY_AUDIT_HOOK"
+  },
+  "syntax_static": {
+    "files": 4,
+    "result": "PASS",
+    "pidfd_signal_call_sites": 1,
+    "kill_fallback": false,
+    "automatic_rollback": "absent; errors propagate/abort, no restart path"
+  },
+  "original_live_dry_run": {
+    "technical": "PASS",
+    "exit_code": 3,
+    "signals_sent": 0,
+    "approval": "BLOCKED"
+  },
+  "portable_live_dry_run": {
+    "technical": "PASS",
+    "exit_code": 3,
+    "signals_sent": 0,
+    "configuration": "PRIVATE_IN_MEMORY_ADAPTER_ONLY",
+    "protected_entry_acceptance": "NOT TESTED",
+    "approval": "BLOCKED",
+    "raw_evidence": "retained privately; omitted host identities"
+  },
+  "direct_checkout_dry_run": {
+    "exit_code": 2,
+    "result": "EXPECTED_UNPROVISIONED_CONFIG_REFUSAL",
+    "signals_sent": 0
+  },
+  "publisher_dry_run": {
+    "exit_code": 0,
+    "result": "PASS",
+    "formal_writes": false
+  },
+  "real_post_retirement_120_second_observation": "NOT TESTED; fake-clock logic only",
+  "formal_root_publication": "NOT TESTED",
+  "remote_mcp_discovery": "NOT TESTED",
+  "global_consumer_exclusivity": "NOT PROVEN",
+  "a2_g1_g8": "NOT ACCEPTED",
+  "dispatch_e2e": "NOT TESTED",
+  "candidate_ci": "NOT TESTED; not wired into existing CI",
+  "human_independent_code_review": "PENDING; preparer performed static review only"
+}
