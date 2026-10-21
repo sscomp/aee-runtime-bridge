@@ -38,6 +38,15 @@ documented cold-boot validation ([deployment](deployment.md) §4b) — on the
 reviewed host, broker + restricted gateway survive reboot with persisted
 completed records re-fetchable over the HTTP MCP.
 
+## Codex failure-semantics acceptance (2026-10-21)
+
+The [final acceptance report](../reports/codex_failure_semantics_remediation_20261021/FINAL_ACCEPTANCE_REPORT.md)
+records **PASS WITH CONDITIONS** for PR #9's deployed remediation. ChatGPT
+positive read-only E2E passes; independent process identity rests on prior
+deployment evidence. For this remediation, **reboot persistence remains OPEN**
+and full signoff is not claimed. The historical cold-boot observations above
+refer to the earlier deployment, not acceptance of this revision after reboot.
+
 ## Boot persistence cold check
 
 ```bash
