@@ -179,7 +179,6 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
                 raise ValueError('duplicate decision-critical member')
             seen[key] = value
         return seen
-        return seen
 
     message = None
     completed = False
