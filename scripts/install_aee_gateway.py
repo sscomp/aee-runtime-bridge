@@ -65,6 +65,19 @@ def _default_units_dir():
     return base / 'systemd' / 'user'
 
 
+def _python_literal(args):
+    """Interpreter path exactly as the rendered unit must name it.
+
+    A release venv interpreter is a symlink into the shared toolchain, so it
+    must never be resolved: pyvenv.cfg lives beside the symlink, and systemd
+    launching the resolved interpreter would skip venv activation entirely.
+    """
+    path = Path(args.python or (Path(args.release_dir) / '.venv' / 'bin' / 'python')).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return str(path)
+
+
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
@@ -95,11 +108,22 @@ def preflight(args, *, identity_report=None):
     else:
         facts.append(f'release_dir={release}')
         facts.append(f'gateway_script_sha256={_sha256(gateway)}')
-    py_bin = Path(args.python or (release / '.venv' / 'bin' / 'python')).expanduser().resolve()
+    py_literal = Path(_python_literal(args))
+    py_bin = py_literal.resolve()
     if not py_bin.is_file():
         errors.append(f'interpreter missing: {py_bin} (release build should contain .venv/bin/python)')
     else:
         facts.append(f'python={py_bin}')
+        if args.python is None:
+            # A release venv interpreter is normally a symlink into the shared
+            # toolchain: resolving it in the rendered unit would bypass the
+            # venv (pyvenv.cfg sits beside the symlink, not beside the target)
+            # and the gateway would import nothing. The unit must name the
+            # venv wrapper path as-is; require venv evidence for it.
+            if not (py_literal.parent.parent / 'pyvenv.cfg').is_file():
+                errors.append(f'release interpreter is not a venv wrapper: '
+                              f'no pyvenv.cfg beside {py_literal} '
+                              '(build the release venv per docs/deployment.md §3)')
 
     # Env file: schema-conformant (var names/shape only; values are not recorded).
     env_path = Path(args.env_path).expanduser().resolve()
@@ -275,9 +299,10 @@ def _render_unit(args, env_path, workdir):
         text = template.read_text()
         substitutions = {
             '<RELEASE_DIR>': str(Path(args.release_dir).resolve()),
-            '<PYTHON>': str(Path(args.python or
-                                 (Path(args.release_dir) / '.venv' / 'bin' / 'python'))
-                             .expanduser().resolve()),
+            # The venv wrapper path must survive symlink resolution intact:
+            # unit ExecStart names the release venv script, never the resolved
+            # interpreter (see the preflight venv-evidence rule).
+            '<PYTHON>': _python_literal(args),
             '<ENV_FILE>': str(env_path),
             '<STATE_DIR>': str(Path(args.state_dir or Path(args.env_path).expanduser().parent).resolve()),
         }

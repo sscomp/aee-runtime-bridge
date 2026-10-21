@@ -202,6 +202,33 @@ class ApplyTransaction(InstallerFixture):
         receipt, _ = installer.apply_args(self._args())
         self.assertEqual(receipt['result'], 'PREFLIGHT_FAILED')
 
+    def test_default_venv_python_renders_as_venv_wrapper(self):
+        # A release venv interpreter is a symlink into the shared toolchain;
+        # the rendered unit must name the venv wrapper as-is, because
+        # pyvenv.cfg sits beside the symlink (resolving would skip venv
+        # activation and the gateway would import nothing).
+        venvbin = self.release / '.venv' / 'bin'
+        venvbin.mkdir(parents=True)
+        (self.release / '.venv' / 'pyvenv.cfg').write_text('home = /shared/python\n')
+        wrapper = venvbin / 'python'
+        wrapper.symlink_to(self.tmp + '/fakepython')
+        receipt, code = installer.apply_args(self._args(python=None, dry_run=False, apply=True))
+        self.assertEqual((receipt['result'], code), ('OK', 0))
+        rendered = (Path(self.tmp) / 'units' / 'aee-gateway.service').read_text()
+        self.assertIn(str(self.release / '.venv' / 'bin' / 'python'), rendered)
+        self.assertNotIn('fakepython', rendered)
+
+    def test_default_venv_python_without_pyvenv_cfg_refused(self):
+        # Fail closed: a default release interpreter with no venv evidence is
+        # refused because rendering its symlink target would silently bypass
+        # the release venv.
+        venvbin = self.release / '.venv' / 'bin'
+        venvbin.mkdir(parents=True)
+        (venvbin / 'python').symlink_to(self.tmp + '/fakepython')
+        receipt, _ = installer.apply_args(self._args(python=None))
+        self.assertEqual(receipt['result'], 'PREFLIGHT_FAILED')
+        self.assertTrue(any('pyvenv.cfg' in e for e in receipt['errors']))
+
     def test_uninstall_removes_unit_sidecar_only(self):
         installer.apply_args(self._args(dry_run=False, apply=True))
         unit = Path(self.tmp) / 'units' / 'aee-gateway.service'
