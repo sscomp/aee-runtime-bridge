@@ -163,12 +163,22 @@ def bounded_failure(event=None, *, thread=None):
 
 
 def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt=None):
+    # Decision-critical members whose duplication is ambiguous evidence and
+    # must stay fail-closed (the streamed parser likewise rejects duplicates
+    # of the members it projects). Other members — e.g. the native codex
+    # 0.159.0 `web_search` item carrying both the turn-level `item.id` and the
+    # internal exec id — are not projected on this path and follow stdlib
+    # last-wins, matching the streamed path so identical real streams classify
+    # identically on both routes.
+    decision_critical_members = {'type', 'status', 'exit_code', 'text', 'thread_id'}
+
     def no_duplicate_keys(pairs):
         seen = {}
         for key, value in pairs:
-            if key in seen:
-                raise ValueError('duplicate object member')
+            if key in seen and key in decision_critical_members:
+                raise ValueError('duplicate decision-critical member')
             seen[key] = value
+        return seen
         return seen
 
     message = None
