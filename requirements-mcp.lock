@@ -11,6 +11,7 @@ anyio==4.15.1 \
     --hash=sha256:9f28306018cbd6d329e64a36d58256edff76dd996fe423bc957326e578b82a94
     # via
     #   -c requirements-mcp.constraints.txt
+    #   httpx
     #   httpx2
     #   mcp
     #   sse-starlette
@@ -22,6 +23,13 @@ attrs==26.1.0 \
     #   -c requirements-mcp.constraints.txt
     #   jsonschema
     #   referencing
+certifi==2026.7.22 \
+    --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775 \
+    --hash=sha256:741e2c3b351ddf169a738da9f2c048608ff7f2c5cc02f1ebc6b118bb090d5d55
+    # via
+    #   -c requirements-mcp.constraints.txt
+    #   httpcore
+    #   httpx
 cffi==2.1.1 \
     --hash=sha256:046bfc24911b37851ee1b51aab8bffe713d89c68c6a057b09484ce9fd5f69b4e \
     --hash=sha256:06c72bb76605a4b0cd0aad6930b69d4baf7dd5d806cfc409b824191099700e66 \
@@ -200,14 +208,27 @@ h11==0.16.0 \
     --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
     # via
     #   -c requirements-mcp.constraints.txt
+    #   httpcore
     #   httpcore2
     #   uvicorn
+httpcore==1.0.9 \
+    --hash=sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55 \
+    --hash=sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8
+    # via
+    #   -c requirements-mcp.constraints.txt
+    #   httpx
 httpcore2==2.13.1 \
     --hash=sha256:e0aa977abe17e69a3b820a24542a6fa88702676d83880b8d194dcd18408e5103 \
     --hash=sha256:e1e05d4f25f7d7d496bfb96748f6f4b67657b03da069b3a68c36069f3db73d0a
     # via
     #   -c requirements-mcp.constraints.txt
     #   httpx2
+httpx==0.28.1 \
+    --hash=sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc \
+    --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
+    # via
+    #   -c requirements-mcp.constraints.txt
+    #   -r requirements-mcp.in
 httpx2==2.13.1 \
     --hash=sha256:6dff50fabc270ee5fd25d845d0b078ed20564579744d6d962850975996d2f9a4 \
     --hash=sha256:e48744a19e3af5ee48313d0ce5fe941d5422fae5705ea922a4aabf94d7800dfa
@@ -220,6 +241,7 @@ idna==3.20 \
     # via
     #   -c requirements-mcp.constraints.txt
     #   anyio
+    #   httpx
     #   httpx2
 jsonschema==4.26.0 \
     --hash=sha256:0c26707e2efad8aa1bfc5b7ce170f3fccc2e4918ff85989ba9ffa9facb2be326 \
