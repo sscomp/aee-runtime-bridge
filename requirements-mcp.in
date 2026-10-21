@@ -1,4 +1,7 @@
 # A3 MCP gateway direct dependencies, captured from the working deployment.
 # Separate from the legacy FastAPI bridge requirements; do not sync its venv.
-mcp==1.30.0
+# mcp==2.x: dual-era protocol support (initialize handshake + 2026-07-28
+# per-request envelope) — required by the OpenAI Secure MCP Tunnel product
+# clients; validated by WO ABACUS_AEE_V2_MCP_SDK_PROTOCOL_COMPATIBILITY_REMEDIATION.
+mcp==2.3.0
 uvicorn==0.54.0

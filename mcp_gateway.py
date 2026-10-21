@@ -1094,21 +1094,53 @@ def job_error_payload(exc: _JobError) -> Dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
-# MCP server (FastMCP — streamable HTTP transport)
+# MCP server (streamable HTTP transport)
+# mcp SDK 1.x (fastmcp.FastMCP) → 2.x (mcpserver.MCPServer) dual-support import.
+# The 2.x line serves both protocol eras: the legacy initialize handshake AND
+# the modern per-request envelope (`server/discover`, Mcp-Protocol-Version
+# 2026-07-28 header) required by the OpenAI product MCP clients over the
+# Secure MCP Tunnel. 1.x support is retained so a venv-only rollback needs no
+# code revert (verified against mcp 1.30.0 and 2.3.0; see WO
+# ABACUS_AEE_V2_MCP_SDK_PROTOCOL_COMPATIBILITY_REMEDIATION, Phase B matrix).
 # ---------------------------------------------------------------------------
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer as _McpServerBase
+    from mcp.server.mcpserver.exceptions import ToolError
 
-mcp = FastMCP(
-    "aee-mcp-gateway",
-    host=AEE_MCP_HOST,
-    port=AEE_MCP_PORT,
-    streamable_http_path="/mcp",
-    # stateless_http keeps each request self-contained — friendlier for the
-    # future ChatGPT remote connector (no sticky session affinity needed).
-    stateless_http=True,
-    json_response=True,
+    _MCP_SDK_MAJOR = 2
+except (ImportError, ModuleNotFoundError):
+    from mcp.server.fastmcp import FastMCP as _McpServerBase
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    _MCP_SDK_MAJOR = 1
+
+# 2.x moves streamable-path/stateless/json-response to the app builder;
+# 1.x rejects them there (constructor-level settings instead).
+_STREAMABLE_APP_KWARGS = (
+    {"streamable_http_path": "/mcp", "stateless_http": True, "json_response": True}
+    if _MCP_SDK_MAJOR >= 2
+    else {}
 )
+
+if _MCP_SDK_MAJOR >= 2:
+    mcp = _McpServerBase(
+        "aee-mcp-gateway",
+        version=AEE_GATEWAY_VERSION,
+    )
+else:
+    mcp = _McpServerBase(
+        "aee-mcp-gateway",
+        host=AEE_MCP_HOST,
+        port=AEE_MCP_PORT,
+        # 1.x line keeps these as constructor settings (2.x moves them to
+        # the app builder — _STREAMABLE_APP_KWARGS above).
+        streamable_http_path="/mcp",
+        # stateless_http keeps each request self-contained — friendlier for
+        # the future ChatGPT remote connector (no sticky session affinity needed).
+        stateless_http=True,
+        json_response=True,
+    )
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -1500,8 +1532,6 @@ def _build_auth_middleware(app):
 
 def _apply_tool_exposure_filter() -> None:
     """Filter both listing and the manager call path, including future tools."""
-    from mcp.server.fastmcp.exceptions import ToolError
-
     allowed = RESTRICTED_TOOLS if AEE_MCP_SURFACE == "restricted" else frozenset(AEE_MCP_EXPOSED_TOOLS)
     if not allowed:
         return  # deliberately full/local only; restricted always has the fixed six
@@ -1517,10 +1547,16 @@ def _apply_tool_exposure_filter() -> None:
     def guarded_list():
         return [tool for tool in original_list() if tool.name in allowed]
 
-    async def guarded_call(name, arguments, **kwargs):
-        if name not in allowed:
+    async def guarded_call(*call_args, **call_kwargs):
+        # Era-agnostic passthrough: SDK 1.x invokes call_tool(name, arguments, …),
+        # SDK 2.x adds positional context/convert-result args — the guard must
+        # not reshape the call. The tool name is the first positional arg on
+        # both lines.
+        if (call_args and call_args[0] not in allowed) or (
+            "name" in call_kwargs and call_kwargs["name"] not in allowed
+        ):
             raise ToolError("Tool is not exposed in this gateway")
-        return await original_call(name, arguments, **kwargs)
+        return await original_call(*call_args, **call_kwargs)
 
     manager.list_tools = guarded_list
     manager.call_tool = guarded_call
@@ -1584,7 +1620,10 @@ def main() -> None:
     _apply_tool_exposure_filter()
 
     # Build the streamable-HTTP ASGI app, wrap it with bearer auth, serve it.
-    mcp_app = mcp.streamable_http_app()
+    # Path/stateless/json-response are app-builder args on SDK 2.x
+    # (_STREAMABLE_APP_KWARGS is empty on 1.x, where they are constructor
+    # settings — see the dual-support import block above).
+    mcp_app = mcp.streamable_http_app(**_STREAMABLE_APP_KWARGS)
     app = _build_auth_middleware(mcp_app)
 
     class _Server(uvicorn.Server):
