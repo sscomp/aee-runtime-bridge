@@ -1,0 +1,68 @@
+{
+  "scope": "review-only; no deployment or retirement",
+  "python": "system Python 3.11 -I -B",
+  "original_source_tests": {
+    "count": 66,
+    "exit_code": 0,
+    "result": "PASS"
+  },
+  "portable_tests": {
+    "count": 123,
+    "exit_code": 0,
+    "result": "PASS",
+    "command": "/usr/bin/python3.11 -I -B tools/r2a/test_final_candidate_no_signals.py -v",
+    "coverage": "92 prior tests plus 31 proc-stat, inventory and dry-run orchestration tests",
+    "real_signals": "EARLY_EXPLICIT_API_DENIAL_PLUS_AUDIT_HOOK"
+  },
+  "syntax_static": {
+    "files": 4,
+    "result": "PASS",
+    "pidfd_signal_call_sites": 1,
+    "kill_fallback": false,
+    "automatic_rollback": "absent; errors propagate/abort, no restart path"
+  },
+  "original_live_dry_run": {
+    "technical": "PASS",
+    "exit_code": 3,
+    "signals_sent": 0,
+    "approval": "BLOCKED",
+    "provenance": "HISTORICAL earlier candidate bytes; not rerun for IR-03/IR-04 closure"
+  },
+  "portable_live_dry_run": {
+    "technical": "PASS",
+    "exit_code": 3,
+    "signals_sent": 0,
+    "configuration": "PRIVATE_IN_MEMORY_ADAPTER_ONLY",
+    "protected_entry_acceptance": "NOT TESTED",
+    "approval": "BLOCKED",
+    "raw_evidence": "retained privately; omitted host identities",
+    "provenance": "HISTORICAL earlier candidate bytes; not rerun for IR-03/IR-04 closure"
+  },
+  "direct_checkout_dry_run": {
+    "exit_code": 2,
+    "result": "EXPECTED_UNPROVISIONED_CONFIG_REFUSAL",
+    "signals_sent": 0
+  },
+  "publisher_dry_run": {
+    "exit_code": 0,
+    "result": "PASS",
+    "formal_writes": false,
+    "provenance": "HISTORICAL earlier candidate bytes; not rerun for IR-03/IR-04 closure"
+  },
+  "real_post_retirement_120_second_observation": "NOT TESTED; fake-clock logic only",
+  "formal_root_publication": "NOT TESTED",
+  "remote_mcp_discovery": "NOT TESTED",
+  "global_consumer_exclusivity": "NOT PROVEN",
+  "a2_g1_g8": "NOT ACCEPTED",
+  "dispatch_e2e": "NOT TESTED",
+  "candidate_ci": "Dedicated r2a-no-signal-tests workflow; see commit-specific Actions runs for actual status",
+  "human_independent_code_review": "PENDING; preparer performed static review only",
+  "independent_agent_review": "Separate Codex session; findings recorded in PR conversation; not human approval",
+  "medium_findings_closure": {
+    "IR-03": "Implemented: unified validated parser and synthetic regressions",
+    "IR-04": "Implemented: unknown/race/read failures block all acceptance sites; global uniqueness CONDITIONAL / NOT PROVEN",
+    "inventory_policy": "Unfamiliar executables remain unclassified; no manual override",
+    "operator_evidence": "See README IR-04 section; no authority or approvals provisioned",
+    "production_readiness": "BLOCKED pending human review, classified inventory, authoritative global evidence and independent releases"
+  }
+}
