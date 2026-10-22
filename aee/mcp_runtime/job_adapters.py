@@ -232,7 +232,8 @@ class _HermesAdapter(AdapterSpec):
                    mode: str = "read_only") -> List[str]:
         if mode != "autonomous":
             raise NotImplementedError  # existing constrained-mode mapping remains unsupported
-        return [executable, "chat", "--yolo", "--query-file", "-", "--format", "stream-json"]
+        return [executable, "chat", "--yolo", "--toolsets", "hermes-cli",
+                "--query-file", "-", "--format", "stream-json"]
 
 
 def adapter_specs() -> Dict[str, AdapterSpec]:
@@ -341,7 +342,7 @@ def _probe_version(spec: AdapterSpec, executable: str) -> str:
 def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str, object],
                         task: str, working_directory: str, *, limits: Limits,
                         cancel_event=None, budget=None, spool=None, redact=lambda x: x,
-                        mode: str = "read_only") -> Dict[str, object]:
+                        mode: str = "read_only", cwd_fd=None) -> Dict[str, object]:
     """Run one bounded adapter job; returns summary/log excerpt evidence.
 
     Mirrors the codex worker's semantics: the child process group is
@@ -397,15 +398,27 @@ def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str
             argv += ['--max-turns', str(budget.max_turns)]
         def on_start(pid):
             if mode == 'autonomous' or authorization.get('schema') == PROOF:
+                import sys
+                if sys.platform == 'darwin':
+                    status = subprocess.check_output(
+                        ['/bin/ps', '-p', str(pid), '-o', 'pid=,uid=,gid=,pgid='],
+                        text=True).strip()
+                    if not status:
+                        raise JobError('EXECUTOR_IDENTITY_MISMATCH', 'Native child identity unavailable')
+                    execution['process_identity'] = {'pid': pid, 'launcher': 'process_guard',
+                        'platform': 'darwin', 'ps_fields': 'pid uid gid pgid', 'status': [status]}
+                    return
                 from pathlib import Path
                 lines = Path(f'/proc/{pid}/status').read_text().splitlines()
                 execution['process_identity'] = {'pid': pid, 'launcher': 'process_guard',
                     'status': [line for line in lines if line.startswith(
                         ('Uid:', 'Gid:', 'Groups:', 'CapEff:', 'NoNewPrivs:'))]}
         parser = EventParser(spec.name, budget.result_inline_bytes, budget.memory_capture_bytes)
+        cwd_options = {'cwd_fd': cwd_fd} if cwd_fd is not None else {}
         completed = run_streamed(argv, env=env, stdin=task.encode('utf-8'), on_start=on_start,
                                  budget=budget, spool=spool, parser=parser,
-                                 cwd=working_directory, cancel_event=cancel_event, redact=redact)
+                                 cwd=working_directory, cancel_event=cancel_event, redact=redact,
+                                 **cwd_options)
         execution['tool_event_record'] = parser.tool_evidence()
         if completed.returncode != 0:
             error = JobError('EXECUTION_FAILED', f'Executor exited {completed.returncode}',
@@ -509,6 +522,12 @@ def execute_adapter_job(spec, executable, execution, task, working_directory, **
         if expected != {'device': info.st_dev, 'inode': info.st_ino}:
             raise JobError('INVALID_WORKING_DIRECTORY', 'Working directory changed since admission')
         # Parent holds fd across Popen; child chdir resolves this pinned inode.
+        import sys
+        if sys.platform == 'darwin':
+            if kwargs.get('budget') is None:
+                raise JobError('INVALID_EXECUTION_BUDGET', 'Native pinned execution requires streaming budget')
+            return _execute_adapter_job(spec, executable, execution, task, working_directory,
+                                        cwd_fd=fd, **kwargs)
         pinned = f'/proc/{os.getpid()}/fd/{fd}'
         return _execute_adapter_job(spec, executable, execution, task, pinned, **kwargs)
     finally:

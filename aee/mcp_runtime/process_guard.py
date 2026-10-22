@@ -1,4 +1,4 @@
-"""Standalone Linux process-group guardian; no task/config input beyond argv/stdin.
+"""Native process-group guardian; no task/config input beyond argv/stdin.
 
 Runs inside the runner-created session. Parent death kills the entire session's
 process group, rather than leaving an orphan CLI after a gateway crash.
@@ -15,13 +15,38 @@ def main():
     def terminate(*_):
         os.killpg(os.getpgrp(), signal.SIGKILL)
     signal.signal(signal.SIGTERM, terminate)
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+    if sys.platform == 'darwin':
+        import select
+        import threading
+        watcher = select.kqueue()
+        try:
+            watcher.control([select.kevent(parent, filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT)], 0, 0)
+        except ProcessLookupError:
+            terminate()
+        def watch_parent():
+            watcher.control(None, 1)
+            terminate()
+        threading.Thread(target=watch_parent, daemon=True).start()
+    elif sys.platform.startswith('linux'):
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            return 125
+    else:
         return 125
     if os.getppid() != parent:
         terminate()
     try:
-        child = subprocess.Popen(sys.argv[2:], close_fds=True)
+        args = sys.argv[2:]
+        if args[:1] == ['--cwd-fd']:
+            if len(args) < 4 or args[2] != '--':
+                return 125
+            fd = int(args[1])
+            os.fchdir(fd)
+            os.close(fd)
+            args = args[3:]
+        child = subprocess.Popen(args, close_fds=True)
         code = child.wait()
     except OSError:
         return 125
