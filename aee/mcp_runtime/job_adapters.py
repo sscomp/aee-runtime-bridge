@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .process import Limits, run_bounded, run_streamed
@@ -105,8 +106,25 @@ class _CodexAdapter(AdapterSpec):
                     "--dangerously-bypass-approvals-and-sandbox", *doc_limit,
                     "--cd", ".", "-"]
         sandbox = "workspace-write" if mode == "write" else "read-only"
-        return [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
-                *doc_limit, "--sandbox", sandbox, "--cd", working_directory, "-"]
+        argv = [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+                *doc_limit, "--sandbox", sandbox, "--cd", working_directory]
+        if mode != "write" or os.environ.get("AEE_CODEX_GIT_WRITABLE") != "1":
+            return [*argv, "-"]
+
+        # Codex protects .git in workspace-write mode (openai/codex#5034).
+        # Grant only a directory strictly beneath the resolved workspace.
+        try:
+            workspace = Path(working_directory).resolve(strict=True)
+            git_dir = (workspace / ".git").resolve(strict=True)
+            if workspace not in git_dir.parents or not git_dir.is_dir():
+                return [*argv, "-"]
+        except (OSError, RuntimeError):
+            return [*argv, "-"]
+
+        # JSON and TOML basic strings share these escapes. Escape DEL as
+        # well because TOML disallows it literally.
+        git_dir_literal = json.dumps(str(git_dir), ensure_ascii=False).replace("\x7f", "\\u007f")
+        return [*argv, "-c", f"sandbox_workspace_write.writable_roots=[{git_dir_literal}]", "-"]
 
 
 @_spec
@@ -412,7 +430,6 @@ def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str
                     execution['process_identity'] = {'pid': pid, 'launcher': 'process_guard',
                         'platform': 'darwin', 'ps_fields': 'pid uid gid pgid', 'status': [status]}
                     return
-                from pathlib import Path
                 lines = Path(f'/proc/{pid}/status').read_text().splitlines()
                 execution['process_identity'] = {'pid': pid, 'launcher': 'process_guard',
                     'status': [line for line in lines if line.startswith(
