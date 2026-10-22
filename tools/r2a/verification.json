@@ -7,12 +7,12 @@
     "result": "PASS"
   },
   "portable_tests": {
-    "count": 86,
+    "count": 92,
     "exit_code": 0,
     "result": "PASS",
     "command": "/usr/bin/python3.11 -I -B tools/r2a/test_final_candidate_no_signals.py -v",
-    "coverage": "original 66 adapted to synthetic identities plus 20 configuration/binding negative tests",
-    "real_signals": "DENIED_BY_AUDIT_HOOK"
+    "coverage": "86 baseline tests plus six signal-guard/boundary negatives",
+    "real_signals": "EARLY_EXPLICIT_API_DENIAL_PLUS_AUDIT_HOOK"
   },
   "syntax_static": {
     "files": 4,
@@ -52,6 +52,7 @@
   "global_consumer_exclusivity": "NOT PROVEN",
   "a2_g1_g8": "NOT ACCEPTED",
   "dispatch_e2e": "NOT TESTED",
-  "candidate_ci": "NOT TESTED; not wired into existing CI",
-  "human_independent_code_review": "PENDING; preparer performed static review only"
+  "candidate_ci": "Dedicated r2a-no-signal-tests workflow; see commit-specific Actions runs for actual status",
+  "human_independent_code_review": "PENDING; preparer performed static review only",
+  "independent_agent_review": "Separate Codex session; findings recorded in PR conversation; not human approval"
 }

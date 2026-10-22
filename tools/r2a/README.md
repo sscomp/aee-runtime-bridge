@@ -82,7 +82,10 @@ From this directory (no service changes):
 ```
 
 Tests use only synthetic identities, local temporary files, fake clocks and mocked
-signal boundaries; an audit hook denies actual kill/killpg/pidfd signals. The
+signal boundaries; an early audit hook and explicit deny functions block unmocked kill/killpg/pidfd
+signal APIs. Python 3.11 pidfd calls do not emit the assumed audit event; the
+explicit deny function is required. These guards protect this cooperative test
+suite, not arbitrary native code or hostile tests. The
 candidate dry-run additionally denies writes and restricts subprocesses to the
 configured Supervisor status query. Without a provisioned configuration the direct
 entry exits 2, emits `BLOCKED_OR_ABORTED`, and sends zero signals. Exit 3 means
@@ -96,8 +99,12 @@ It is not shipped, is not a trusted launch path and cannot establish protected
 configuration or formal-entry acceptance. Local original/revised checks passed,
 with exit 3 and zero signals. Raw outputs remain private because they contain
 host process identities. See `verification.json` for the sanitized evidence.
-The existing repository CI does not invoke this new suite; CI coverage of these
-candidates is NOT TESTED unless a later explicit run is recorded.
+The dedicated `r2a-no-signal-tests` job runs on relevant PR/push changes and manual
+dispatch, using Python 3.11, pinned Actions and hashed Linux x86_64 test wheels in
+`requirements-ci.lock`. It compiles all four Python files, checks static process
+boundaries, runs all 92 synthetic tests and invokes the existing secrets scanner.
+The job logs record commit, interpreter/dependency versions, test count and result.
+Actual run evidence is recorded separately; a green job is not production approval.
 
 ## Non-executable release prerequisites
 

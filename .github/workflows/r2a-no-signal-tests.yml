@@ -1,0 +1,81 @@
+name: R2-A no-signal tests
+
+on:
+  pull_request:
+    paths:
+      - 'tools/r2a/**'
+      - '.github/workflows/r2a-no-signal-tests.yml'
+      - 'scripts/scan-aee-baseline-secrets.py'
+  push:
+    paths:
+      - 'tools/r2a/**'
+      - '.github/workflows/r2a-no-signal-tests.yml'
+      - 'scripts/scan-aee-baseline-secrets.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  r2a-no-signal-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Python 3.11
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Install hashed test dependencies
+        run: python3.11 -m pip install --only-binary=:all: --require-hashes -r tools/r2a/requirements-ci.lock
+      - name: Record source and dependency versions
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          git rev-parse HEAD
+          echo "PR/push head: $HEAD_SHA"
+          python3.11 --version
+          python3.11 -m pip freeze
+      - name: Syntax and static signal/restart boundaries
+        run: |
+          python3.11 -I -B - <<'PY'
+          import ast
+          from pathlib import Path
+          root = Path('tools/r2a')
+          names = ['r2a_retire_final_candidate.py', 'r2a_publish_candidate.py',
+                   'r2a_snapshot_launcher_candidate.py', 'test_final_candidate_no_signals.py']
+          for name in names:
+              raw = (root / name).read_bytes()
+              tree = ast.parse(raw, filename=name)
+              compile(raw, name, 'exec')
+              if name.startswith('test_'):
+                  continue
+              calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+              forbidden = {'kill', 'killpg', 'system', 'popen', 'fork', 'execv', 'execve',
+                           'execl', 'execlp', 'execvp', 'spawnv', 'spawnve', 'Popen'}
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Attribute) and node.attr == 'SIGKILL':
+                      raise SystemExit(f'{name}: SIGKILL forbidden')
+              for call in calls:
+                  if isinstance(call.func, ast.Attribute) and call.func.attr in forbidden:
+                      raise SystemExit(f'{name}: forbidden process call {call.func.attr}')
+              signals = [n for n in calls if isinstance(n.func, ast.Attribute)
+                         and n.func.attr == 'pidfd_send_signal']
+              if len(signals) != (1 if name == names[0] else 0):
+                  raise SystemExit(f'{name}: unexpected signal boundary')
+              processes = [n for n in calls if isinstance(n.func, ast.Attribute)
+                           and isinstance(n.func.value, ast.Name) and n.func.value.id == 'subprocess']
+              if name == names[0]:
+                  if len(processes) != 1 or ast.unparse(processes[0].args[0]) != "['supervisorctl', '-c', SUPERVISOR_CONFIG, 'status']":
+                      raise SystemExit('only Supervisor status subprocess allowed; no automatic rollback')
+              elif processes:
+                  raise SystemExit(f'{name}: subprocess forbidden')
+          print('PASS: four Python files compile; one pidfd boundary; no kill/restart fallback')
+          PY
+      - name: Synthetic no-signal regression
+        run: python3.11 -I -B tools/r2a/test_final_candidate_no_signals.py -v
+      - name: Existing public-source secret scanner
+        run: python3.11 -I -B scripts/scan-aee-baseline-secrets.py

@@ -1,4 +1,21 @@
 """Pure synthetic approval/postcondition tests. No production approval, keys or signals."""
+import sys, os, signal
+
+def deny_signals(event,args):
+    if event in ('os.kill','os.killpg','signal.pidfd_send_signal'):
+        raise AssertionError('REAL_SIGNAL_FORBIDDEN_IN_TESTS')
+
+# Install before third-party and candidate imports, including discovery/import usage.
+sys.addaudithook(deny_signals)
+
+# Python 3.11's pidfd API does not emit the assumed audit event. Explicit
+# deny functions also protect every unmocked signal API before candidate import.
+def forbidden_signal(*args,**kwargs):
+    raise AssertionError('REAL_SIGNAL_FORBIDDEN_IN_TESTS')
+os.kill=forbidden_signal
+os.killpg=forbidden_signal
+signal.pidfd_send_signal=forbidden_signal
+
 from pathlib import Path
 from datetime import datetime,timedelta,timezone
 import base64,copy,importlib.util,json,os,tempfile,threading,time,unittest,hashlib
@@ -358,9 +375,35 @@ class RuntimeConfigurationTests(unittest.TestCase):
         PublisherTests.setUpClass()
         with self.assertRaises(ValueError):PublisherTests.publisher.checked_snapshot('/nonexistent','0'*64,100,0)
 
+class SignalGuardTests(unittest.TestCase):
+    def test_audit_events_are_blocked_without_syscalls(self):
+        for event in ('os.kill','os.killpg','signal.pidfd_send_signal'):
+            with self.subTest(event=event),self.assertRaisesRegex(AssertionError,'REAL_SIGNAL_FORBIDDEN_IN_TESTS'):
+                sys.audit(event, -1, 0)
+    def test_unmocked_pidfd_api_is_blocked_even_with_invalid_fd(self):
+        # fd=-1 cannot designate any process, even if the hook regresses.
+        with self.assertRaisesRegex(AssertionError,'REAL_SIGNAL_FORBIDDEN_IN_TESTS'):
+            c.signal.pidfd_send_signal(-1,0,None,0)
+    def test_valid_signal_boundary_reaches_only_mock(self):
+        test=ApprovalTests();test.setUp();sent=[]
+        class Clock(datetime):
+            @staticmethod
+            def now(tz):return test.now
+        with patch.object(c,'datetime',Clock),patch.object(c,'wait_exit',return_value=False),patch.object(c.signal,'pidfd_send_signal') as syscall:
+            c.send_term(-1,c.STUB,sent,lambda:test.payload)
+            syscall.assert_called_once_with(-1,c.signal.SIGTERM,None,0)
+        self.assertEqual(sent,[c.STUB])
+    def test_authorization_exception_aborts_without_signal_or_restart(self):
+        def denied():raise c.GateError('SYNTHETIC_AUTHORIZATION_FAILURE')
+        with patch.object(c,'wait_exit',return_value=False),patch.object(c.signal,'pidfd_send_signal') as syscall,patch.object(c.subprocess,'run') as process:
+            with self.assertRaises(c.GateError):c.send_term(-1,c.STUB,[],denied)
+            syscall.assert_not_called();process.assert_not_called()
+    def test_readonly_guard_denies_signal_and_process_mutation(self):
+        for event,args in (('os.kill',()),('os.killpg',()),('signal.pidfd_send_signal',()),('subprocess.Popen',(None,['supervisorctl','restart','all']))):
+            with self.subTest(event=event),self.assertRaises(c.GateError):c.readonly_guard(event,args)
+    def test_readonly_guard_denies_file_writes(self):
+        for mode,flags in (('w',0),(None,os.O_WRONLY),(None,os.O_CREAT)):
+            with self.subTest(mode=mode,flags=flags),self.assertRaises(c.GateError):c.readonly_guard('open',('synthetic',mode,flags))
+
 if __name__=='__main__':
-    def deny_signals(event,args):
-        if event in ('os.kill','os.killpg','signal.pidfd_send_signal'):raise AssertionError('REAL_SIGNAL_FORBIDDEN_IN_TESTS')
-    import sys
-    sys.addaudithook(deny_signals)
     unittest.main()
