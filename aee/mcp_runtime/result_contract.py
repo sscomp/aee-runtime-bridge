@@ -208,6 +208,17 @@ def validate_success(record, *, persisted=True):
                     and fields['NoNewPrivs'].strip() == '1' and int(fields['CapEff'].strip(), 16) == 0)
             except (TypeError, KeyError, ValueError, AttributeError):
                 pass
+            if isinstance(process, dict) and process.get('platform') == 'darwin':
+                try:
+                    identity = authorization['os_identity']
+                    pid, uid, gid, pgid = map(int, process['status'][0].split())
+                    process_valid = (type(process['pid']) is int and pid == process['pid'] > 0
+                        and uid == identity['uid'] and gid == identity['gid'] and pgid == pid
+                        and process.get('launcher') == 'process_guard'
+                        and process.get('ps_fields') == 'pid uid gid pgid'
+                        and len(process['status']) == 1)
+                except (TypeError, KeyError, ValueError, IndexError):
+                    process_valid = False
             if (not isinstance(authorization, dict)
                     or authorization.get('schema') not in {'aee-autonomous-proof-v1', 'aee-secure-mcp-admission-v1'}
                     or authorization.get('schema') == 'aee-secure-mcp-admission-v1' and (

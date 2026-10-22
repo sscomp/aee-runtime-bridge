@@ -243,6 +243,16 @@ class JobError(Exception):
 
 
 def owner_identity():
+    import sys
+    if sys.platform == 'darwin':
+        import subprocess
+        start = subprocess.check_output(
+            ['/bin/ps', '-p', str(os.getpid()), '-o', 'lstart='], text=True).strip()
+        boot = subprocess.check_output(
+            ['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'], text=True).strip()
+        if not start or not boot:
+            raise JobError('EXECUTOR_IDENTITY_MISMATCH', 'Native owner identity unavailable')
+        return {'pid': os.getpid(), 'start_ticks': start, 'boot_id': boot}
     # /proc stat's comm may contain spaces or ')'; split after its final ')'.
     fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
     return {"pid": os.getpid(), "start_ticks": fields[19],

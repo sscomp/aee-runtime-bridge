@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -130,7 +131,11 @@ class TrustedSecurity(unittest.TestCase):
         def streamed(argv,**kwargs):
             self.assertEqual(argv[argv.index('--sandbox')+1],'workspace-write')
             self.assertEqual(argv[argv.index('--cd')+1],str(self.cwd))
-            self.assertTrue(kwargs['cwd'].startswith('/proc/'))
+            if sys.platform == 'darwin':
+                self.assertEqual(kwargs['cwd'], str(self.cwd))
+                self.assertEqual(os.fstat(kwargs['cwd_fd']).st_ino, self.cwd.stat().st_ino)
+            else:
+                self.assertTrue(kwargs['cwd'].startswith('/proc/'))
             return SimpleNamespace(returncode=0,final='fixture',streaming={'streams':{'stderr':{'tail':''}}})
         with patch('aee.mcp_runtime.job_adapters.run_streamed',side_effect=streamed) as run:
             execute_adapter_job(spec,executable,execution,'fixture task',str(self.cwd),
@@ -158,6 +163,14 @@ class TrustedSecurity(unittest.TestCase):
                 'execution':{'adapter_proof':adapter,'authorization':proof,
                              'native_profile':'os-native','process_identity':process}}
         self.assertTrue(validate_success(record,persisted=False))
+        native_process = {'pid': 1234, 'launcher': 'process_guard', 'platform': 'darwin',
+                          'ps_fields': 'pid uid gid pgid',
+                          'status': [f"1234 {identity['uid']} {identity['gid']} 1234"]}
+        record['execution']['process_identity'] = native_process
+        self.assertTrue(validate_success(record,persisted=False))
+        native_process['status'] = [f"1234 {identity['uid'] + 1} {identity['gid']} 1234"]
+        self.denied('TOOL_EVIDENCE_INCOMPLETE',validate_success,record,persisted=False)
+        record['execution']['process_identity'] = process
         proof['transport']='local'
         self.denied('TOOL_EVIDENCE_INCOMPLETE',validate_success,record,persisted=False)
 
