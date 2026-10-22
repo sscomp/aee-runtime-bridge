@@ -101,8 +101,32 @@ class _CodexAdapter(AdapterSpec):
             return [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
                     "--dangerously-bypass-approvals-and-sandbox", "--cd", ".", "-"]
         sandbox = "workspace-write" if mode == "write" else "read-only"
-        return [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+        argv = [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
                 "--sandbox", sandbox, "--cd", working_directory, "-"]
+        if mode == "write":
+            # Codex's native workspace-write sandbox hard-codes a ``.git``
+            # carve-out: ref locks (``.git/refs/heads/*.lock``) inside the
+            # working directory are denied with EPERM (openai/codex#5034),
+            # so git branch/checkout operations fail mid-job. When the
+            # operator opts in via AEE_CODEX_GIT_WRITABLE=1, scope a
+            # write grant to this job's resolved ``.git`` directory only —
+            # the general filesystem and network boundaries stay intact
+            # (verified: other workspace paths remain writable, and paths
+            # outside the workspace stay denied). Opt-in keeps the default
+            # posture unchanged; un-set the variable to restore strict
+            # .git read-only sandboxing.
+            if os.environ.get("AEE_CODEX_GIT_WRITABLE") == "1":
+                from pathlib import Path as _Path
+                git_dir = (_Path(working_directory) / ".git").resolve()
+                if git_dir.exists():
+                    # Escape for a TOML basic-string: backslashes first,
+                    # then quotes, so a path can't terminate the string and
+                    # inject an extra writable root.
+                    git_dir_literal = str(git_dir).replace(
+                        "\\", "\\\\").replace('"', '\\"')
+                    argv = argv[:-1] + [
+                        "-c", f'sandbox_workspace_write.writable_roots=["{git_dir_literal}"]', "-"]
+        return argv
 
 
 @_spec
