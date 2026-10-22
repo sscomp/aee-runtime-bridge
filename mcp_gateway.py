@@ -381,16 +381,28 @@ _AGENT_COMMANDS: Dict[str, List[str]] = {
 
 def discover_agent(name: str) -> Dict[str, Any]:
     """Discover one agent CLI. Read-only: which + `--version` only."""
+    candidates = _AGENT_COMMANDS.get(name, [])
     if name == "codex":
         try:
             identity = resolve_codex(A3_CODEX_BIN)
             return {"agent": name, "installed": True, "available": True,
                     "executable": identity.executable, "version": identity.version,
                     "executable_sha256": identity.sha256}
-        except _JobError as error:
-            return {"agent": name, "installed": False, "available": False,
-                    "executable": None, "version": None, "error_code": error.code}
-    candidates = _AGENT_COMMANDS.get(name, [])
+        except _JobError as broker_error:
+            if broker_error.code != "AGENT_UNAVAILABLE":
+                # Drift/contract violations stay visible; only an absent
+                # broker pin falls through to the generic adapter registry,
+                # which is the resolution the dispatch path actually uses.
+                return {"agent": name, "installed": False, "available": False,
+                        "executable": None, "version": None,
+                        "error_code": broker_error.code}
+            try:
+                _, registry_exe = resolve_adapter("codex")
+            except _JobError as adapter_error:
+                return {"agent": name, "installed": False, "available": False,
+                        "executable": None, "version": None,
+                        "error_code": adapter_error.code}
+            candidates = [registry_exe]
     exe: Optional[str] = None
     for cand in candidates:
         if os.sep not in cand:
