@@ -23,7 +23,7 @@ class AutonomousSecurity(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='aee-aut-security-')
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.cwd = self.root / 'any-accessible-cwd'; self.cwd.mkdir()
         self.policy = self.root / 'policy.json'
         self.policy_data = {'schema': 'aee-autonomous-policy-v1', 'enabled': True,
