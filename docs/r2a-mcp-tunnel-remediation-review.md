@@ -18,7 +18,7 @@ See `tools/r2a/README.md` for V4 configuration hash binding, verification eviden
 and remaining release prerequisites. Live configuration, approvals, raw outputs
 and host process identities remain private. No protected paths were provisioned.
 
-The handoff identifies these candidate hashes (provenance only; not approval):
+The original handoff identified these historical hashes (provenance only; not current bytes or approval):
 - Retirement candidate: `112bd4afbe90540675d6de18a84ab455650ea0cdbac7cbd04b680849ac8bb81c`
 - Snapshot launcher: `0a6a0444026e57069c2fa447b98a930f2cead78f05e74b1db79b5e36cdc78669`
 - Publisher: `09b9017ec16f57c1af9e10a12821361aedab81081928ca4ed3fbf02283d16c69`
@@ -51,3 +51,16 @@ private in-memory configuration adapter and does not establish trusted-entry
 acceptance. Human review, protected publication/configuration, fresh V4 signatures,
 Owner release and Operator approval remain pending. Remote MCP validation and A2
 acceptance are NOT TESTED. Full details are in `tools/r2a/verification.json`.
+
+
+## IR-03 / IR-04 closure revision
+
+All proc-stat readers now validate records through one parser that handles comm
+whitespace and parentheses. Consumer acceptance rejects unknown/read-failure/race
+entries before retirement, inside the lock and in post-checks. Kernel-thread
+exclusion requires positive flag evidence; unfamiliar executable names cannot
+establish non-consumer status. The no-signal suite now has 123 tests. See
+`tools/r2a/README.md` for operator evidence requirements and remaining limitations.
+Earlier live dry-run statements above describe prior bytes, not this revision.
+IR-04 operational acceptance remains CONDITIONAL: local observations cannot prove
+global uniqueness. NO APPLY / NO SIGNAL / NO SERVICE CHANGE / NO MERGE.

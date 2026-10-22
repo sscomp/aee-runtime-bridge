@@ -39,12 +39,31 @@ def readonly_guard(event, args):
         need(not (isinstance(mode,str) and any(c in mode for c in 'wax+')), 'DRY_RUN_WRITE_DENIED')
         need(not (isinstance(flags,int) and flags&(os.O_WRONLY|os.O_RDWR|os.O_CREAT|os.O_TRUNC|os.O_APPEND)), 'DRY_RUN_WRITE_DENIED')
 
-def pstat(pid): return Path('/proc',str(pid),'stat').read_text().split()
+def parse_proc_stat(raw, expected_pid):
+    """Linux stat: comm is unescaped and may contain whitespace and parentheses.
+
+    Only the suffix after the LAST ')' has positional fields. Require the full
+    modern Linux record (through exit_code); never guess missing identity fields.
+    """
+    need(type(expected_pid) is int and expected_pid>0,'PROC_STAT_EXPECTED_PID')
+    match=re.fullmatch(r'([1-9][0-9]*) \((.*)\) ([^()]*)\n?',raw,re.DOTALL)
+    need(match is not None,'PROC_STAT_FORMAT')
+    pid=int(match[1]);tail=match[3].split()
+    need(pid==expected_pid,'PROC_STAT_PID_MISMATCH')
+    need(len(tail)>=50 and tail[0] in {'R','S','D','Z','T','t','W','X','x','K','P','I'},'PROC_STAT_FIELDS')
+    need(all(re.fullmatch(r'-?[0-9]+',v) for v in tail[1:]),'PROC_STAT_NUMBER')
+    ppid,flags,ticks=int(tail[1]),int(tail[6]),int(tail[19])
+    need(ppid>=0 and flags>=0 and ticks>=0,'PROC_STAT_IDENTITY_NUMBER')
+    return {'pid':pid,'comm':match[2],'state':tail[0],'ppid':ppid,
+            'flags':flags,'start_ticks':ticks}
+
+def pstat(pid):
+    return parse_proc_stat(Path('/proc',str(pid),'stat').read_text(),pid)
 def penv(pid):
     return dict(x.decode().split('=',1) for x in Path('/proc',str(pid),'environ').read_bytes().split(bytes([0])) if b'=' in x)
 def identity(pid):
     tick,ppid,exe,role=TARGETS[pid];p=Path('/proc')/str(pid);s=pstat(pid)
-    need(int(s[21])==tick and int(s[3])==ppid and s[2] not in ('T','t','Z'), 'TARGET_IDENTITY_CHANGED')
+    need(s['start_ticks']==tick and s['ppid']==ppid and s['state'] not in ('T','t','Z'), 'TARGET_IDENTITY_CHANGED')
     need(str(p.joinpath('exe').resolve())==exe, 'TARGET_EXEC_CHANGED')
     need(role.encode() in p.joinpath('cmdline').read_bytes().split(bytes([0])), 'TARGET_ROLE_CHANGED')
     lines=p.joinpath('status').read_text().splitlines()
@@ -53,8 +72,7 @@ def descendants():
     ppids={}
     for p in Path('/proc').iterdir():
         if p.name.isdigit():
-            try: ppids[int(p.name)]=int(pstat(int(p.name))[3])
-            except OSError: pass
+            ppids[int(p.name)]=pstat(int(p.name))['ppid']
     result=set();queue=[STUB]
     while queue:
         parent=queue.pop()
@@ -67,7 +85,7 @@ def fetch(port,path):
         need(r.status==200,'HEALTH_HTTP'); return r.read()
 def healthy():
     for pid,tick in FORMAL.items():
-        s=pstat(pid);need(int(s[21])==tick and s[2] not in ('T','t','Z'),'FORMAL_IDENTITY_CHANGED')
+        s=pstat(pid);need(s['start_ticks']==tick and s['state'] not in ('T','t','Z'),'FORMAL_IDENTITY_CHANGED')
     fetch(GATEWAY_PORT,'/health');fetch(FORMAL_PORT,'/readyz')
 def parse_managed(output):
     """Keep only Program/State/PID. Descriptions and uptime are volatile."""
@@ -267,7 +285,7 @@ def checks():
     need(os.geteuid()==EXECUTOR_UID,'EXECUTOR_UID')
     ancestor=os.getpid();seen=set()
     while ancestor and ancestor not in seen:
-        need(ancestor not in TARGETS,'EXECUTOR_DEPENDS_ON_TARGET');seen.add(ancestor);ancestor=int(pstat(ancestor)[3])
+        need(ancestor not in TARGETS,'EXECUTOR_DEPENDS_ON_TARGET');seen.add(ancestor);ancestor=pstat(ancestor)['ppid']
     need(descendants()=={WRAPPER,APPSERVER},'DESCENDANTS_CHANGED')
     for pid in TARGETS: identity(pid)
     ge=penv(GATEWAY);te=penv(STUB);fe=penv(FORMAL_TUNNEL)
@@ -329,34 +347,80 @@ def stub_listener_snapshot():
     need(all(row[2] in owned for row in listener_rows() if row[1] in (STUB_PORT,APP_PORT)),'STUB_PORT_OWNERSHIP')
     return sorted(rows)
 
+INVENTORY_SCOPE = 'visible_local_process_namespace_only'
+# Linux include/linux/sched.h PF_KTHREAD; absence of exe alone proves nothing.
+PF_KTHREAD = 0x00200000
+INVENTORY_UNKNOWN = ('unresolved_candidate_pids','vanished_race_pids',
+                     'read_failure_pids','other_unclassified_pids')
+
+def validate_consumer_inventory(inventory, expected):
+    """Accept only the classified local snapshot, never global exclusivity."""
+    need(inventory['scope']==INVENTORY_SCOPE,'CONSUMER_SCOPE_UNSUPPORTED')
+    need(not inventory['unexpected_consumer_pids'],'UNEXPECTED_SAME_TUNNEL_CONSUMER')
+    need(not any(inventory[k] for k in INVENTORY_UNKNOWN)
+         and inventory['unclassified_proc_count']==0,'CONSUMER_INVENTORY_INCONCLUSIVE')
+    need(inventory['same_tunnel_pids']==sorted(expected),'UNEXPECTED_SAME_TUNNEL_CONSUMER')
+    need(inventory['formal_consumer_pids']==[FORMAL_TUNNEL],'FORMAL_CONSUMER_NOT_IDENTIFIED')
+
 def consumers(tunnel_id):
-    same=[];unknown=[];unclassified=0
+    inv={k:[] for k in ('same_tunnel_pids','formal_consumer_pids',
+                        'unexpected_consumer_pids','proven_non_target_pids',*INVENTORY_UNKNOWN)}
+    inv.update(scope=INVENTORY_SCOPE,global_consumer_exclusivity='NOT_PROVEN')
     installed=os.stat(TUNNEL)
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():continue
+        pid=int(entry.name)
         try:
-            comm=entry.joinpath('comm').read_text().strip()
-            try:exe=str(entry.joinpath('exe').resolve(strict=True))
-            except OSError:exe=''
-            try:
-                actual=entry.joinpath('exe').stat();same_inode=(actual.st_dev,actual.st_ino)==(installed.st_dev,installed.st_ino)
-            except OSError:same_inode=False
-            if not same_inode and Path(exe).name!='tunnel-client' and comm!='tunnel-client':
-                if not exe:unclassified+=1
-                continue
-            pid=int(entry.name);argv=[x.decode() for x in entry.joinpath('cmdline').read_bytes().split(bytes([0])) if x]
-            env=penv(pid);bound=None
-            # Flag > environment. Unknown profile/config resolution blocks this inventory.
-            for i,arg in enumerate(argv):
-                if arg=='--control-plane.tunnel-id' and i+1<len(argv):bound=argv[i+1]
-                elif arg.startswith('--control-plane.tunnel-id='):bound=arg.split('=',1)[1]
-            if bound is None:bound=env.get('CONTROL_PLANE_TUNNEL_ID')
-            if pid==FORMAL_TUNNEL:bound=json.loads(fetch(FORMAL_PORT,'/api/status'))['control_plane_tunnel_id']
-            if not bound:unknown.append(pid)
-            elif bound==tunnel_id:same.append(pid)
-        except FileNotFoundError:continue
-        except (OSError,ValueError,KeyError):unknown.append(int(entry.name))
-    return {'same_tunnel_pids':sorted(same),'unresolved_candidate_pids':sorted(set(unknown)),'unclassified_proc_count':unclassified,'scope':'visible_local_process_namespace_only'}
+            before=pstat(pid)
+            if before['flags'] & PF_KTHREAD:
+                category='proven_non_target_pids'
+            else:
+                exe=str(entry.joinpath('exe').resolve(strict=True))
+                actual=entry.joinpath('exe').stat()
+                same_inode=(actual.st_dev,actual.st_ino)==(installed.st_dev,installed.st_ino)
+                candidate=same_inode or Path(exe).name=='tunnel-client' or before['comm']=='tunnel-client'
+                if not candidate:
+                    # A renamed client, interpreter or alternate implementation may
+                    # still consume this tunnel. A different basename is not proof.
+                    category='other_unclassified_pids'
+                else:
+                    argv=[x.decode() for x in entry.joinpath('cmdline').read_bytes().split(bytes([0])) if x]
+                    env=penv(pid);bindings=[]
+                    for i,arg in enumerate(argv):
+                        if arg=='--control-plane.tunnel-id':
+                            need(i+1<len(argv) and bool(argv[i+1]) and not argv[i+1].startswith('--'),'CONSUMER_FLAG_VALUE')
+                            bindings.append(argv[i+1])
+                        elif arg.startswith('--control-plane.tunnel-id='):bindings.append(arg.split('=',1)[1])
+                    need(len(bindings)<=1 and all(bindings),'CONSUMER_BINDING_AMBIGUOUS')
+                    bound=bindings[0] if bindings else env.get('CONTROL_PLANE_TUNNEL_ID')
+                    if pid==FORMAL_TUNNEL:
+                        need(before['start_ticks']==FORMAL[pid],'FORMAL_IDENTITY_CHANGED')
+                        bound=json.loads(fetch(FORMAL_PORT,'/api/status'))['control_plane_tunnel_id']
+                    if not bound:category='unresolved_candidate_pids'
+                    elif bound==tunnel_id:category='same_tunnel_pids'
+                    else:category='proven_non_target_pids'
+            after=pstat(pid)
+            need(before==after,'CONSUMER_IDENTITY_CHANGED_DURING_SCAN')
+            inv[category].append(pid)
+            if category=='same_tunnel_pids':
+                if pid==FORMAL_TUNNEL:inv['formal_consumer_pids'].append(pid)
+                elif pid!=STUB:inv['unexpected_consumer_pids'].append(pid)
+        except FileNotFoundError:
+            # Missing exe/env is not proof of exit; confirm stat also disappeared.
+            try:pstat(pid)
+            except FileNotFoundError:inv['vanished_race_pids'].append(pid)
+            except (OSError,ValueError,GateError):inv['other_unclassified_pids'].append(pid)
+            else:inv['read_failure_pids'].append(pid)
+        except OSError:inv['read_failure_pids'].append(pid)
+        except (ValueError,KeyError,GateError):inv['other_unclassified_pids'].append(pid)
+    for key,value in inv.items():
+        if isinstance(value,list):value.sort()
+    inv['unclassified_proc_count']=sum(len(inv[k]) for k in INVENTORY_UNKNOWN)
+    inv['local_inventory_status']='INCONCLUSIVE'
+    if inv['unexpected_consumer_pids']:inv['local_inventory_status']='BLOCKED'
+    elif not inv['unclassified_proc_count'] and inv['formal_consumer_pids']:
+        inv['local_inventory_status']='CLASSIFIED_LOCAL_SNAPSHOT_ONLY'
+    return inv
 
 def delivery_failures():
     d=json.loads(fetch(FORMAL_PORT,'/health?details=true'))
@@ -365,7 +429,7 @@ def delivery_failures():
 
 def original_state(pid):
     try:
-        s=pstat(pid);return (int(s[21]),s[2])
+        s=pstat(pid);return (s['start_ticks'],s['state'])
     except FileNotFoundError:return None
 
 def validate_post_snapshot(snapshot,expected_ticks,old_listeners):
@@ -380,8 +444,7 @@ def validate_post_snapshot(snapshot,expected_ticks,old_listeners):
     need(not any(row[1] in (STUB_PORT,APP_PORT) for row in current),'STUB_PORT_STILL_LISTENING')
     need(not({row[2] for row in old_listeners}&{row[2] for row in current}),'ORIGINAL_LISTENER_INODE_REMAINS')
     inventory=snapshot['consumers']
-    need(not inventory['unresolved_candidate_pids'],'CONSUMER_BINDING_UNRESOLVED')
-    need(inventory['same_tunnel_pids']==[FORMAL_TUNNEL],'UNEXPECTED_SAME_TUNNEL_CONSUMER')
+    validate_consumer_inventory(inventory,[FORMAL_TUNNEL])
     need(snapshot['formal_health'] is True and snapshot['supervisor_unchanged'] is True,'FORMAL_SERVICE_CHANGED')
     need(snapshot['delivery_failures']==snapshot['delivery_baseline'],'DELIVERY_FAILURES_INCREASED_OR_RESET')
 
@@ -434,7 +497,7 @@ def main():
         for pid in TARGETS:handles[pid]=os.pidfd_open(pid);identity(pid)
         tunnel_id=penv(STUB)['CONTROL_PLANE_TUNNEL_ID']
         old_listeners=stub_listener_snapshot();inv=consumers(tunnel_id)
-        need(not inv['unresolved_candidate_pids'] and inv['same_tunnel_pids']==[STUB,FORMAL_TUNNEL],'PRE_RETIREMENT_CONSUMER_SET_CHANGED')
+        validate_consumer_inventory(inv,[STUB,FORMAL_TUNNEL])
         failures=delivery_failures()
         if not args.apply:
             copy_trusted=False;lock_protected=False
@@ -453,7 +516,7 @@ def main():
         # Refresh every mechanical gate inside the lock immediately before mutation.
         refreshed,_=checks();assert_managed_unchanged(refreshed,baseline)
         need(stub_listener_snapshot()==old_listeners,'LISTENER_BASELINE_CHANGED')
-        current=consumers(tunnel_id);need(not current['unresolved_candidate_pids'] and current['same_tunnel_pids']==[STUB,FORMAL_TUNNEL],'CONSUMER_BASELINE_CHANGED')
+        current=consumers(tunnel_id);validate_consumer_inventory(current,[STUB,FORMAL_TUNNEL])
         def interrupted(signum,frame):raise GateError('CONTROLLER_INTERRUPTED_NO_AUTOMATIC_ROLLBACK')
         signal.signal(signal.SIGTERM,interrupted);signal.signal(signal.SIGINT,interrupted)
         emit(mode='apply',event='TRUSTED_SIGNAL_BOUNDARY')

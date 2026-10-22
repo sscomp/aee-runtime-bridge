@@ -28,6 +28,183 @@ fixture=json.loads(Path(__file__).with_name('runtime.example.json').read_text())
 fixture['executor_uid']=os.geteuid()
 c.configure_runtime(fixture,hashlib.sha256(c.canonical(fixture)).hexdigest())
 
+def proc_stat(pid=41001,comm='synthetic',state='S',ppid=1,ticks=100,flags=0):
+    fields=['0']*50
+    fields[0]=state;fields[1]=str(ppid);fields[6]=str(flags);fields[19]=str(ticks)
+    return f'{pid} ({comm}) '+ ' '.join(fields)+'\n'
+
+def classified_inventory():
+    return {'same_tunnel_pids':[c.FORMAL_TUNNEL],'formal_consumer_pids':[c.FORMAL_TUNNEL],
+            'unexpected_consumer_pids':[],'proven_non_target_pids':[],
+            **{k:[] for k in c.INVENTORY_UNKNOWN},'unclassified_proc_count':0,
+            'scope':c.INVENTORY_SCOPE,'global_consumer_exclusivity':'NOT_PROVEN'}
+
+class ProcStatTests(unittest.TestCase):
+    def test_names_and_required_fields(self):
+        for comm in ('normal','two words','a(b)c','a)b)c','a (b) c)','line\nbreak'):
+            with self.subTest(comm=comm):
+                s=c.parse_proc_stat(proc_stat(comm=comm,ppid=42,ticks=987,flags=3),41001)
+                self.assertEqual(s,dict(pid=41001,comm=comm,state='S',ppid=42,start_ticks=987,flags=3))
+    def test_truncated_or_malformed_records_rejected(self):
+        valid=proc_stat()
+        for raw in ('',valid[:30],valid.rsplit(' ',1)[0],valid.replace(') S',')'),
+                    valid.replace('(synthetic)','synthetic'),valid.replace(' S ',' ? '),
+                    valid.replace(' 1 ',' nope ',1),proc_stat(ppid=-1),
+                    proc_stat(ticks=-1),proc_stat(flags=-1),valid+' junk',
+                    proc_stat().replace(' 100 ',' 1.5 '),proc_stat().replace(' 100 ',' +100 ')):
+            with self.subTest(raw=raw),self.assertRaises(c.GateError):c.parse_proc_stat(raw,41001)
+    def test_pid_mismatch_rejected(self):
+        with self.assertRaisesRegex(c.GateError,'PID_MISMATCH'):c.parse_proc_stat(proc_stat(pid=9),41001)
+    def test_invalid_pid_rejected(self):
+        for pid in (0,-1,True,'41001'):
+            with self.subTest(pid=pid),self.assertRaises(c.GateError):c.parse_proc_stat(proc_stat(),pid)
+    def test_reader_validates_real_record_not_split_fixture(self):
+        with patch.object(Path,'read_text',return_value=proc_stat(comm='a b)c')):
+            self.assertEqual(c.pstat(41001)['comm'],'a b)c')
+    def test_identity_start_tick_mismatch_aborts_before_other_reads(self):
+        with patch.object(Path,'read_text',return_value=proc_stat(ticks=c.TARGETS[c.STUB][0]+1)),patch.object(Path,'resolve') as exe:
+            with self.assertRaises(c.GateError):c.identity(c.STUB)
+            exe.assert_not_called()
+    def test_identity_exit_during_read_propagates(self):
+        with patch.object(Path,'read_text',side_effect=FileNotFoundError),patch.object(c.signal,'pidfd_send_signal') as signal:
+            with self.assertRaises(FileNotFoundError):c.identity(c.STUB)
+            signal.assert_not_called()
+    def test_missing_original_state_is_exit_evidence_only(self):
+        with patch.object(Path,'read_text',side_effect=FileNotFoundError):self.assertIsNone(c.original_state(c.STUB))
+    def test_malformed_original_state_is_not_exit_evidence(self):
+        with patch.object(Path,'read_text',return_value='truncated'):
+            with self.assertRaises(c.GateError):c.original_state(c.STUB)
+    def test_descendant_read_failure_is_not_ignored(self):
+        with patch.object(Path,'iterdir',return_value=[Path('/proc/41003')]),patch.object(c,'pstat',side_effect=PermissionError):
+            with self.assertRaises(PermissionError):c.descendants()
+
+class ConsumerInventoryTests(unittest.TestCase):
+    def scan(self,rows):
+        # All /proc, inode, environment, HTTP and executable evidence is synthetic.
+        # All row overrides below represent fixture evidence, never live processes.
+        from types import SimpleNamespace
+        def row_for(path):return rows[int(path.parts[2])]
+        def read_text(path,*args,**kwargs):
+            row=row_for(path);pid=int(path.parts[2])
+            if row.get('vanish'):raise FileNotFoundError
+            if row.get('stat_error'):raise row['stat_error']
+            return proc_stat(pid,comm=row.get('comm','tunnel-client'),ticks=row.get('ticks',c.FORMAL.get(pid,100)),flags=row.get('flags',0))
+        def resolve(path,*args,**kwargs):
+            row=row_for(path)
+            if row.get('read_error'):raise row['read_error']
+            return Path(row.get('exe',c.TUNNEL))
+        def read_bytes(path):return row_for(path).get('argv',b'tunnel-client\0')
+        def stat(path,*args,**kwargs):
+            return SimpleNamespace(st_dev=1,st_ino=2 if str(path)==c.TUNNEL or row_for(path).get('exe',c.TUNNEL)==c.TUNNEL else 3)
+        def env(pid):return {'CONTROL_PLANE_TUNNEL_ID':rows[pid].get('bound','synthetic-tunnel')}
+        with patch.object(Path,'iterdir',return_value=[Path('/proc')/str(pid) for pid in rows]),patch.object(Path,'read_text',read_text),patch.object(Path,'resolve',resolve),patch.object(Path,'stat',stat),patch.object(Path,'read_bytes',read_bytes),patch.object(c.os,'stat',return_value=SimpleNamespace(st_dev=1,st_ino=2)),patch.object(c,'penv',side_effect=env),patch.object(c,'fetch',return_value=b'{"control_plane_tunnel_id":"synthetic-tunnel"}'):
+            return c.consumers('synthetic-tunnel')
+    def formal(self,**extra):return {c.FORMAL_TUNNEL:{},**extra}
+    def accept(self,inv):return c.validate_consumer_inventory(inv,[c.FORMAL_TUNNEL])
+    def test_single_formal_consumer_accepts_only_local_snapshot(self):
+        inv=self.scan(self.formal());self.accept(inv)
+        self.assertEqual(inv['global_consumer_exclusivity'],'NOT_PROVEN')
+        self.assertEqual(inv['scope'],'visible_local_process_namespace_only')
+    def test_identified_second_consumer_blocks(self):
+        inv=self.scan({c.FORMAL_TUNNEL:{},99999:{}})
+        self.assertEqual(inv['unexpected_consumer_pids'],[99999]);self.assertEqual(inv['local_inventory_status'],'BLOCKED')
+        with self.assertRaises(c.GateError):self.accept(inv)
+    def test_different_binding_is_proven_non_target(self):
+        inv=self.scan({c.FORMAL_TUNNEL:{},99999:{'bound':'other-synthetic-tunnel'}})
+        self.accept(inv);self.assertEqual(inv['proven_non_target_pids'],[99999])
+    def test_unreadable_executable_is_not_a_kernel_thread(self):
+        for error in (PermissionError,FileNotFoundError):
+            inv=self.scan({c.FORMAL_TUNNEL:{},99999:{'comm':'unfamiliar','read_error':error}})
+            self.assertEqual(inv['read_failure_pids'],[99999]);self.assertFalse(inv['proven_non_target_pids'])
+            with self.assertRaises(c.GateError):self.accept(inv)
+    def test_process_disappearance_is_inconclusive(self):
+        inv=self.scan({c.FORMAL_TUNNEL:{},99999:{'vanish':True}})
+        self.assertEqual(inv['vanished_race_pids'],[99999])
+        with self.assertRaises(c.GateError):self.accept(inv)
+    def test_kernel_flag_is_positive_exclusion_evidence(self):
+        inv=self.scan({c.FORMAL_TUNNEL:{},99999:{'flags':c.PF_KTHREAD,'read_error':PermissionError}})
+        self.accept(inv);self.assertEqual(inv['proven_non_target_pids'],[99999])
+    def test_unfamiliar_executable_cannot_prove_non_consumer(self):
+        inv=self.scan({c.FORMAL_TUNNEL:{},99999:{'comm':'renamed','exe':'/synthetic/renamed'}})
+        self.assertEqual(inv['other_unclassified_pids'],[99999])
+        with self.assertRaises(c.GateError):self.accept(inv)
+    def test_missing_binding_blocks(self):
+        inv=self.scan({c.FORMAL_TUNNEL:{},99999:{'bound':''}})
+        self.assertEqual(inv['unresolved_candidate_pids'],[99999])
+        with self.assertRaises(c.GateError):self.accept(inv)
+    def test_command_line_binding_precedes_environment(self):
+        inv=self.scan({c.FORMAL_TUNNEL:{},99999:{'bound':'other-tunnel','argv':b'tunnel-client\0--control-plane.tunnel-id=synthetic-tunnel\0'}})
+        self.assertEqual(inv['unexpected_consumer_pids'],[99999])
+        with self.assertRaises(c.GateError):self.accept(inv)
+    def test_malformed_or_ambiguous_flags_are_unknown(self):
+        for argv in (b'tunnel-client\0--control-plane.tunnel-id\0',
+                     b'tunnel-client\0--control-plane.tunnel-id=\0',
+                     b'tunnel-client\0--control-plane.tunnel-id=a\0--control-plane.tunnel-id=b\0'):
+            with self.subTest(argv=argv):
+                inv=self.scan({c.FORMAL_TUNNEL:{},99999:{'argv':argv}})
+                self.assertEqual(inv['other_unclassified_pids'],[99999])
+                with self.assertRaises(c.GateError):self.accept(inv)
+    def test_formal_pid_reuse_cannot_use_formal_endpoint_binding(self):
+        inv=self.scan({c.FORMAL_TUNNEL:{'ticks':c.FORMAL[c.FORMAL_TUNNEL]+1}})
+        self.assertFalse(inv['formal_consumer_pids'])
+        with self.assertRaises(c.GateError):self.accept(inv)
+    def test_stat_permission_failure_blocks(self):
+        inv=self.scan({c.FORMAL_TUNNEL:{},99999:{'stat_error':PermissionError}})
+        self.assertEqual(inv['read_failure_pids'],[99999])
+        with self.assertRaises(c.GateError):self.accept(inv)
+    def test_malformed_stat_blocks(self):
+        inv=self.scan({c.FORMAL_TUNNEL:{},99999:{'stat_error':c.GateError('PROC_STAT_FORMAT')}})
+        self.assertEqual(inv['other_unclassified_pids'],[99999])
+        with self.assertRaises(c.GateError):self.accept(inv)
+    def test_empty_inventory_is_not_pass(self):
+        inv=self.scan({});self.assertEqual(inv['local_inventory_status'],'INCONCLUSIVE')
+        with self.assertRaises(c.GateError):self.accept(inv)
+    def test_proc_listing_permission_failure_propagates(self):
+        from types import SimpleNamespace
+        with patch.object(c.os,'stat',return_value=SimpleNamespace(st_dev=1,st_ino=2)),patch.object(Path,'iterdir',side_effect=PermissionError):
+            with self.assertRaises(PermissionError):c.consumers('synthetic-tunnel')
+    def test_namespace_scope_cannot_be_promoted(self):
+        inv=classified_inventory();inv['scope']='global'
+        with self.assertRaises(c.GateError):self.accept(inv)
+    def test_legacy_unclassified_count_cannot_bypass_postcheck(self):
+        test=PostconditionTests();test.setUp();test.snap['consumers']['unclassified_proc_count']=7
+        with self.assertRaises(c.GateError):test.check()
+    def test_each_unknown_category_blocks_pre_and_post_even_with_stale_status(self):
+        for key in c.INVENTORY_UNKNOWN:
+            inv=classified_inventory();inv[key]=[99999];inv['local_inventory_status']='CLASSIFIED_LOCAL_SNAPSHOT_ONLY'
+            with self.subTest(key=key):
+                for expected in ([c.FORMAL_TUNNEL],[c.STUB,c.FORMAL_TUNNEL]):
+                    inv['same_tunnel_pids']=sorted(expected)
+                    with self.assertRaises(c.GateError):c.validate_consumer_inventory(inv,expected)
+                test=PostconditionTests();test.setUp();test.snap['consumers']=inv
+                with self.assertRaises(c.GateError):test.check()
+    def test_start_ticks_change_during_inventory_blocks(self):
+        first=c.parse_proc_stat(proc_stat(c.FORMAL_TUNNEL,ticks=c.FORMAL[c.FORMAL_TUNNEL],flags=c.PF_KTHREAD),c.FORMAL_TUNNEL)
+        last={**first,'start_ticks':first['start_ticks']+1}
+        from types import SimpleNamespace
+        with patch.object(c.os,'stat',return_value=SimpleNamespace(st_dev=1,st_ino=2)),patch.object(Path,'iterdir',return_value=[Path('/proc')/str(c.FORMAL_TUNNEL)]),patch.object(c,'pstat',side_effect=[first,last]):
+            inv=c.consumers('synthetic-tunnel')
+        self.assertEqual(inv['other_unclassified_pids'],[c.FORMAL_TUNNEL])
+        with self.assertRaises(c.GateError):self.accept(inv)
+
+class InventoryMainBoundaryTests(unittest.TestCase):
+    def run_main(self,inventory):
+        # Exercise default dry-run orchestration with no real proc/HTTP/service I/O.
+        with patch.object(sys,'argv',['candidate','--dry-run']),patch.object(sys,'addaudithook'),patch.object(c,'load_runtime_config'),patch.object(c,'checks',return_value=({},{})),patch.object(c.os,'pidfd_open',return_value=-1),patch.object(c.os,'close'),patch.object(c,'identity'),patch.object(c,'penv',return_value={'CONTROL_PLANE_TUNNEL_ID':'synthetic-tunnel'}),patch.object(c,'stub_listener_snapshot',return_value=[]),patch.object(c,'consumers',return_value=inventory),patch.object(c,'delivery_failures',return_value=0),patch.object(c,'protected_source_hashes',side_effect=c.GateError('UNPUBLISHED')),patch.object(c,'root_protected_read',side_effect=c.GateError('UNPROVISIONED')),patch.object(c,'emit') as emit,patch.object(c,'send_term') as send,patch.object(c.subprocess,'run') as process:
+            result=c.main()
+            send.assert_not_called();process.assert_not_called()
+            return result,emit.call_args.kwargs
+    def test_unknown_inventory_aborts_dry_run_with_zero_signals(self):
+        inv=classified_inventory();inv['same_tunnel_pids']=sorted([c.STUB,c.FORMAL_TUNNEL]);inv['read_failure_pids']=[99999]
+        result,event=self.run_main(inv)
+        self.assertEqual(result,2);self.assertEqual(event['signals_sent'],0)
+        self.assertEqual(event['code'],'CONSUMER_INVENTORY_INCONCLUSIVE')
+    def test_classified_local_dry_run_still_requires_release_and_approval(self):
+        inv=classified_inventory();inv['same_tunnel_pids']=sorted([c.STUB,c.FORMAL_TUNNEL])
+        result,event=self.run_main(inv)
+        self.assertEqual(result,3);self.assertEqual(event['signals_sent'],0)
+        self.assertEqual(event['consumers']['global_consumer_exclusivity'],'NOT_PROVEN')
+
 class ApprovalTests(unittest.TestCase):
     def setUp(self):
         # Deliberately public deterministic TEST seeds; never written as a real trust anchor.
@@ -106,7 +283,7 @@ class PostconditionTests(unittest.TestCase):
     def setUp(self):
         self.ticks={pid:v[0] for pid,v in c.TARGETS.items()}
         self.old=[('tcp',29001,'111'),('tcp',29002,'112')]
-        self.snap={'pidfd_exited':{pid:True for pid in self.ticks},'original_states':{pid:None for pid in self.ticks},'listeners':[('tcp',29003,'211'),('tcp',29004,'212')],'consumers':{'same_tunnel_pids':[42002],'unresolved_candidate_pids':[],'unclassified_proc_count':0},'formal_health':True,'supervisor_unchanged':True,'delivery_failures':0,'delivery_baseline':0}
+        self.snap={'pidfd_exited':{pid:True for pid in self.ticks},'original_states':{pid:None for pid in self.ticks},'listeners':[('tcp',29003,'211'),('tcp',29004,'212')],'consumers':classified_inventory(),'formal_health':True,'supervisor_unchanged':True,'delivery_failures':0,'delivery_baseline':0}
     def check(self):return c.validate_post_snapshot(self.snap,self.ticks,self.old)
     def test_complete_synthetic_postconditions_pass(self):self.check()
     def test_each_target_must_exit(self):
@@ -351,7 +528,7 @@ class RuntimeConfigurationTests(unittest.TestCase):
         with self.assertRaises(c.GateError):self.configure(cfg)
         self.assertEqual((c.STUB,c.CONFIG_SHA256),previous)
     def test_pid_reuse_or_identity_mismatch_rejected_before_executable_check(self):
-        row=['0']*22;row[21]=str(c.TARGETS[c.STUB][0]+1);row[3]='1';row[2]='S'
+        row=c.parse_proc_stat(proc_stat(c.STUB,ticks=c.TARGETS[c.STUB][0]+1),c.STUB)
         with patch.object(c,'pstat',return_value=row):
             with self.assertRaises(c.GateError):c.identity(c.STUB)
     def test_changed_protected_config_rejected_before_trust_load(self):
