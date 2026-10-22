@@ -30,7 +30,8 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install hashed test dependencies
-        run: python3.11 -m pip install --only-binary=:all: --require-hashes -r tools/r2a/requirements-ci.lock
+        run: |
+          python3.11 -m pip install --only-binary=:all: --require-hashes -r tools/r2a/requirements-ci.lock
       - name: Record source and dependency versions
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
