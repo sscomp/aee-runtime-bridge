@@ -69,7 +69,8 @@ class HardenedProtocol(unittest.TestCase):
 
     async def with_client(self, action):
         gateway = self.gateway
-        app = gateway._build_auth_middleware(gateway.mcp.streamable_http_app())
+        app = gateway._build_auth_middleware(
+            gateway.mcp.streamable_http_app(**getattr(gateway, "_STREAMABLE_APP_KWARGS", {})))
         async with gateway.mcp.session_manager.run():
             # ASGITransport makes no socket connection. Use the SDK's trusted
             # loopback Host header so its DNS-rebinding defense stays enabled.
