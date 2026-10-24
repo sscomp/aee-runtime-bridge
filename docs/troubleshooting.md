@@ -16,9 +16,21 @@ raw model traffic, tunnel profiles or internal host inventories.
 | Completed label rejected | Missing/tampered integrity or incomplete native/broker proof is a failure; never repair by relabeling |
 | Code Mode accepted success rejected | Since R3, accepted success needs each observed code-mode execution decoded from the pinned binary's own result header with broker cross-matched declared calls, still failing closed (`REQUIRED_OPERATION_UNVERIFIABLE`) for code-mode `exec`/`wait` or anything without machine-verified completion; check the receipt and [deployment §4c](deployment.md#4c-completed-job-smoke-test-real-http-mcp-production-seal) |
 | Tunnel absent from ChatGPT | Check workspace association, tunnel permissions and healthy client; follow official linked guides |
-| Job fails `REQUIRED_TOOL_FAILED`, `exit_code=0`, null summary | Intentional fail-shot semantics: the agent ran a native command execution that exited nonzero (e.g. `grep -q` with no match, `diff`, `git …` — the admitted snapshot has no `.git`), or reported a failed/declined item. Do **not** ignore/relabel nonzero tool exits. With the diagnostics patch, `execution.native_tool_failure.failing_event` names the failing event (item type/status/exit code, no raw text); without it the failing event is not retained. Re-run with exit-zero-guarded commands ([task authoring](chatgpt-plugin-deployment.md#1a-dispatch-contract-the-plugin-exposes-codex-read-only-only)) |
+| Job fails `REQUIRED_TOOL_FAILED`, `exit_code=0`, null summary | Inspect the retained failing event and private spool. A command with an integer exit code is a recoverable observation, including nonzero exits. A `failed` `mcp_tool_call` is recoverable only when its `result` key is present; `completed` / `in_progress` MCP items remain nonfatal without `result`. Declined MCP calls, failed MCP calls lacking `result`, error items and other failed/declined items remain fatal. Recovery still requires the final turn completion and answer plus process success; later completion cannot clear a fatal event. Compare streamed and buffered parser results using the original spool read-only. Never relabel or rewrite a historical failed record |
 | `INVALID_AGENT` / `INVALID_MODE` on dispatch | Expected: the restricted contract is `agent=codex`, `mode=read_only` only. `aee_agents` availability for Claude Code/Hermes is discovery, not authorization |
 | `/home/...` dispatch target rejected/invisible | By design: the gateway service unit sets `ProtectHome=yes`, so `/home` cannot be traversed. Do not chmod or relax; dispatch against the approved snapshot `/opt/aee/current/source` |
+
+### MCP recovery verification
+
+The MCP exception checks `result` key presence, not truthiness. It does not
+clear an earlier fatal error or weaken process, terminal-event or answer checks.
+Run `test_codex_tool_failure_recovery_semantics` with `PYTHONPATH=.:tests/mcp`
+through `python -m unittest`; replay retained spools through both parsers read-only.
+Record baseline and installed source digests, test evidence and a rollback copy
+before restarting. Restart only from an independent operator process when no jobs
+are active, then verify the new PID, health and imported source digests. If restart
+or verification is unsafe, report live activation as blocked. Roll back only the
+changed parser files from the saved copy; preserve other working-tree changes.
 
 ### `REQUIRED_TOOL_FAILED` attribution runbook
 

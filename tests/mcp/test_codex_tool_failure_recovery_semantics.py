@@ -6,8 +6,9 @@ recorded in ``tool_evidence`` but never a job-terminal verdict on its own.
 The job resolves on the agent turn's authentic terminal event plus the
 adapter process outcome, with deterministic sticky precedence — any fatal
 agent event (``turn.failed``, top-level ``error``, error items, failed or
-declined non-command items) wins over later completion, and ambiguous
-command evidence (failed/declined with no exit code) fails closed.
+declined non-command items except failed MCP calls carrying a result) wins
+over later completion. Ambiguous command evidence (failed/declined with no
+exit code) fails closed.
 Both native parser paths stay under the same contract: the streamed
 budget parser (``mcp_runtime/event_stream``) and the buffered codex
 finalizer (``executor.final_agent_message``).
@@ -480,6 +481,69 @@ class StreamedBufferedParityMatrix(unittest.TestCase):
         evidence = parser.tool_evidence()
         self.assertEqual(evidence['tools_failed'], 1)
         self.assertEqual(evidence['tools_completed'], 2)
+
+    def test_parity_mcp_status_and_result_presence(self):
+        # The exception is exactly failed + mcp_tool_call + result key.
+        for status in ('failed', 'declined', 'completed', 'in_progress'):
+            for result in ('absent', None, {}, {'error': 'synthetic API 422'}):
+                with self.subTest(status=status, result=result):
+                    item = {'type': 'mcp_tool_call', 'status': status}
+                    if result != 'absent':
+                        item['result'] = result
+                    events = ({'type': 'turn.started'},
+                              {'type': 'item.completed', 'item': item},
+                              _message('recovered'), {'type': 'turn.completed'})
+                    fatal = status == 'declined' or (status == 'failed' and result == 'absent')
+                    expected = (('failed', {'code': 'REQUIRED_TOOL_FAILED'}) if fatal
+                                else ('completed', 'recovered'))
+                    self.assertAgree(events, expected)
+                    # Exercise tokenizer boundaries as well as whole-buffer input.
+                    parser = EventParser('codex', 16384)
+                    for byte in codex_stream(*events):
+                        parser.feed(bytes([byte]))
+                    parser.feed(b'', eof=True)
+                    if fatal:
+                        with self.assertRaises(JobError) as error:
+                            parser.result()
+                        self.assertEqual(error.exception.code, 'REQUIRED_TOOL_FAILED')
+                    else:
+                        self.assertEqual(parser.result(), 'recovered')
+
+    def test_parity_result_cannot_recover_other_failed_item_types(self):
+        for kind in ('error', 'file_change', 'unknown_tool'):
+            with self.subTest(kind=kind):
+                self.assertAgree(({'type': 'turn.started'},
+                                  {'type': 'item.completed', 'item': {
+                                      'type': kind, 'status': 'failed', 'result': {}}},
+                                  _message('pretend done'), {'type': 'turn.completed'}),
+                                 ('failed', {'code': 'REQUIRED_TOOL_FAILED'}))
+
+    def test_parity_recovered_mcp_cannot_clear_fatal_events(self):
+        recovered = {'type': 'item.completed', 'item': {
+            'type': 'mcp_tool_call', 'status': 'failed', 'result': {'error': 'synthetic'}}}
+        for fatal, code in (({'type': 'turn.failed'}, 'EXECUTION_FAILED'),
+                            ({'type': 'error'}, 'EXECUTION_FAILED'),
+                            ({'type': 'item.completed', 'item': {'type': 'error'}},
+                             'REQUIRED_TOOL_FAILED'),
+                            ({'type': 'item.completed', 'item': {
+                                'type': 'mcp_tool_call', 'status': 'declined', 'result': {}}},
+                             'REQUIRED_TOOL_FAILED'),
+                            ({'type': 'item.completed', 'item': {
+                                'type': 'mcp_tool_call', 'status': 'failed'}},
+                             'REQUIRED_TOOL_FAILED')):
+            for pair in ((fatal, recovered), (recovered, fatal)):
+                with self.subTest(fatal=fatal, pair=pair):
+                    self.assertAgree(({'type': 'turn.started'}, *pair,
+                                      {'type': 'turn.started'}, _message('pretend done'),
+                                      {'type': 'turn.completed'}), ('failed', {'code': code}))
+
+    def test_recovered_mcp_still_requires_terminal_event_and_answer(self):
+        recovered = {'type': 'item.completed', 'item': {
+            'type': 'mcp_tool_call', 'status': 'failed', 'result': {}}}
+        for suffix in ((), (_message('partial'),), ({'type': 'turn.completed'},)):
+            with self.subTest(suffix=suffix):
+                outcomes = decide(({'type': 'turn.started'}, recovered, *suffix))
+                self.assertTrue(all(outcome[0] == 'failed' for outcome in outcomes.values()))
 
     def test_parity_final_answer_is_last_agent_message_of_final_turn(self):
         # (a) Last final answer removed, earlier same-turn message retained:

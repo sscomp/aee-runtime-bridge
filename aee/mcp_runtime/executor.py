@@ -222,11 +222,16 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
                 # (exit code missing or not an integer) stays fail-closed, as
                 # do error items, failed/declined non-command items and
                 # turn.failed / top-level error events.
+                # Only failed mcp_tool_call items carrying a result are also
+                # recoverable observations; the final turn still decides.
                 if item.get('type') == 'command_execution':
                     if type(item.get('exit_code')) is not int:
                         raise JobError('REQUIRED_TOOL_FAILED',
                                        'Native executor reported a command outcome with no measurable exit code',
                                        exit_code=0, failure=bounded_failure(event, thread=thread))
+                elif (item.get('type') == 'mcp_tool_call' and
+                      item.get('status') == 'failed' and 'result' in item):
+                    pass
                 elif ((item.get('type') == 'error')
                       or (isinstance(item.get('status'), str) and
                           item.get('status') in {'failed', 'declined'})):

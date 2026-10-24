@@ -303,14 +303,18 @@ class EventParser:
                 # counts it as evidence. It is not a job-terminal verdict. A
                 # command outcome whose exit evidence is missing, or not an
                 # integer per the native schema, is ambiguous and stays
-                # fail-closed. Fatal agent outcomes remain: error items,
-                # failed/declined non-command items, and turn.failed /
+                # fail-closed. Only failed mcp_tool_call items carrying a
+                # result are also recoverable observations. Fatal outcomes
+                # remain: error items, other failed/declined non-command items, and turn.failed /
                 # top-level error events. Error is sticky — a later
                 # turn.completed can never override an earlier fatal event.
                 if item.get('type') == 'command_execution':
                     if type(item.get('exit_code')) is not int:
                         self.error = JobError('REQUIRED_TOOL_FAILED',
                                               'Codex reported a command outcome with no measurable exit code')
+                elif (item.get('type') == 'mcp_tool_call' and
+                      item.get('status') == 'failed' and 'result' in item):
+                    pass  # Retain earlier errors; the final turn still decides.
                 elif item.get('type') == 'error' or (isinstance(item.get('status'), str) and
                                                      item.get('status') in {'failed', 'declined'}):
                     self.error = JobError('REQUIRED_TOOL_FAILED', 'Codex reported failed required operation')
