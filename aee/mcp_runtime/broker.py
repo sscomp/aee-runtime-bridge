@@ -10,7 +10,6 @@ import http.client
 import json
 import logging
 import os
-import re
 import socket
 import socketserver
 import ssl
@@ -21,6 +20,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from .provider_contract import approved_tools
+from .job_identity import JOB_ID
 
 MODEL = "gpt-6.1-sol"
 MAX_REQUEST = 2 * 1024**2
@@ -28,7 +28,6 @@ MAX_RESPONSE = 16 * 1024**2
 MAX_REQUESTS = 32
 LEASE_SECONDS = 900
 MAX_JOB_BYTES = 64 * 1024**2
-JOB_ID = re.compile(r"A3JOB-[0-9]{8}-[a-f0-9]{32}")
 log = logging.getLogger('aee.broker')
 FIELDS = {"model", "instructions", "input", "tools", "tool_choice", "parallel_tool_calls",
           "reasoning", "text", "stream", "store", "include", "prompt_cache_key",

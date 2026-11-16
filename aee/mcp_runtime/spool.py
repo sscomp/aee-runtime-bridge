@@ -11,9 +11,9 @@ import stat
 import time
 
 from .store import JobError
+from .job_identity import JOB_ID as _JOB
 
 _ID = re.compile('[a-f0-9]{32}\\Z')
-_JOB = re.compile('A3JOB-[0-9]{8}-[a-f0-9]{32}\\Z')
 MAX_SPOOLS = 4096  # mandatory metadata/inode host safety ceiling
 
 

@@ -39,6 +39,92 @@ def classified_inventory():
             **{k:[] for k in c.INVENTORY_UNKNOWN},'unclassified_proc_count':0,
             'scope':c.INVENTORY_SCOPE,'global_consumer_exclusivity':'NOT_PROVEN'}
 
+class ActiveJobGuardTests(unittest.TestCase):
+    def setUp(self):
+        # -I excludes the checkout from sys.path. Only local fixture imports here.
+        repo = Path(__file__).resolve().parents[2]
+        with patch.object(sys, 'path', [str(repo), str(repo/'tests/mcp'), *sys.path]):
+            from aee.mcp_runtime.store import JobStore, JobError
+            from completed_result_fixtures import successful_fields
+        self.successful_fields = successful_fields
+        self.JobError = JobError
+        self.temp = tempfile.TemporaryDirectory(prefix='aee-r2a-job-guard-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.JobStore = JobStore
+
+    def record(self, prefix, status):
+        store = self.JobStore(self.root, job_id_prefix=prefix)
+        self.addCleanup(store.close)
+        with patch('aee.mcp_runtime.store.owner_identity', return_value={
+                'pid': 123, 'start_ticks': 'fixture', 'boot_id': 'fixture'}):
+            job = store.create('codex', 'synthetic guard fixture', str(self.root), 'read_only')
+        if status == 'completed':
+            store.update(job['job_id'], **self.successful_fields())
+        elif status != 'queued':
+            store.update(job['job_id'], status=status)
+        return self.root/(job['job_id']+'.json')
+
+    def test_active_jobs_in_each_supported_namespace_block(self):
+        for prefix in ('A3JOB', 'N2JOB', 'M2JOB', 'FUTURE42JOB'):
+            for status in ('queued', 'running'):
+                with self.subTest(prefix=prefix, status=status):
+                    self.root = Path(self.temp.name)/(prefix+'-'+status)
+                    path = self.record(prefix, status)
+                    before = path.read_bytes()
+                    with self.assertRaisesRegex(c.GateError, 'ACTIVE_JOBS'):
+                        c.inactive_job_files(self.root)
+                    self.assertEqual(path.read_bytes(), before)
+
+    def test_terminal_mixed_store_does_not_hide_active_m2_or_n2(self):
+        for prefix in ('M2JOB', 'N2JOB'):
+            with self.subTest(prefix=prefix):
+                self.root = Path(self.temp.name)/prefix
+                self.record('A3JOB', 'cancelled')
+                self.record('N2JOB' if prefix == 'M2JOB' else 'M2JOB', 'failed')
+                self.record(prefix, 'running')
+                with self.assertRaisesRegex(c.GateError, 'ACTIVE_JOBS'):
+                    c.inactive_job_files(self.root)
+
+    def test_terminal_records_and_archived_active_records_allow_guard(self):
+        paths = [self.record(prefix, status) for prefix, status in (
+            ('A3JOB', 'cancelled'), ('N2JOB', 'failed'), ('M2JOB', 'timed_out'),
+            ('FUTURE42JOB', 'completed'))]
+        active = self.record('FUTURE42JOB', 'running')
+        archive = self.root/'archive'; archive.mkdir()
+        active.rename(archive/active.name)
+        before = {p: p.read_bytes() for p in paths}
+        self.assertEqual(set(c.inactive_job_files(self.root)), set(paths))
+        self.assertEqual(before, {p: p.read_bytes() for p in paths})
+
+    def test_unrelated_and_alternate_extension_malicious_files_are_ignored(self):
+        for name in ('unrelated.json', 'N2JOB-..%2f..%2fescape.json.bak',
+                     'M2JOB-20261117-'+'a'*32+'.json.bak',
+                     'M2JOB-20261117-'+'a'*32+'.json\n'):
+            (self.root/name).write_text('invalid JSON')
+        self.assertEqual(c.inactive_job_files(self.root), [])
+
+    def test_scan_bound_still_fails_before_record_reads(self):
+        with patch.object(Path, 'glob', return_value=[self.root/'candidate.json']*10000), \
+                patch('aee.mcp_runtime.store.read_job_record') as read:
+            with self.assertRaisesRegex(c.GateError, 'JOB_SCAN_BOUND'):
+                c.inactive_job_files(self.root)
+            read.assert_not_called()
+
+    def test_malformed_candidates_and_valid_named_symlinks_fail_closed(self):
+        for name in ('N2JOB-malformed.json', 'M2JOB-20261117-'+'a'*32+'\n.json',
+                     'N2JOB-..\\escape.json'):
+            path = self.root/name; path.write_text('{}')
+            with self.assertRaises(self.JobError):
+                c.inactive_job_files(self.root)
+            path.unlink()
+        outside = self.root/'outside'; outside.write_text('not a job')
+        link = self.root/('M2JOB-20261117-'+'b'*32+'.json')
+        link.symlink_to(outside)
+        with self.assertRaises(self.JobError):
+            c.inactive_job_files(self.root)
+        self.assertEqual(outside.read_text(), 'not a job')
+
 class ProcStatTests(unittest.TestCase):
     def test_names_and_required_fields(self):
         for comm in ('normal','two words','a(b)c','a)b)c','a (b) c)','line\nbreak'):
