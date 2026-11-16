@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .result_contract import seal_record, verify_integrity, validate_success
+from .job_identity import JOB_ID as _JOB_ID, validate_job_id_prefix
 
 ACTIVE = {"queued", "running"}
 TERMINAL = {"completed", "failed", "timed_out", "cancelled"}
@@ -255,9 +256,6 @@ def owner_identity():
 # shares the exact production record contract with JobStore._read below - no
 # duplicate parser, no mutated expectations - while performing zero filesystem
 # writes of its own.
-_JOB_ID = re.compile(r"A3JOB-[0-9]{8}-[0-9a-f]{32}")
-
-
 def _job_record_path(root, job_id):
     if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
         raise JobError("JOB_NOT_FOUND", "Job not found")
@@ -384,7 +382,8 @@ def compact_adapter_terminal(record, fields):
 class JobStore:
     _REGISTRY_LOCK = ".registry.lock"
 
-    def __init__(self, root: Path, redact=lambda value: value):
+    def __init__(self, root: Path, redact=lambda value: value, *, job_id_prefix='A3JOB'):
+        self._job_id_prefix = validate_job_id_prefix(job_id_prefix)
         self._root = Path(root)
         if self._root.is_symlink():
             raise JobError("JOB_STORE_CORRUPT", "Job store cannot be a symlink")
@@ -532,8 +531,9 @@ class JobStore:
         return data
 
     def _records(self):
+        # Scan every namespace, including malformed candidates, across config changes.
         try:
-            return [self._read(p.stem) for p in sorted(self._root.glob("A3JOB-*.json"))]
+            return [self._read(p.stem) for p in sorted(self._root.glob("*JOB-*.json"))]
         except JobError as error:
             if error.code == "JOB_NOT_FOUND":
                 raise JobError("JOB_STORE_CORRUPT", "Registry contains an invalid job filename") from None
@@ -637,9 +637,8 @@ class JobStore:
             data, {'terminal_write_truncated': True,
                    'record_json_utf8_overflow_bytes': first_overflow})
 
-    @staticmethod
-    def _new_job_id():
-        return f"A3JOB-{datetime.now(timezone.utc):%Y%m%d}-{secrets.token_hex(16)}"
+    def _new_job_id(self):
+        return f"{self._job_id_prefix}-{datetime.now(timezone.utc):%Y%m%d}-{secrets.token_hex(16)}"
 
     def create(self, agent, task, working_directory, mode, execution=None):
         if agent not in AGENT_NAMES or mode not in DISPATCH_MODES:

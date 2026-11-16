@@ -4,15 +4,13 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 import tempfile
 from pathlib import Path
 
 from .packaging import safe_output
 from .store import JobStore, JobError, read_job_record, now, ACTIVE, TERMINAL
 from .result_contract import seal_record
-
-ID = re.compile(r'A3JOB-[0-9]{8}-[a-f0-9]{32}')
+from .job_identity import JOB_ID as ID
 
 
 def private_write(path,payload):
@@ -114,7 +112,7 @@ def rollback_copy(backup,destination,*,apply=False):
     manifest=json.loads((backup/'backup-manifest.json').read_text())
     records={}
     for name,digest in manifest['records'].items():
-        if not ID.fullmatch(Path(name).stem) or Path(name).name!=name:
+        if not name.endswith('.json') or not ID.fullmatch(name[:-5]):
             raise JobError('MIGRATION_INVALID','Invalid backup manifest path')
         p=backup/name
         if p.is_symlink() or hashlib.sha256(p.read_bytes()).hexdigest()!=digest:

@@ -708,7 +708,8 @@ def _validate_write_authorization(mode: str, metadata: object,
 
 class JobStore(_PersistentJobStore):
     def __init__(self, root: Path):
-        super().__init__(root, redact=redact)
+        super().__init__(root, redact=redact,
+                         job_id_prefix=os.getenv('AEE_JOB_ID_PREFIX', 'A3JOB'))
 
 
 JOB_STORE = JobStore(A3_JOB_STORE_DIR)
