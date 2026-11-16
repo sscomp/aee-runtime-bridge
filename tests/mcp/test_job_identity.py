@@ -58,6 +58,60 @@ class JobIdentity(unittest.TestCase):
         self.assertFalse(new_store.has_active())
         self.assertEqual(path.read_bytes(), original)
 
+    def listed_record(self, prefix, stamp):
+        store = self.store(prefix)
+        job = self.create(store)
+        store.update(job['job_id'], status='cancelled', error_code='EXECUTION_CANCELLED')
+        record = store._read(job['job_id'])
+        record['created_at'] = stamp
+        store._write(record)  # reseal the synthetic fixture, preserving reader validation
+        return job['job_id']
+
+    def test_list_ids_orders_mixed_prefixes_before_limit(self):
+        older = self.listed_record('N2JOB', '2026-11-17T01:00:00+00:00')
+        middle = self.listed_record('A3JOB', '2026-11-17T02:00:00Z')
+        newest = self.listed_record('M2JOB', '2026-11-17T12:00:00+08:00')
+        store = self.store()
+        self.assertEqual(store.list_ids(limit=1), [newest])
+        self.assertEqual(store.list_ids(), [newest, middle, older])
+        self.assertEqual(store.list_ids(limit=2), [newest, middle])
+        self.assertEqual(store.list_ids(limit=0), [])
+        self.assertEqual(store.list_ids(limit=-1), [])
+
+    def test_list_ids_equal_instants_use_descending_id_tiebreaker(self):
+        ids = [self.listed_record(prefix, stamp) for prefix, stamp in (
+            ('M2JOB', '2026-11-17T00:00:00Z'),
+            ('A3JOB', '2026-11-17T08:00:00+08:00'),
+            ('N2JOB', '2026-11-17T00:00:00+00:00'))]
+        self.assertEqual(self.store().list_ids(), sorted(ids, reverse=True))
+
+    def test_list_ids_invalid_or_naive_times_sort_oldest_without_rewriting(self):
+        ids = [self.listed_record(prefix, stamp) for prefix, stamp in (
+            ('N2JOB', ''), ('M2JOB', 'not-a-time'),
+            ('FUTURE42JOB', '2026-11-17T00:00:00'),
+            ('RANGEJOB', '0001-01-01T00:00:00+01:00'))]
+        valid = self.listed_record('A3JOB', '2026-11-17T00:00:00Z')
+        before = {p.name: p.read_bytes() for p in (self.root/'jobs').glob('*.json')}
+        self.assertEqual(self.store().list_ids(), [valid] + sorted(ids, reverse=True))
+        self.assertEqual(before, {p.name: p.read_bytes() for p in (self.root/'jobs').glob('*.json')})
+
+    def test_list_ids_retains_missing_timestamp_corruption_guard(self):
+        from aee.mcp_runtime.result_contract import seal_record
+        job_id = self.listed_record('A3JOB', '2026-11-17T00:00:00Z')
+        path = self.root/'jobs'/(job_id+'.json')
+        record = json.loads(path.read_text())
+        record.pop('created_at')
+        seal_record(record)
+        path.write_text(json.dumps(record))
+        with self.assertRaises(JobError) as error:
+            self.store().list_ids()
+        self.assertEqual(error.exception.code, 'JOB_STORE_CORRUPT')
+
+    def test_list_ids_keeps_fifty_record_cap_and_legacy_a3_chronology(self):
+        ids = [self.listed_record('A3JOB', f'2026-11-17T00:00:{second:02d}Z')
+               for second in range(52)]
+        self.assertEqual(self.store().list_ids(limit=100), ids[::-1][:50])
+
     def test_live_n2_lease_blocks_other_instances_then_restart_recovers(self):
         store = self.store('N2JOB')
         job = self.create(store)

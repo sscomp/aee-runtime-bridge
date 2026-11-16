@@ -26,6 +26,20 @@ an active job. Integrity verification, ownership and lease enforcement remain in
 place. Use the original complete ID when querying a record; changing the setting
 does not rename, alias or reseal terminal records.
 
+`list_ids` sorts the entire validated registry by `created_at`, newest first,
+then by full job ID descending for equal instants, before applying the requested
+limit (still capped at 50; nonpositive limits return an empty list). Timezone-aware
+ISO timestamps are normalized to UTC. Empty, unparseable, timezone-free or
+out-of-range timestamps fall back to `datetime.min` in UTC (oldest), with the
+same ID tiebreaker; no record is rewritten. Missing or non-string `created_at`
+still fails the existing record contract with `JOB_STORE_CORRUPT`.
+
+The retirement candidate uses the same `*JOB-*.json` live-registry scan and
+side-effect-free validated reader. Queued/running records in every valid
+namespace block `ACTIVE_JOBS`; malformed candidates and symlinks fail closed.
+Unrelated files, alternate extensions and nested archives are not live records.
+The scan bound and all existing retirement approval gates remain unchanged.
+
 Change generation settings only at a planned restart with no active worker.
 Restoring `AEE_JOB_ID_PREFIX=A3JOB` (or unsetting it) under this version still
 reads all existing namespaces. **Reverting the source to a pre-feature version

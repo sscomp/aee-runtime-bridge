@@ -278,6 +278,17 @@ def authorization(envelope_path,remaining=0,phase='signal'):
     verify_envelope(envelope,registry,local_scope(),datetime.now(timezone.utc),remaining,phase)
     return envelope['payload']
 
+def inactive_job_files(root):
+    """Inspect every namespace using the shared validated, no-follow reader.
+
+    Malformed *JOB-*.json candidates fail closed; archives/other files are ignored.
+    Never construct a JobStore, reconcile records or change approval gates.
+    """
+    from aee.mcp_runtime.store import read_job_record
+    files=list(Path(root).glob('*JOB-*.json'));need(len(files)<10000,'JOB_SCAN_BOUND')
+    need(all(read_job_record(f.parent,f.stem)['status'] not in ('queued','running') for f in files),'ACTIVE_JOBS')
+    return files
+
 def checks():
     need(sys.version_info[:2]==(3,11) and Path(sys.executable).resolve()==Path('/usr/bin/python3.11').resolve(),'USE_SYSTEM_PYTHON311')
     need(sys.dont_write_bytecode and sys.flags.isolated,'USE_ISOLATED_PYTHON311_I_B')
@@ -294,9 +305,7 @@ def checks():
     need(bool(key) and key==te['CONTROL_PLANE_API_KEY']==fe['CONTROL_PLANE_API_KEY'],'ROLLBACK_KEY_SOURCE_CHANGED')
     need(json.loads(fetch(FORMAL_PORT,'/api/status'))['control_plane_tunnel_id']==te['CONTROL_PLANE_TUNNEL_ID'],'TUNNEL_BINDING_CHANGED')
     sys.path.insert(0,str(ROOT))
-    from aee.mcp_runtime.store import read_job_record
-    files=list(Path(ge['A3_JOB_STORE_DIR']).glob('A3JOB-*.json'));need(len(files)<10000,'JOB_SCAN_BOUND')
-    need(all(read_job_record(f.parent,f.stem)['status'] not in ('queued','running') for f in files),'ACTIVE_JOBS')
+    files=inactive_job_files(ge['A3_JOB_STORE_DIR'])
     before=managed()
     for sample in range(2):
         healthy()

@@ -250,6 +250,22 @@ def owner_identity():
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
 
 
+def _record_sort_key(data):
+    """Chronological key; unparseable/naive times use datetime.min in UTC.
+
+    Record validation still rejects missing/non-string created_at fields.
+    Equal instants (including fallbacks) use the complete job ID as a tiebreaker.
+    """
+    try:
+        stamp = datetime.fromisoformat(data.get("created_at", ""))
+        if stamp.tzinfo is None:
+            raise ValueError("timezone required")
+        stamp = stamp.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        stamp = datetime.min.replace(tzinfo=timezone.utc)
+    return stamp, data["job_id"]
+
+
 # P3 Gate B1: one side-effect-free read path for sealed job records. JobStore
 # construction deliberately has write side effects (mkdir/chmod 0700, lock
 # files, reconcile); inspection callers must never reach it. This function
@@ -710,7 +726,10 @@ class JobStore:
 
     def list_ids(self, limit=50):
         with self._guard():
-            return [d["job_id"] for d in self._records()][-max(0, min(limit, 50)):][::-1] if limit > 0 else []
+            if limit <= 0:
+                return []
+            records = sorted(self._records(), key=_record_sort_key, reverse=True)
+            return [d["job_id"] for d in records[:min(limit, 50)]]
 
     def close(self):
         with self._lock:
