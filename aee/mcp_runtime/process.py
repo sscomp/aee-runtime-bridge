@@ -146,7 +146,7 @@ def run_bounded(argv, *, env, stdin=b"", limits=Limits(), cwd=None, on_start=Non
 
 
 def run_streamed(argv, *, env, stdin, budget, spool, parser, cwd=None,
-                 on_start=None, cancel_event=None, redact=lambda x: x):
+                 on_start=None, cancel_event=None, redact=lambda x: x, cwd_fd=None):
     """Generic-adapter runner. Legacy approved broker contract stays explicit."""
     if len(stdin) > 32000:
         raise JobError('INVALID_TASK', 'Task input exceeds byte limit')
@@ -163,9 +163,14 @@ def run_streamed(argv, *, env, stdin, budget, spool, parser, cwd=None,
         from pathlib import Path
         guarded = [sys.executable, str(Path(__file__).with_name('process_guard.py')),
                    str(os.getpid()), *argv]
+        fd_options = {}
+        if cwd_fd is not None:
+            guarded = guarded[:3] + ['--cwd-fd', str(cwd_fd), '--', *argv]
+            fd_options['pass_fds'] = (cwd_fd,)
+            cwd = None
         process = subprocess.Popen(guarded, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, env=env, cwd=cwd,
-                                   start_new_session=True, close_fds=True)
+                                   start_new_session=True, close_fds=True, **fd_options)
         if on_start:
             on_start(process.pid)
         for stream, name in ((process.stdout, 'stdout'), (process.stderr, 'stderr')):
