@@ -462,14 +462,14 @@ print(json.dumps({"type": "result",
         self.assertNotIn("--max-turns", argv)
 
     def test_registry_surface_unchanged(self):
-        """The four-adapter registry and codex/pi argv contracts are
-        untouched by the claude output-contract fix."""
+        """Registry and argv contracts, including the Codex document budget."""
         from aee.mcp_runtime.job_adapters import adapter_specs as adapter_specs_registry
         specs = adapter_specs_registry()
         self.assertEqual(set(specs), {"codex", "claude", "pi", "hermes"})
         self.assertEqual(
             specs["codex"].build_argv("/abs/work", "codex"),
             ["codex", "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+             "-c", "project_doc_max_bytes=65536",
              "--sandbox", "read-only", "--cd", "/abs/work", "-"])
         self.assertEqual(
             specs["pi"].build_argv("/abs/work", "pi"),
@@ -478,6 +478,26 @@ print(json.dumps({"type": "result",
              "--no-approve", "--tools", "read"])
         with self.assertRaises(NotImplementedError):
             specs["hermes"].build_argv("/abs/work", "hermes")
+
+    def test_codex_project_doc_budget_argv_all_modes(self):
+        """One bounded override preserves each mode's sandbox/cwd/stdin contract."""
+        from aee.mcp_runtime.job_adapters import adapter_specs
+        spec = adapter_specs()["codex"]
+        executable = "/synthetic/codex"
+        common = [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check"]
+        override = ["-c", "project_doc_max_bytes=65536"]
+        for mode, tail in (
+            ("read_only", override + ["--sandbox", "read-only", "--cd", "/abs/work", "-"]),
+            ("write", override + ["--sandbox", "workspace-write", "--cd", "/abs/work", "-"]),
+            ("autonomous", ["--dangerously-bypass-approvals-and-sandbox"]
+             + override + ["--cd", ".", "-"]),
+        ):
+            with self.subTest(mode=mode):
+                argv = spec.build_argv("/abs/work", executable, mode)
+                self.assertEqual(argv, common + tail)
+                self.assertEqual(argv.count("project_doc_max_bytes=65536"), 1)
+                self.assertEqual(argv.count("-c"), 1)
+                self.assertEqual(argv[argv.index("-c") + 1], override[1])
 
     def test_claude_single_object_final_json_completes(self):
         """The fixed argv shape: one final result JSON object completes with

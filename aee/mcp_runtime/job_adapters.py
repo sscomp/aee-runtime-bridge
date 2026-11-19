@@ -97,12 +97,16 @@ class _CodexAdapter(AdapterSpec):
         # `-` reads the task from stdin instead of argv. --ephemeral keeps
         # session files off disk; --json yields the parsed event stream the
         # gateway already understands.
+        # Codex 0.170.0 rejects combined instructions over its 32 KiB default.
+        # Bound this invocation to 64 KiB without changing operator config.
+        doc_limit = ["-c", "project_doc_max_bytes=65536"]
         if mode == "autonomous":
             return [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
-                    "--dangerously-bypass-approvals-and-sandbox", "--cd", ".", "-"]
+                    "--dangerously-bypass-approvals-and-sandbox", *doc_limit,
+                    "--cd", ".", "-"]
         sandbox = "workspace-write" if mode == "write" else "read-only"
         return [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
-                "--sandbox", sandbox, "--cd", working_directory, "-"]
+                *doc_limit, "--sandbox", sandbox, "--cd", working_directory, "-"]
 
 
 @_spec
