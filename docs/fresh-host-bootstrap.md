@@ -48,7 +48,8 @@ loopback ports 8790/8791 free, and an operator-provisioned OpenAI API key file
 6. **Config with no placeholders.** Render `/etc/aee/gateway-restricted.env` and
    `/etc/aee/broker.env` privately; every `<...>` filled; gateway lister stays
    `127.0.0.1:8791`; job store outside the tree. Exit condition: no placeholder
-   remains and mode is 0600 root-owned.
+   remains, mode is 0600 root-owned, and [Fresh Install Smoke](#fresh-install-smoke)
+   passes for the operator-approved job ID prefix.
 7. **Credential presentation.** For the per-0600-only broker policy, pick the
    LoadCredential route only if a live probe shows the broker user can read it;
    otherwise use the reviewed broker-owned 0600 file + `ExecStart=` drop-in.
@@ -80,3 +81,41 @@ loopback ports 8790/8791 free, and an operator-provisioned OpenAI API key file
 Failure semantics: any step's exit condition fails → stop, record the exact
 command and output category in the operator-run report, and do not proceed with
 workarounds that weaken validation, silence a negative test or alter a pin.
+
+## Fresh Install Smoke
+
+On either profile, put the operator-approved `AEE_JOB_ID_PREFIX` in the exact
+0600 gateway EnvironmentFile selected by the service. Confirm the service's
+unit and drop-ins leave that assignment effective. Choose the prefix from the
+approved host provisioning record. Valid examples are `M2JOB`, `A2JOB`,
+`A3JOB`, and `N2JOB`. The profile and hostname do not choose a prefix.
+
+From the reviewed source tree, run the following as an identity authorized to
+read the rendered env. Substitute the approved prefix independently of the
+file contents. For example, for a restricted host approved to use `N2JOB`:
+
+```sh
+python3 -B scripts/validate_profiles.py --profile restricted \
+  --env-path /etc/aee/gateway-restricted.env --expected-job-id-prefix N2JOB
+```
+
+For an os-native host approved to use `M2JOB`, with its user unit pointing to
+`$HOME/.config/aee/gateway.env`:
+
+```sh
+python3 -B scripts/validate_profiles.py --profile os-native \
+  --env-path "$HOME/.config/aee/gateway.env" --expected-job-id-prefix M2JOB
+```
+
+Use the examples' simple ASCII, LF-delimited `KEY=VALUE` format. Single-line
+quoted values are supported. Leave out `export` and backslash escapes. Exit 0
+(`PASS`) means the selected profile and
+explicit prefix match. Exit 1 (`FAIL`) covers file, permission, syntax, profile
+and prefix errors, including an omitted assignment even when `A3JOB` is
+expected. Exit 2 indicates incorrect command usage. Stop on any nonzero exit
+before the first real dispatch.
+
+This check reads configuration only and reports no env values. Live service
+behavior, sandbox qualification and completed-job evidence remain part of the
+later checklist steps. The regular installer still permits legacy files to omit
+the prefix, which preserves the gateway's `A3JOB` default.
