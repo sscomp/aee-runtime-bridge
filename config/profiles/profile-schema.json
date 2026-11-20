@@ -49,6 +49,11 @@
         ],
         "optional": [
           {
+            "name": "AEE_JOB_ID_PREFIX",
+            "placeholder": "<operator-job-id-prefix>",
+            "note": "Explicit operator value required by Fresh Install Smoke; omission on legacy installs defaults to A3JOB."
+          },
+          {
             "name": "AEE_TRUSTED_DISPATCH_POLICY",
             "placeholder": "<0600-policy-json-path>",
             "note": "required on this host for trusted write/autonomous admission; absence leaves write/autonomous subject to the legacy fail-closed gates"
@@ -201,7 +206,13 @@
             "fixed": true
           }
         ],
-        "optional": [],
+        "optional": [
+          {
+            "name": "AEE_JOB_ID_PREFIX",
+            "placeholder": "<operator-job-id-prefix>",
+            "note": "Explicit operator value required by Fresh Install Smoke; omission on legacy installs defaults to A3JOB."
+          }
+        ],
         "forbidden_defaults": []
       },
       "systemd": {

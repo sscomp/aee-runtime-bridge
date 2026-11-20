@@ -70,6 +70,11 @@ Values are parsed with systemd EnvironmentFile semantics (`export ` prefixes
 ignored, one wrapping quote level removed, inline `#` literal, last key
 wins), so a quoted placeholder cannot hide from these checks.
 
+Fresh hosts on either profile must explicitly provision `AEE_JOB_ID_PREFIX`
+and pass [Fresh Install Smoke](fresh-host-bootstrap.md#fresh-install-smoke)
+before the first dispatch. Legacy env files can omit this key and retain the
+`A3JOB` default.
+
 ## Adapter provisioning (`A3_ADAPTER_<NAME>_BIN`)
 
 Adapter discovery per agent (`claude`, `codex`, `hermes`, `pi`) resolves, in

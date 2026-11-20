@@ -2,21 +2,35 @@
 """Validate AEE deployment profile env files against the profile schema contract.
 
 Schema: config/profiles/profile-schema.json (aee-deployment-profile-schema-v1).
-Used three ways:
+Used four ways:
   1. CI / local check: validate the shipped example files (no arguments).
   2. Installer preflight: validate an operator env file for a profile.
   3. Trusted-dispatch onboarding: confirm the profile file stays schema-clean.
+  4. Fresh Install Smoke: check the explicitly provisioned job ID prefix offline.
 
 Secret VALUES must never appear here or in any example/provisioned artifact:
 real values live only in operator-owned 0600 files on the target host.
 """
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from aee.mcp_runtime.job_identity import validate_job_id_prefix  # noqa: E402
+
 SCHEMA_PATH = ROOT / 'config' / 'profiles' / 'profile-schema.json'
+PREFIX_KEY = 'AEE_JOB_ID_PREFIX'
+# The smoke accepts the simple, single-line EnvironmentFile syntax used by the
+# examples. Reject shell syntax, escapes and multiline quoting before parse_env
+# can mistake an ignored or continued assignment for an effective setting.
+SIMPLE_ASSIGNMENT = re.compile(
+    r"""[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*(?:"[^"]*"|'[^']*'|[^'"]*)[ \t]*"""
+)
 EXAMPLES = {
     'os-native': ROOT / 'config' / 'profiles' / 'os-native.env.example',
     'restricted': ROOT / 'config' / 'profiles' / 'restricted.env.example',
@@ -117,6 +131,15 @@ def validate_fields(fields, profile, *, source='example'):
         elif not _placeholder_ok(value, item):
             errors.append(f'{profile}/{source}: {name} must keep its '
                           f'{prefix}... placeholder')
+    if PREFIX_KEY in fields:
+        if operator_env:
+            try:
+                validate_job_id_prefix(fields[PREFIX_KEY])
+            except ValueError as exc:
+                errors.append(f'{profile}/{source}: {PREFIX_KEY} invalid ({exc})')
+        elif not fields[PREFIX_KEY].startswith(prefix):
+            errors.append(f'{profile}/{source}: {PREFIX_KEY} must keep its '
+                          f'{prefix}... placeholder')
     # Secret-bearing keys: in shipped/staged artifacts never allow real values;
     # in operator env files they must exist as real provisioned values.
     for name, value in fields.items():
@@ -150,6 +173,51 @@ def validate_env_path(path, profile):
     return validate_fields(fields, profile, source='operator-env')
 
 
+def check_fresh_install(path, profile, expected_prefix):
+    """Validate private gateway configuration without loading it into the process."""
+    try:
+        validate_job_id_prefix(expected_prefix)
+    except ValueError:
+        return ['expected job ID prefix is invalid']
+
+    try:
+        # Nonblocking open also lets us reject a FIFO without waiting for a writer.
+        with open(Path(path).expanduser(), encoding='utf-8', newline='\n',
+                  opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as env_file:
+            mode = os.fstat(env_file.fileno()).st_mode
+            if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+                return ['gateway env must be a regular file with mode 0600']
+            contents = env_file.read()
+    except (OSError, ValueError):
+        return ['gateway env could not be read']
+
+    # An escaped newline in a comment can hide the next assignment on older
+    # systemd releases. Reject backslashes before discarding comments.
+    if '\\' in contents or not re.fullmatch(r'[\t\n\x20-\x7e]*', contents):
+        return ['gateway env must use ASCII, LF and single-line KEY=VALUE assignments without escapes']
+    lines = [line.strip() for line in contents.split('\n')]
+    assignments = [line for line in lines if line and not line.startswith(('#', ';'))]
+    if any(not SIMPLE_ASSIGNMENT.fullmatch(line) for line in assignments):
+        return ['gateway env must use single-line KEY=VALUE assignments without export or escapes']
+    fields = parse_env('\n'.join(assignments))
+
+    if PREFIX_KEY not in fields:
+        return [f'{PREFIX_KEY} must be explicitly provisioned']
+    actual_prefix = fields[PREFIX_KEY]
+    if actual_prefix.startswith(load_placeholder_prefix()):
+        return [f'{PREFIX_KEY} still carries a placeholder']
+    try:
+        validate_job_id_prefix(actual_prefix)
+    except ValueError as exc:
+        return [f'{PREFIX_KEY} invalid ({exc})']
+    if actual_prefix != expected_prefix:
+        return [f'{PREFIX_KEY} does not match the expected prefix']
+    if validate_fields(fields, profile, source='operator-env'):
+        # Legacy diagnostics can include raw values. Keep smoke output redacted.
+        return ['gateway env failed deployment profile validation']
+    return []
+
+
 def validate_examples():
     errors = []
     for profile, path in EXAMPLES.items():
@@ -181,8 +249,14 @@ def main():
     parser.add_argument('--env-path', help='operator env file to validate')
     parser.add_argument('--profile', choices=sorted(EXAMPLES),
                         help='profile to validate against (with --env-path)')
+    parser.add_argument('--expected-job-id-prefix',
+                        help='run the offline Fresh Install Smoke against a 0600 gateway env')
     args = parser.parse_args()
-    if args.env_path:
+    if args.expected_job_id_prefix is not None:
+        if not args.env_path or not args.profile:
+            parser.error('--expected-job-id-prefix requires --env-path and --profile')
+        errors = check_fresh_install(args.env_path, args.profile, args.expected_job_id_prefix)
+    elif args.env_path:
         errors = validate_env_path(args.env_path, args.profile or 'os-native')
     else:
         errors = validate_examples()

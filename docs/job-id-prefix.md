@@ -2,7 +2,10 @@
 
 `AEE_JOB_ID_PREFIX` controls newly generated gateway job IDs. When unset it
 remains `A3JOB`. For example, operators may explicitly choose `M2JOB` or
-`N2JOB`; no hostname or deployment profile is consulted. The lower-level
+`N2JOB`; `A2JOB` and `A3JOB` are valid explicit choices too. No hostname or
+deployment profile is consulted. Fresh-host operators provision the prefix in
+the gateway's private env file and run [Fresh Install Smoke](fresh-host-bootstrap.md#fresh-install-smoke)
+with the approved expected prefix before the first dispatch. The lower-level
 `JobStore` accepts the same value as its keyword-only `job_id_prefix`
 argument and defaults to `A3JOB` independently of the environment.
 
