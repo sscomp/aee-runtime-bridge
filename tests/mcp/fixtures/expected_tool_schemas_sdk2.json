@@ -1,0 +1,203 @@
+{
+  "base_commit": "32171273d448bf8be18d7c92f3bee4958f1a5ee9",
+  "mcp": "2.3.0",
+  "note": "SDK-2 era tool surface snapshot (parameters+signatures) captured from the patched gateway under mcp 2.3.0; base-commit gateway cannot import under mcp 2.x (fastmcp removed). Drift detector for the 2.x runtime.",
+  "tools": {
+    "aee_status": {
+      "parameters": {
+        "properties": {},
+        "title": "aee_statusArguments",
+        "type": "object"
+      },
+      "signature": "() -> 'str'"
+    },
+    "aee_agents": {
+      "parameters": {
+        "properties": {},
+        "title": "aee_agentsArguments",
+        "type": "object"
+      },
+      "signature": "() -> 'str'"
+    },
+    "aee_dispatch": {
+      "parameters": {
+        "properties": {
+          "agent": {
+            "title": "Agent",
+            "type": "string"
+          },
+          "working_directory": {
+            "title": "Working Directory",
+            "type": "string"
+          },
+          "task": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Task"
+          },
+          "mode": {
+            "default": "read_only",
+            "enum": [
+              "read_only",
+              "write",
+              "autonomous"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Prompt"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Metadata"
+          },
+          "execution_profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Execution Profile"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
+          }
+        },
+        "required": [
+          "agent",
+          "working_directory"
+        ],
+        "title": "aee_dispatchArguments",
+        "type": "object"
+      },
+      "signature": "(agent: 'str', working_directory: 'str', task: 'Optional[str]' = None, mode: \"Literal['read_only', 'write', 'autonomous']\" = 'read_only', prompt: 'Optional[str]' = None, metadata: 'Optional[dict]' = None, execution_profile: 'Optional[str]' = None, model: 'Optional[str]' = None, reasoning_effort: 'Optional[str]' = None) -> 'str'"
+    },
+    "aee_job_status": {
+      "parameters": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "aee_job_statusArguments",
+        "type": "object"
+      },
+      "signature": "(job_id: 'str') -> 'str'"
+    },
+    "aee_job_result": {
+      "parameters": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "aee_job_resultArguments",
+        "type": "object"
+      },
+      "signature": "(job_id: 'str') -> 'str'"
+    },
+    "aee_job_cancel": {
+      "parameters": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "aee_job_cancelArguments",
+        "type": "object"
+      },
+      "signature": "(job_id: 'str') -> 'str'"
+    },
+    "aee_exec": {
+      "parameters": {
+        "properties": {
+          "command": {
+            "title": "Command",
+            "type": "string"
+          },
+          "cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cwd"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "title": "aee_execArguments",
+        "type": "object"
+      },
+      "signature": "(command: 'str', cwd: 'Optional[str]' = None) -> 'str'"
+    }
+  }
+}

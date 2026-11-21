@@ -169,7 +169,7 @@ class TrustedSecurity(unittest.TestCase):
         self.g._apply_tool_exposure_filter()
         secure_mcp_transport.set(None)
         async def run():
-            app=self.g._build_auth_middleware(self.g.mcp.streamable_http_app())
+            app=self.g._build_auth_middleware(self.g.mcp.streamable_http_app(**getattr(self.g, '_STREAMABLE_APP_KWARGS', {})))
             async with self.g.mcp.session_manager.run():
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://127.0.0.1:8791') as client:
                     for mode in ['write','autonomous']:

@@ -1,5 +1,8 @@
 # Exact installed A3 versions captured on 2026-10-03.
 # Resolver applies only packages reachable from requirements-mcp.in.
+# 2026-10-21: mcp/mcp-types bumped to 2.3.0 (dual-era protocol; the only
+# upstream line serving both the legacy handshake and the 2026-07-28
+# per-request envelope) — see the remediation WO for the isolated matrix.
 PyJWT==2.15.1
 annotated-types==0.8.0
 anyio==4.15.1
@@ -17,8 +20,8 @@ httpx2==2.13.1
 idna==3.20
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
-mcp==1.30.0
-mcp-types==2.2.0
+mcp==2.3.0
+mcp-types==2.3.0
 opentelemetry-api==1.45.0
 pycparser==3.0
 pydantic==2.13.5
