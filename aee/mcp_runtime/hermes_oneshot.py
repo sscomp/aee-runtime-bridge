@@ -15,6 +15,12 @@ import threading
 
 VERSION = 'hermes-aee-oneshot 1'
 
+_READ_FILE_NO_PROGRESS_WARNING = re.compile(
+    r'(?<=\})\n\n\[Tool loop warning: idempotent_no_progress_warning; count=([1-9][0-9]*); '
+    r'read_file returned the same result \1 times\. Use the result already provided '
+    r'or change the query instead of repeating it unchanged\.\]\Z'
+)
+
 
 def _json_fields(pairs):
     fields = dict(pairs)
@@ -68,16 +74,27 @@ def _read_file_page(value):
 
 
 def tool_failed(value, *, tool_name=None):
+    has_warning = False
     if isinstance(value, str):
-        value = value.strip()
-        if not value or value == 'null' or value.startswith(
+        stripped = value.strip()
+        if not stripped or stripped == 'null' or stripped.startswith(
             ('Error executing tool ', '[Tool execution cancelled')
         ):
             return True
-        if not value.startswith(('{', '[')):
-            return False  # Nonblank plain-text tool output.
+        if not stripped.startswith(('{', '[')):
+            return tool_name == 'read_file' and (
+                stripped.lower().startswith(
+                    'hermes note: this result is byte-identical to the read_file result earlier this turn.'
+                )
+                or '\n\n[Tool loop warning: ' in stripped
+                or '\n\n[Tool loop hard stop: ' in stripped
+            )
+        # Match against the original text so trailing whitespace cannot hide a malformed suffix.
+        warning = _READ_FILE_NO_PROGRESS_WARNING.search(value) if tool_name == 'read_file' else None
+        has_warning = warning is not None
+        payload = value[:warning.start()] if warning is not None else stripped
         try:
-            value = json.loads(value, object_pairs_hook=_json_fields,
+            value = json.loads(payload, object_pairs_hook=_json_fields,
                                parse_constant=_invalid_json_constant)
         except (ValueError, RecursionError):
             return True
@@ -91,8 +108,11 @@ def tool_failed(value, *, tool_name=None):
     if any(key in value and (type(value[key]) is not int or value[key] != 0)
            for key in ('exit_code', 'returncode')):
         return True
+    if (tool_name == 'read_file' and value.get('status') == 'unchanged'
+            and value.get('dedup') is True and value.get('content_returned') is False):
+        return True
     truncated = value.get('truncated', False)
-    return truncated is not False and not (
+    return (has_warning or truncated is not False) and not (
         truncated is True and tool_name == 'read_file' and _read_file_page(value)
     )
 

@@ -19,6 +19,13 @@ from aee.mcp_runtime.job_adapters import (
 from aee.mcp_runtime.store import JobError
 
 
+READ_FILE_NO_PROGRESS_WARNING = (
+    '\n\n[Tool loop warning: idempotent_no_progress_warning; count=3; '
+    'read_file returned the same result 3 times. Use the result already provided '
+    'or change the query instead of repeating it unchanged.]'
+)
+
+
 def read_file_page(**fields):
     return {
         'content': '2|alpha\n3|beta',
@@ -157,6 +164,73 @@ class HermesOneshot(unittest.TestCase):
                 self.assertEqual(code, 1)
                 with self.assertRaises(JobError):
                     parser.result()
+
+    def execute_raw_read_file_result(self, result):
+        args = {'path': 'synthetic.txt', 'offset': 2, 'limit': 2}
+        return self.execute(callback_events=[
+            ('start', ('page', 'read_file', args)),
+            ('complete', ('page', 'read_file', args, result)),
+        ])
+
+    def test_read_file_complete_page_accepts_exact_no_progress_warning_suffix(self):
+        result = json.dumps(read_file_page()) + READ_FILE_NO_PROGRESS_WARNING
+        code, parser, _ = self.execute_raw_read_file_result(result)
+        self.assertEqual(code, 0)
+        self.assertEqual(parser.result(), 'verified final')
+        self.assertEqual(parser.tool_evidence()['tools_completed'], 1)
+
+    def test_read_file_json_dedup_stub_requires_prior_page_evidence(self):
+        result = json.dumps({
+            'status': 'unchanged',
+            'message': (
+                'File unchanged since last read. The content from the earlier read_file result '
+                'in this conversation is still current — refer to that instead of re-reading.'
+            ),
+            'path': 'synthetic.txt',
+            'dedup': True,
+            'content_returned': False,
+        })
+        code, parser, _ = self.execute_raw_read_file_result(result)
+        self.assertEqual(code, 1)
+        with self.assertRaises(JobError):
+            parser.result()
+
+    def test_read_file_plaintext_byte_identical_reference_requires_prior_page_evidence(self):
+        note = (
+            'hermes note: this result is byte-identical to the read_file result earlier this turn. '
+            'Refer to that result; it has not changed. Args: {"limit":2,"offset":2,"path":"synthetic.txt"}'
+        )
+        for result in (f'[{note}]', note):
+            with self.subTest(result=result):
+                code, parser, _ = self.execute_raw_read_file_result(result)
+                self.assertEqual(code, 1)
+                with self.assertRaises(JobError):
+                    parser.result()
+
+    def test_read_file_explicit_error_with_no_progress_warning_suffix_remains_failure(self):
+        result = json.dumps({'error': 'Permission denied'}) + READ_FILE_NO_PROGRESS_WARNING
+        code, parser, _ = self.execute_raw_read_file_result(result)
+        self.assertEqual(code, 1)
+        with self.assertRaises(JobError):
+            parser.result()
+
+    def test_read_file_hard_stop_with_complete_page_remains_failure(self):
+        result = json.dumps(read_file_page()) + (
+            '\n\n[Tool loop hard stop: identical_call_streak_halt; count=5; '
+            'Stopped read_file: the same call with identical arguments returned the same result '
+            '5 times in a row. Stop repeating it unchanged; use the result already provided or change strategy.]'
+        )
+        code, parser, _ = self.execute_raw_read_file_result(result)
+        self.assertEqual(code, 1)
+        with self.assertRaises(JobError):
+            parser.result()
+
+    def test_read_file_cancellation_remains_failure(self):
+        result = '[Tool execution cancelled — read_file was skipped due to user interrupt]'
+        code, parser, _ = self.execute_raw_read_file_result(result)
+        self.assertEqual(code, 1)
+        with self.assertRaises(JobError):
+            parser.result()
 
     def test_absent_malformed_and_truncated_tool_results_fail(self):
         values = (None, [], 0, {}, '', '  ', 'null', '[1]', '{"exit_code":',
