@@ -407,6 +407,24 @@ def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str
                       if authorization.get('schema') == PROOF and mode != 'autonomous'
                       else working_directory)
     argv = spec.build_argv(native_workdir, executable, mode)
+    # A headless CLI can inherit connected AEE apps. Establish its worker
+    # role explicitly so a vague smoke-test title cannot trigger a recursive
+    # dispatch into its own single-active-job lease. Keep the admitted task
+    # unchanged in the store and authorization proof; this fixed context is
+    # a separately recorded part of the executor's input contract.
+    worker_context = {'schema': 'aee-local-worker-v1', 'mode': mode,
+                      'working_directory': authorization.get('working_directory', working_directory)}
+    execution['worker_context'] = worker_context
+    worker_prefix = (
+        'AEE local worker context: ' + json.dumps(worker_context) + '\n'
+        'You are already executing this dispatched job on the target host. '
+        'Carry out its instructions directly with local tools in the working directory. '
+        'Do not redispatch this job through an AEE gateway or use AEE to test your own transport. '
+        'Honor the task permissions and acceptance checks. If concrete instructions are missing, '
+        'report what is missing; do not search other hosts for an unspecified test.\n\n'
+        'Dispatched task:\n'
+    ).encode('utf-8')
+    task_input = task.encode('utf-8')
     if budget is not None:
         if spool is None:
             raise JobError('SPOOL_BOUNDARY', 'Durable spool required for budget execution')
@@ -436,7 +454,8 @@ def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str
                         ('Uid:', 'Gid:', 'Groups:', 'CapEff:', 'NoNewPrivs:'))]}
         parser = EventParser(spec.name, budget.result_inline_bytes, budget.memory_capture_bytes)
         cwd_options = {'cwd_fd': cwd_fd} if cwd_fd is not None else {}
-        completed = run_streamed(argv, env=env, stdin=task.encode('utf-8'), on_start=on_start,
+        completed = run_streamed(argv, env=env, stdin=task_input, stdin_prefix=worker_prefix,
+                                 on_start=on_start,
                                  budget=budget, spool=spool, parser=parser,
                                  cwd=working_directory, cancel_event=cancel_event, redact=redact,
                                  **cwd_options)
@@ -449,7 +468,7 @@ def _execute_adapter_job(spec: AdapterSpec, executable: str, execution: Dict[str
         return {'summary': completed.final,
                 'log_excerpt': completed.streaming['streams']['stderr']['tail'][:limits.log_chars],
                 'exit_code': completed.returncode, 'streaming': completed.streaming}
-    completed = run_bounded(argv, env=env, stdin=task.encode("utf-8"),
+    completed = run_bounded(argv, env=env, stdin=task_input, stdin_prefix=worker_prefix,
                             limits=limits, cwd=working_directory,
                             cancel_event=cancel_event)
     stdout = completed.stdout.decode("utf-8", "replace")
