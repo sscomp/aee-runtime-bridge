@@ -1,0 +1,7 @@
+{
+  "enabled": false,
+  "hermes_bin": "/absolute/path/to/hermes",
+  "hermes_home": "/absolute/path/to/.hermes",
+  "target": "telegram",
+  "enabled_at": "2026-11-13T00:00:00Z"
+}

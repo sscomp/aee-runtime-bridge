@@ -1615,6 +1615,8 @@ def main() -> None:
         async def startup(self, sockets=None):
             await super().startup(sockets=sockets)
             if self.started:
+                from aee.mcp_runtime.job_notifications import start_job_notifier
+                self.job_notifier = start_job_notifier(JOB_STORE._root)
                 from aee.mcp_runtime.readiness import notify
                 notify("READY=1")
 
@@ -1642,7 +1644,12 @@ def main() -> None:
         AEE_MCP_HOST,
         AEE_MCP_PORT,
     )
-    server.run()
+    try:
+        server.run()
+    finally:
+        notifier = getattr(server, 'job_notifier', None)
+        if notifier is not None:
+            notifier.stop()
 
 
 if __name__ == "__main__":
