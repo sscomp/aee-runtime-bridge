@@ -1,4 +1,13 @@
 # A3 MCP gateway direct dependencies, captured from the working deployment.
 # Separate from the legacy FastAPI bridge requirements; do not sync its venv.
-mcp==1.30.0
+# mcp==2.x: dual-era protocol support (initialize handshake + 2026-07-28
+# per-request envelope) — required by the OpenAI Secure MCP Tunnel product
+# clients; validated by WO ABACUS_AEE_V2_MCP_SDK_PROTOCOL_COMPATIBILITY_REMEDIATION.
+mcp==2.3.0
+# httpx (1.x line) stays in the mcp closure: tests/mcp (ASGI in-memory battery
+# harness) and aee/adapters/hermes_adapter.py still import it, and CI builds
+# the mcp-runtime env from requirements-mcp.lock alone (mcp 2.x vendored its
+# HTTP transport as httpx2 and no longer pulls httpx itself). Pin keeps the
+# 1.x-era version shared with requirements-dev.
+httpx==0.28.1
 uvicorn==0.54.0
