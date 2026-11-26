@@ -76,9 +76,12 @@ class TerminalNotifications(unittest.TestCase):
         JobNotifier(self.root, future, sender=self.sender).poll_once()
         self.sender.assert_not_called()
 
-    def test_explicit_failures_retry_with_backoff_and_stop_after_three(self):
+    def test_launch_failure_retries_with_backoff_and_stops_after_three(self):
         record = self.terminal('failed')
-        self.sender.return_value = {'state': 'failed', 'error_code': 'HERMES_UNAVAILABLE'}
+        with patch('subprocess.Popen', side_effect=FileNotFoundError):
+            result = send_hermes(self.config, 'safe')
+        self.assertEqual(result, {'state': 'failed', 'error_code': 'HERMES_START_FAILED'})
+        self.sender.return_value = result
         clock = Mock(return_value=1000)
         notifier = self.notifier(clock=clock)
         notifier.poll_once()
@@ -104,15 +107,33 @@ class TerminalNotifications(unittest.TestCase):
         self.sender.assert_not_called()
         self.assertEqual(self.receipt(record)['state'], 'unknown')
 
-    def test_delivery_recovers_after_restart_and_explicit_failure(self):
+    def test_delivery_recovers_after_restart_and_launch_failure(self):
         record = self.terminal('failed')
-        self.sender.return_value = {'state': 'failed', 'error_code': 'HERMES_UNAVAILABLE'}
+        self.sender.return_value = {'state': 'failed', 'error_code': 'HERMES_START_FAILED'}
         self.notifier(clock=lambda: 1000).poll_once()
         self.sender.return_value = {'state': 'sent', 'message_id': '1234'}
         self.notifier(clock=lambda: 1060).poll_once()
         self.notifier(clock=lambda: 2000).poll_once()
         self.assertEqual(self.sender.call_count, 2)
         self.assertEqual(self.receipt(record)['state'], 'sent')
+
+    def test_legacy_failed_receipt_stops_automatic_retries(self):
+        notifier = self.notifier(clock=lambda: 1000)
+        notifier.state_dir.mkdir(mode=0o700)
+        for code in ('HERMES_CLI_FAILED', 'HERMES_UNAVAILABLE'):
+            with self.subTest(code=code):
+                record = self.terminal('failed')
+                notifier._write(notifier.state_dir / (record['job_id'] + '.json'), {
+                    'job_id': record['job_id'], 'state': 'failed', 'attempts': 1,
+                    'error_code': code, 'next_attempt_at': 1,
+                })
+                notifier.poll_once()
+                self.sender.assert_not_called()
+                receipt = self.receipt(record)
+                self.assertEqual(receipt['state'], 'unknown')
+                self.assertEqual(receipt['attempts'], 1)
+                self.assertEqual(receipt['error_code'], code)
+                self.assertNotIn('next_attempt_at', receipt)
 
     def test_tampered_job_or_receipt_cannot_trigger_delivery(self):
         record = self.terminal('failed')
@@ -173,13 +194,38 @@ class TerminalNotifications(unittest.TestCase):
         with patch('subprocess.Popen', return_value=proc):
             self.assertEqual(send_hermes(self.config, 'safe')['state'], 'unknown')
 
-    def test_timeout_kills_sender_and_does_not_auto_retry(self):
-        record = self.terminal('timed_out')
-        proc = Mock(pid=123, returncode=-9)
-        proc.communicate.side_effect = [subprocess.TimeoutExpired('hermes', 30), ('', '')]
+    def test_nonzero_exit_has_an_uncertain_receipt_and_does_not_retry(self):
+        record = self.terminal('failed')
+        proc = Mock(returncode=1)
+        proc.communicate.return_value = ('', 'receipt connection closed')
+        notifier = JobNotifier(self.root, self.config, clock=lambda: 1000)
+        with patch('subprocess.Popen', return_value=proc) as popen:
+            notifier.poll_once()
+            notifier.clock = lambda: 2000
+            notifier.poll_once()
+        popen.assert_called_once()
+        receipt = self.receipt(record)
+        self.assertEqual(receipt['state'], 'unknown')
+        self.assertEqual(receipt['error_code'], 'HERMES_CLI_FAILED')
+        self.assertNotIn('next_attempt_at', receipt)
+
+    def test_io_error_after_start_is_uncertain(self):
+        proc = Mock(pid=123, returncode=None)
+        proc.communicate.side_effect = OSError('pipe read failed')
         with patch('subprocess.Popen', return_value=proc), patch('os.killpg') as kill:
             result = send_hermes(self.config, 'safe')
         kill.assert_called_once()
+        proc.wait.assert_called_once_with(timeout=5)
+        self.assertEqual(result, {'state': 'unknown', 'error_code': 'DELIVERY_IO_FAILED'})
+
+    def test_timeout_kills_sender_and_does_not_auto_retry(self):
+        record = self.terminal('timed_out')
+        proc = Mock(pid=123, returncode=-9)
+        proc.communicate.side_effect = subprocess.TimeoutExpired('hermes', 30)
+        with patch('subprocess.Popen', return_value=proc), patch('os.killpg') as kill:
+            result = send_hermes(self.config, 'safe')
+        kill.assert_called_once()
+        proc.wait.assert_called_once_with(timeout=5)
         self.assertEqual(result['state'], 'unknown')
         self.sender.return_value = result
         self.notifier().poll_once()

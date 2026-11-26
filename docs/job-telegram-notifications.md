@@ -48,13 +48,14 @@ Receipts live in `<job-store>/notifications/<job-id>.json`, with directory mode
 The outbox is protected by a cross-process lock and durable atomic writes.
 Restarting the gateway preserves sent receipts and skips duplicate sends.
 
-Known CLI failures retry at most three attempts, after 60 then 300 seconds.
-Network/CLI acknowledgement loss can still cause duplicates on retry; Telegram
-does not provide an idempotency key for this operation. A 30-second transport
-timeout, malformed/missing acknowledgement, or restart during `sending` is
-instead recorded as `unknown` and **not** resent automatically. Check the
-Telegram conversation before an operator deliberately retries an uncertain
-send. A failed notification never changes the Job's terminal status.
+Only a failure to start the Hermes process is eligible for retries. The
+notifier makes at most three attempts, with delays of 60 and 300 seconds.
+A nonzero CLI exit, 30-second transport timeout, I/O error, missing or
+unusable acknowledgement, or restart during `sending` is recorded as
+`unknown` and stops automatic retries. On read, the notifier also marks older
+failed receipts as `unknown` when they lack a confirmed launch failure. Check
+the Telegram conversation before retrying an uncertain send. The notification
+has a delivery status independent of the Job's terminal status.
 
 The shared `aee._notification_guard` suppresses both the poller and transport
 in verification contexts. Automated tests use temporary stores and mocked

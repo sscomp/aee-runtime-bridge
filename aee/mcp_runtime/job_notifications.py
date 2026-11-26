@@ -100,39 +100,42 @@ def send_hermes(config, body):
     # AEE/model credentials or Telegram overrides from the executor environment.
     env = {k: os.environ[k] for k in ('HOME', 'PATH', 'LANG', 'LC_ALL', 'TMPDIR') if k in os.environ}
     env['HERMES_HOME'] = config.hermes_home
-    process = None
     try:
         process = subprocess.Popen(
             [config.hermes_bin, 'send', '--to', config.target, '--file', '-', '--json'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=env, start_new_session=True,
         )
-        try:
-            stdout, _ = process.communicate(body, timeout=30)
-        except subprocess.TimeoutExpired:
+    except OSError:
+        return {'state': 'failed', 'error_code': 'HERMES_START_FAILED'}
+
+    # Once the CLI starts, a local failure can mean the receipt was lost
+    # after Telegram accepted the notification.
+    try:
+        stdout, _ = process.communicate(body, timeout=30)
+    except (subprocess.TimeoutExpired, OSError, UnicodeError) as error:
+        timed_out = isinstance(error, subprocess.TimeoutExpired)
+        if timed_out or process.returncode is None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            process.communicate()
-            # Telegram has no idempotency key: a lost acknowledgement may
-            # still mean delivered. Never automatically resend an uncertain send.
-            return {'state': 'unknown', 'error_code': 'DELIVERY_TIMEOUT'}
-        if process.returncode:
-            return {'state': 'failed', 'error_code': 'HERMES_CLI_FAILED'}
-        try:
-            payload = json.loads(stdout)
-        except (ValueError, TypeError):
-            return {'state': 'unknown', 'error_code': 'INVALID_DELIVERY_RECEIPT'}
-        message_id = payload.get('message_id') if isinstance(payload, dict) else None
-        if (isinstance(payload, dict) and payload.get('success') is True
-                and not payload.get('error') and not payload.get('skipped')
-                and isinstance(message_id, (str, int)) and not isinstance(message_id, bool)
-                and re.fullmatch(r'[0-9]{1,30}', str(message_id))):
-            return {'state': 'sent', 'message_id': str(message_id)}
-        return {'state': 'unknown', 'error_code': 'UNCONFIRMED_DELIVERY'}
-    except OSError:
-        return {'state': 'failed', 'error_code': 'HERMES_UNAVAILABLE'}
+            process.wait(timeout=5)
+        code = 'DELIVERY_TIMEOUT' if timed_out else 'DELIVERY_IO_FAILED'
+        return {'state': 'unknown', 'error_code': code}
+    if process.returncode:
+        return {'state': 'unknown', 'error_code': 'HERMES_CLI_FAILED'}
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, TypeError):
+        return {'state': 'unknown', 'error_code': 'INVALID_DELIVERY_RECEIPT'}
+    message_id = payload.get('message_id') if isinstance(payload, dict) else None
+    if (isinstance(payload, dict) and payload.get('success') is True
+            and not payload.get('error') and not payload.get('skipped')
+            and isinstance(message_id, (str, int)) and not isinstance(message_id, bool)
+            and re.fullmatch(r'[0-9]{1,30}', str(message_id))):
+        return {'state': 'sent', 'message_id': str(message_id)}
+    return {'state': 'unknown', 'error_code': 'UNCONFIRMED_DELIVERY'}
 
 
 class JobNotifier:
@@ -179,6 +182,11 @@ class JobNotifier:
             return
         if state == 'sending':
             self._write(path, {**previous, 'state': 'unknown', 'error_code': 'DELIVERY_INTERRUPTED'})
+            return
+        if state == 'failed' and previous.get('error_code') != 'HERMES_START_FAILED':
+            # Older receipts did not distinguish launch and post-launch errors.
+            previous.pop('next_attempt_at', None)
+            self._write(path, {**previous, 'state': 'unknown', 'updated_at': self.clock()})
             return
         attempts = previous.get('attempts', 0)
         if type(attempts) is not int or not 0 <= attempts < 3:
