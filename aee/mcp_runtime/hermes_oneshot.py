@@ -65,12 +65,46 @@ def _read_file_page(value):
     # Hermes numbers the empty segment after the trailing newline from sed.
     if lines[-1] == f'{next_offset}|':
         lines.pop()
-    return len(lines) == end - start + 1 and all(
+    return len(lines) == end - start + 1 and _complete_numbered_lines(lines, start)
+
+
+def _complete_numbered_lines(lines, start):
+    return all(
         line.startswith(f'{number}|')
         and not line.endswith('... [truncated]')
         and not line.partition('|')[2].startswith('... [OUTPUT TRUNCATED - ')
         for number, line in enumerate(lines, start)
     )
+
+
+def _final_read_file_page(value):
+    required = {'content', 'total_lines', 'file_size', 'truncated'}
+    content = value.get('content')
+    total_lines, file_size = value.get('total_lines'), value.get('file_size')
+    if (not isinstance(content, str) or not content or type(total_lines) is not int
+            or type(file_size) is not int or total_lines < 0):
+        return False
+
+    extracted = value.get('extracted_document') is True
+    if extracted:
+        if value.keys() != required | {'extracted_document'} or file_size <= 0:
+            return False
+    else:
+        warning = value.get('_warning', '')
+        if (value.keys() - {'_warning'} != required | {'is_binary', 'is_image'}
+                or value['is_binary'] is not False or value['is_image'] is not False
+                or file_size < total_lines
+                or ('_warning' in value and (not isinstance(warning, str) or not warning.strip()))):
+            return False
+
+    lines = content.split('\n')
+    end = total_lines
+    # Text reads count newlines with wc -l and number every segment from sed.
+    # The final segment can be an unterminated line or an empty trailing segment.
+    if not extracted and lines[-1].startswith(f'{total_lines + 1}|'):
+        end += 1
+    start = end - len(lines) + 1
+    return start > 0 and _complete_numbered_lines(lines, start)
 
 
 def tool_failed(value, *, tool_name=None):
@@ -112,7 +146,9 @@ def tool_failed(value, *, tool_name=None):
             and value.get('dedup') is True and value.get('content_returned') is False):
         return True
     truncated = value.get('truncated', False)
-    return (has_warning or truncated is not False) and not (
+    if has_warning and truncated is False:
+        return not _final_read_file_page(value)
+    return truncated is not False and not (
         truncated is True and tool_name == 'read_file' and _read_file_page(value)
     )
 
