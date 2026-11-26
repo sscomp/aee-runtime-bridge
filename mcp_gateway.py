@@ -106,7 +106,9 @@ A3_CODEX_MAX_OUTPUT_FILE = int(os.getenv("A3_CODEX_MAX_OUTPUT_FILE", "65536"))
 # Explicit Secure MCP policy can replace per-job gates for approved transport principals.
 # Agents come from the generic adapter registry (multi-agent recovery work
 # order: codex is an adapter, not the mandatory sole backend).
-from aee.mcp_runtime.store import AGENT_NAMES as A3_ALLOWED_AGENTS, ACTIVE as ACTIVE_STATES
+from aee.mcp_runtime.job_identity import JOB_ID
+from aee.mcp_runtime.store import (AGENT_NAMES as A3_ALLOWED_AGENTS, ACTIVE as ACTIVE_STATES,
+                                   TERMINAL as TERMINAL_STATES)
 A3_ALLOWED_MODES = {"read_only", "write", "autonomous"}
 AEE_DEFAULT_DISPATCH_MODE = os.getenv("AEE_DEFAULT_DISPATCH_MODE", "read_only").strip()
 if AEE_DEFAULT_DISPATCH_MODE not in A3_ALLOWED_MODES:
@@ -762,7 +764,7 @@ EXECUTION_POLICY = BudgetPolicy(os.getenv('AEE_EXECUTION_POLICY'), legacy=_LEGAC
 # On AEE_DEPLOYMENT_PROFILE=os-native hosts the gateway runs without the
 # legacy TaskManager/dispatcher notification stack, so a finished job is
 # visible only by polling aee_job_status. This hook lets the operator opt in
-# (AEE_TELEGRAM_TERMINAL_NOTIFY=1) to push a one-line summary through the
+# (AEE_TELEGRAM_TERMINAL_NOTIFY=1) to push terminal metadata through the
 # host's own messaging CLI — by default the local `hermes send` command,
 # which re-resolves its own platform credentials outside this process.
 #
@@ -782,45 +784,66 @@ AEE_TELEGRAM_NOTIFY_TARGET = os.getenv(
     "AEE_TERMINAL_NOTIFY_TARGET", "").strip()
 
 
+AEE_TERMINAL_NOTIFY_HERMES_HOME = os.getenv("AEE_TERMINAL_NOTIFY_HERMES_HOME", "").strip()
+_TERMINAL_NOTIFY_ERROR_CODES = frozenset({
+    "EXECUTION_FAILED", "EXECUTION_CANCELLED", "EXECUTION_TIMEOUT",
+    "EXECUTION_IDLE_TIMEOUT", "REQUIRED_TOOL_FAILED", "TOOL_EVIDENCE_INCOMPLETE",
+    "OUTPUT_LIMIT_EXCEEDED", "RESOURCE_LIMIT_EXCEEDED", "TURN_BUDGET_EXHAUSTED",
+    "ADAPTER_UNSUPPORTED", "EXECUTOR_IDENTITY_MISMATCH", "BROKER_UNAVAILABLE",
+})
+
+
 def _notify_terminal(
     job_id: str, status: str, exit_code: Optional[int],
-    error_code: Optional[str] = None, summary: Optional[str] = None,
-    agent: Optional[str] = None,
+    error_code: Optional[str] = None, agent: Optional[str] = None,
 ) -> None:
-    """Fire-and-forget Telegram notice for a terminal job state.
-
-    Never raises: any failure is logged at info level and dropped. The
-    message text is operator-facing and bounded — the job summary is
-    clipped to 400 characters and control characters are stripped so a
-    hostile task summary cannot forge line structure in the message.
-    """
+    """Send bounded terminal metadata after persistence, with fixed diagnostics."""
     from aee._notification_guard import notifications_disabled
 
     if (not AEE_TELEGRAM_TERMINAL_NOTIFY or _DURABLE_JOB_NOTIFIER_ACTIVE
             or notifications_disabled()):
         return
+    if (not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id)
+            or not isinstance(status, str) or status not in TERMINAL_STATES):
+        log.info("event=terminal_notify_skipped reason=invalid_metadata")
+        return
+    target = AEE_TELEGRAM_NOTIFY_TARGET
+    if not target:
+        log.info("event=terminal_notify_skipped job_id=%s reason=no_target", job_id)
+        return
     try:
-        target = AEE_TELEGRAM_NOTIFY_TARGET
-        if not target:
-            log.info("event=terminal_notify_skipped job_id=%s reason=no_target", job_id)
-            return
-        flat = " ".join((summary or "").split())[:400]
-        parts = ["AEE job %s: %s (exit_code=%s, agent=%s)" % (
-            job_id, status, exit_code if exit_code is not None else "none",
-            agent or "unknown")]
-        if error_code:
-            parts.append("error_code=%s" % error_code)
-        if flat:
-            parts.append("summary: %s" % flat)
+        agent = agent if isinstance(agent, str) and agent in A3_ALLOWED_AGENTS else "unknown"
+        if type(exit_code) is not int or not -(2**31) <= exit_code < 2**31:
+            exit_code = "none"
+        text = f"AEE job {job_id}: {status} (exit_code={exit_code}, agent={agent})"
+        if status != "completed":
+            if not isinstance(error_code, str) or error_code not in _TERMINAL_NOTIFY_ERROR_CODES:
+                error_code = "EXECUTION_FAILED"
+            text += f" | error_code={error_code}"
+        # Match the durable sender's basic process environment. Select a sender
+        # profile explicitly when needed, independently of the gateway profile.
+        env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR")
+               if k in os.environ}
+        if AEE_TERMINAL_NOTIFY_HERMES_HOME:
+            if not os.path.isabs(AEE_TERMINAL_NOTIFY_HERMES_HOME):
+                log.info("event=terminal_notify_skipped job_id=%s reason=invalid_sender_home", job_id)
+                return
+            env["HERMES_HOME"] = AEE_TERMINAL_NOTIFY_HERMES_HOME
         argv = [AEE_TERMINAL_NOTIFY_COMMAND, "send", "-t", target,
                 "-s", "AEE job terminal"]
-        text = " | ".join(parts)
-        subprocess.run(argv, input=text, text=True,
-                       capture_output=True, timeout=30)
-        log.info("event=terminal_notify_sent job_id=%s status=%s", job_id, status)
-    except Exception as exc:  # noqa: BLE001 — must never break the worker
-        safe_type = type(exc).__name__[:64]
-        log.info("event=terminal_notify_failed job_id=%s exc_type=%s", job_id, safe_type)
+        result = subprocess.run(argv, input=redact(text)[:400], text=True, env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        if result.returncode == 0:
+            log.info("event=terminal_notify_sender_succeeded job_id=%s status=%s", job_id, status)
+        else:
+            log.info("event=terminal_notify_failed job_id=%s reason=sender_exit returncode=%d",
+                     job_id, result.returncode)
+    except subprocess.TimeoutExpired:
+        log.info("event=terminal_notify_failed job_id=%s reason=timeout", job_id)
+    except OSError:
+        log.info("event=terminal_notify_failed job_id=%s reason=sender_os_error", job_id)
+    except Exception:  # noqa: BLE001 — must never break the worker
+        log.info("event=terminal_notify_failed job_id=%s reason=sender_exception", job_id)
 
 
 def _codex_executable() -> str:
@@ -871,8 +894,7 @@ def run_codex_job(job_id: str, task: str, working_directory: str, *, cancel_even
                          truncated=result.truncated, execution=execution)
         log.info("event=job_completed job_id=%s duration_ms=%d", job_id,
                  int((time.monotonic()-worker_started)*1000))
-        _notify_terminal(job_id, "completed", result.exit_code, summary=result.summary,
-                         agent="codex")
+        _notify_terminal(job_id, "completed", result.exit_code, agent="codex")
     except _JobError as error:
         log.warning("event=job_failed job_id=%s error_code=%s duration_ms=%d", job_id, error.code,
                     int((time.monotonic()-worker_started)*1000))
@@ -888,7 +910,7 @@ def run_codex_job(job_id: str, task: str, working_directory: str, *, cancel_even
         JOB_STORE.update(job_id, status=status, finished_at=_now_iso(), exit_code=error.exit_code,
                          error_code=error.code, error=redact(error.message), **fields)
         _notify_terminal(job_id, status, error.exit_code, error_code=error.code,
-                         summary=error.message, agent="codex")
+                         agent="codex")
     except Exception as exc:
         # D1 minimum exception instrumentation: journal-only bounded class name
         # and sanitized errno. Never logs str(exc), repr(exc), or any payload.
@@ -909,7 +931,7 @@ def run_codex_job(job_id: str, task: str, working_directory: str, *, cancel_even
         JOB_STORE.update(job_id, status="failed", finished_at=_now_iso(),
                          error_code="EXECUTION_FAILED", error="Isolated executor failed")
         _notify_terminal(job_id, "failed", None, error_code="EXECUTION_FAILED",
-                         summary="Isolated executor failed", agent="codex")
+                         agent="codex")
     finally:
         if broker_socket is not None:
             try:
@@ -931,6 +953,7 @@ def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_even
     """
     worker_started = time.monotonic()
     execution = None
+    agent_name = None
     spool_store = spool = None
     try:
         record = JOB_STORE.get(job_id)
@@ -988,8 +1011,7 @@ def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_even
         JOB_STORE.update(job_id, **fields)
         log.info("event=job_completed job_id=%s duration_ms=%d", job_id,
                  int((time.monotonic() - worker_started) * 1000))
-        _notify_terminal(job_id, "completed", outcome["exit_code"],
-                         summary=summary, agent=spec.name)
+        _notify_terminal(job_id, "completed", outcome["exit_code"], agent=spec.name)
     except _JobError as error:
         log.warning("event=job_failed job_id=%s error_code=%s duration_ms=%d", job_id, error.code,
                     int((time.monotonic() - worker_started) * 1000))
@@ -1012,7 +1034,7 @@ def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_even
                       error_code=error.code, error=redact(error.message))
         JOB_STORE.update(job_id, **compact_adapter_terminal(record, fields))
         _notify_terminal(job_id, status, error.exit_code, error_code=error.code,
-                         summary=error.message, agent=error.agent_name if hasattr(error, 'agent_name') else None)
+                         agent=agent_name)
     except Exception as exc:
         safe_type = type(exc).__name__[:64]
         if not (safe_type.isascii() and safe_type.isidentifier()):
@@ -1031,8 +1053,7 @@ def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_even
             'error': 'Isolated executor failed', 'execution': execution})
         JOB_STORE.update(job_id, **fields)
         _notify_terminal(job_id, "failed", None, error_code="EXECUTION_FAILED",
-                         summary="Isolated executor failed",
-                         agent=(execution or {}).get("adapter", {}).get("adapter"))
+                         agent=agent_name)
     finally:
         if spool is not None:
             spool.close()
