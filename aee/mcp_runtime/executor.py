@@ -11,6 +11,7 @@ from .profiles import codex_arguments, executable_digest
 from .sandbox import read_manifest, sandbox_command, snapshot_workspace
 from .store import JobError, output_limit_context
 from .result_contract import validate_native_receipt as native_receipt, SUCCESS_VERSION
+from .codex_diagnostics import ignored_startup_config_notice
 
 
 @dataclass(frozen=True)
@@ -170,7 +171,7 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
     # internal exec id — are not projected on this path and follow stdlib
     # last-wins, matching the streamed path so identical real streams classify
     # identically on both routes.
-    decision_critical_members = {'type', 'status', 'exit_code', 'text', 'thread_id'}
+    decision_critical_members = {'type', 'status', 'exit_code', 'text', 'thread_id', 'message'}
 
     def no_duplicate_keys(pairs):
         seen = {}
@@ -182,6 +183,7 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
 
     message = None
     completed = False
+    turn_seen = False
     receipt, thread = None, None
     for line in stdout.splitlines():
         try:
@@ -196,6 +198,7 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
         if event.get("type") == "turn.completed":
             completed = True
         if event.get('type') == 'turn.started':
+            turn_seen = True
             # Only the final turn's own terminal event and answer settle the
             # stream: a new turn invalidates any earlier completion/message.
             message = None
@@ -227,6 +230,9 @@ def final_agent_message(stdout, limits, *, require_receipt=False, broker_receipt
                         raise JobError('REQUIRED_TOOL_FAILED',
                                        'Native executor reported a command outcome with no measurable exit code',
                                        exit_code=0, failure=bounded_failure(event, thread=thread))
+                elif (not require_receipt and
+                      ignored_startup_config_notice(item, turn_seen=turn_seen)):
+                    pass
                 elif ((item.get('type') == 'error')
                       or (isinstance(item.get('status'), str) and
                           item.get('status') in {'failed', 'declined'})):
