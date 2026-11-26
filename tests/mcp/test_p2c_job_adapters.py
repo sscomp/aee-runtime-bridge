@@ -499,6 +499,21 @@ print(json.dumps({"type": "result",
                 self.assertEqual(argv.count("-c"), 1)
                 self.assertEqual(argv[argv.index("-c") + 1], override[1])
 
+    def test_m2_codex_project_doc_budget_argv_all_modes(self):
+        """Keep the 65,536-byte invocation budget alongside each mode's flags."""
+        from aee.mcp_runtime.job_adapters import adapter_specs as adapter_specs_registry
+        spec = adapter_specs_registry()["codex"]
+        for mode in ("read_only", "write", "autonomous"):
+            argv = spec.build_argv("/abs/work", "codex", mode)
+            self.assertIn("-c", argv)
+            self.assertEqual(argv[argv.index("-c") + 1], "project_doc_max_bytes=65536")
+            self.assertEqual(argv.count("project_doc_max_bytes=65536"), 1)
+        # mode-specific safety flags remain intact alongside the budget flag
+        self.assertIn("read-only", spec.build_argv("/abs/work", "codex", "read_only"))
+        self.assertIn("workspace-write", spec.build_argv("/abs/work", "codex", "write"))
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox",
+                      spec.build_argv("/abs/work", "codex", "autonomous"))
+
     def test_claude_single_object_final_json_completes(self):
         """The fixed argv shape: one final result JSON object completes with
         its contract proof, and no output-limit diagnostics ever attach to a

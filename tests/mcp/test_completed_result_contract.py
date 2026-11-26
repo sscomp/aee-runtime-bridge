@@ -196,9 +196,11 @@ class CompletedResultContract(unittest.TestCase):
         broker = {'valid': True, 'response_complete': True, 'expected_calls': {}}
         (root / 'broker.json').write_text(json.dumps(broker))
         tree = ast.parse((ROOT / 'mcp_gateway.py').read_text())
-        names = {'run_codex_job', '_now_iso'}
+        names = {'run_codex_job', '_now_iso', '_notify_terminal'}
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
         namespace = {'JOB_STORE': store, '_JobError': JobError, 'Dict': dict, 'Any': object,
+            'Optional': __import__('typing').Optional,
+            'AEE_TELEGRAM_TERMINAL_NOTIFY': False,
             'time': time, 'datetime': datetime, 'timezone': timezone, 'log': logging.getLogger('fixture-worker'),
             'os': SimpleNamespace(getenv=lambda k: str(root / 'fixture-control')),
             '_dispatch_pool': {}, '_cancel_events': {}, 'select_profile': select_profile, 'ExecutorIdentity': ExecutorIdentity,
