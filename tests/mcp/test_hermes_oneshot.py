@@ -206,6 +206,35 @@ class HermesOneshot(unittest.TestCase):
         self.assertEqual(parser.result(), 'verified final')
         self.assertEqual(parser.tool_evidence()['tools_completed'], 1)
 
+    def test_read_file_final_text_page_with_warning_rejects_missing_leading_line(self):
+        page = {
+            'content': '3|beta\n4|',
+            'total_lines': 3,
+            'file_size': 20,
+            'truncated': False,
+            'is_binary': False,
+            'is_image': False,
+        }
+        code, parser, _ = self.execute_raw_read_file_result(json.dumps(page) + READ_FILE_NO_PROGRESS_WARNING)
+        self.assertEqual(code, 1)
+        with self.assertRaises(JobError) as caught:
+            parser.result()
+        self.assertEqual(caught.exception.code, 'REQUIRED_TOOL_FAILED')
+
+    def test_read_file_final_extracted_document_with_warning_rejects_missing_leading_line(self):
+        page = {
+            'content': '3|beta',
+            'total_lines': 3,
+            'file_size': 1234,
+            'truncated': False,
+            'extracted_document': True,
+        }
+        code, parser, _ = self.execute_raw_read_file_result(json.dumps(page) + READ_FILE_NO_PROGRESS_WARNING)
+        self.assertEqual(code, 1)
+        with self.assertRaises(JobError) as caught:
+            parser.result()
+        self.assertEqual(caught.exception.code, 'REQUIRED_TOOL_FAILED')
+
     def test_read_file_untruncated_dictionary_with_no_progress_warning_remains_failure(self):
         result = json.dumps({'content': 'ordinary tool output', 'truncated': False}) + READ_FILE_NO_PROGRESS_WARNING
         code, parser, _ = self.execute_raw_read_file_result(result)

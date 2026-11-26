@@ -77,7 +77,20 @@ def _complete_numbered_lines(lines, start):
     )
 
 
-def _final_read_file_page(value):
+def _read_file_offset(arguments):
+    if not isinstance(arguments, dict):
+        return None
+    try:
+        return max(1, int(arguments.get('offset', 1)))
+    except (TypeError, ValueError):
+        return 1
+    except OverflowError:
+        return None
+
+
+def _final_read_file_page(value, offset):
+    if offset is None:
+        return False
     required = {'content', 'total_lines', 'file_size', 'truncated'}
     content = value.get('content')
     total_lines, file_size = value.get('total_lines'), value.get('file_size')
@@ -103,11 +116,10 @@ def _final_read_file_page(value):
     # The final segment can be an unterminated line or an empty trailing segment.
     if not extracted and lines[-1].startswith(f'{total_lines + 1}|'):
         end += 1
-    start = end - len(lines) + 1
-    return start > 0 and _complete_numbered_lines(lines, start)
+    return len(lines) == end - offset + 1 and _complete_numbered_lines(lines, offset)
 
 
-def tool_failed(value, *, tool_name=None):
+def tool_failed(value, *, tool_name=None, read_offset=None):
     has_warning = False
     if isinstance(value, str):
         stripped = value.strip()
@@ -147,7 +159,7 @@ def tool_failed(value, *, tool_name=None):
         return True
     truncated = value.get('truncated', False)
     if has_warning and truncated is False:
-        return not _final_read_file_page(value)
+        return not _final_read_file_page(value, read_offset)
     return truncated is not False and not (
         truncated is True and tool_name == 'read_file' and _read_file_page(value)
     )
@@ -197,7 +209,8 @@ def run(prompt, output, native=None, *, exit_process=False):
                 return
             seen.add(tool_id)
             event_id = str(len(seen))
-            pending[tool_id] = event_id, name
+            read_offset = _read_file_offset(arguments) if name == 'read_file' else None
+            pending[tool_id] = event_id, name, read_offset
             emit({'type': 'tool_use', 'tool_id': event_id})
 
     def on_complete(tool_id=None, name=None, arguments=None, result=None, *extra, **fields):
@@ -207,8 +220,9 @@ def run(prompt, output, native=None, *, exit_process=False):
                     or not tool_id.strip() or tool_id not in pending):
                 failed = True
                 return
-            event_id, started_name = pending.pop(tool_id)
-            error = type(name) is not str or name != started_name or tool_failed(result, tool_name=started_name)
+            event_id, started_name, read_offset = pending.pop(tool_id)
+            error = (type(name) is not str or name != started_name
+                     or tool_failed(result, tool_name=started_name, read_offset=read_offset))
             failed = failed or error
             # Stream-local IDs pair events without disclosing provider IDs.
             emit({'type': 'tool_result', 'tool_id': event_id, 'is_error': error})
