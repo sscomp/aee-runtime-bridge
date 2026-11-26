@@ -9,6 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from inspect import Parameter, signature
 import json
 import os
+import re
 import sys
 import threading
 
@@ -26,7 +27,47 @@ def _invalid_json_constant(value):
     raise ValueError('Invalid tool result constant')
 
 
-def tool_failed(value):
+def _read_file_page(value):
+    required = {'content', 'total_lines', 'file_size', 'truncated', 'hint', 'is_binary', 'is_image'}
+    annotations = value.keys() & {'_hint', '_warning'}
+    if value.keys() != required | annotations or any(
+        not isinstance(value[key], str) or not value[key].strip() for key in annotations
+    ):
+        return False
+
+    content, hint = value['content'], value['hint']
+    total_lines, file_size = value['total_lines'], value['file_size']
+    if (not isinstance(content, str) or not isinstance(hint, str)
+            or type(total_lines) is not int or type(file_size) is not int
+            or file_size < total_lines or value['is_binary'] is not False or value['is_image'] is not False):
+        return False
+
+    match = re.fullmatch(
+        r'Use offset=([1-9][0-9]*) to continue reading \(showing ([1-9][0-9]*)-([1-9][0-9]*) of ([1-9][0-9]*) lines\)',
+        hint,
+    )
+    if match is None:
+        return False
+    try:
+        next_offset, start, end, hinted_total = map(int, match.groups())
+    except ValueError:
+        return False
+    if not start <= end < total_lines == hinted_total or next_offset != end + 1:
+        return False
+
+    lines = content.split('\n')
+    # Hermes numbers the empty segment after the trailing newline from sed.
+    if lines[-1] == f'{next_offset}|':
+        lines.pop()
+    return len(lines) == end - start + 1 and all(
+        line.startswith(f'{number}|')
+        and not line.endswith('... [truncated]')
+        and not line.partition('|')[2].startswith('... [OUTPUT TRUNCATED - ')
+        for number, line in enumerate(lines, start)
+    )
+
+
+def tool_failed(value, *, tool_name=None):
     if isinstance(value, str):
         value = value.strip()
         if not value or value == 'null' or value.startswith(
@@ -43,12 +84,17 @@ def tool_failed(value):
     if not isinstance(value, dict) or not value or value.get('error'):
         return True
     if any(value.get(flag, False) is not False
-           for flag in ('is_error', 'isError', 'failed', 'partial', 'truncated', 'interrupted')):
+           for flag in ('is_error', 'isError', 'failed', 'partial', 'interrupted')):
         return True
     if value.get('success', True) is not True or value.get('completed', True) is not True:
         return True
-    return any(key in value and (type(value[key]) is not int or value[key] != 0)
-               for key in ('exit_code', 'returncode'))
+    if any(key in value and (type(value[key]) is not int or value[key] != 0)
+           for key in ('exit_code', 'returncode')):
+        return True
+    truncated = value.get('truncated', False)
+    return truncated is not False and not (
+        truncated is True and tool_name == 'read_file' and _read_file_page(value)
+    )
 
 
 def _preflight(agent, oneshot, cli, config):
@@ -89,12 +135,13 @@ def run(prompt, output, native=None, *, exit_process=False):
         nonlocal failed
         with lock:
             if (extra or fields or type(tool_id) is not str
-                    or not tool_id.strip() or len(tool_id) > 256 or tool_id in seen):
+                    or not tool_id.strip() or len(tool_id) > 256 or tool_id in seen
+                    or type(name) is not str or not name.strip()):
                 failed = True
                 return
             seen.add(tool_id)
             event_id = str(len(seen))
-            pending[tool_id] = event_id
+            pending[tool_id] = event_id, name
             emit({'type': 'tool_use', 'tool_id': event_id})
 
     def on_complete(tool_id=None, name=None, arguments=None, result=None, *extra, **fields):
@@ -104,8 +151,8 @@ def run(prompt, output, native=None, *, exit_process=False):
                     or not tool_id.strip() or tool_id not in pending):
                 failed = True
                 return
-            event_id = pending.pop(tool_id)
-            error = tool_failed(result)
+            event_id, started_name = pending.pop(tool_id)
+            error = type(name) is not str or name != started_name or tool_failed(result, tool_name=started_name)
             failed = failed or error
             # Stream-local IDs pair events without disclosing provider IDs.
             emit({'type': 'tool_result', 'tool_id': event_id, 'is_error': error})

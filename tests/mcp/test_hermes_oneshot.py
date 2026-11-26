@@ -19,6 +19,19 @@ from aee.mcp_runtime.job_adapters import (
 from aee.mcp_runtime.store import JobError
 
 
+def read_file_page(**fields):
+    return {
+        'content': '2|alpha\n3|beta',
+        'total_lines': 5,
+        'file_size': 30,
+        'truncated': True,
+        'hint': 'Use offset=4 to continue reading (showing 2-3 of 5 lines)',
+        'is_binary': False,
+        'is_image': False,
+        **fields,
+    }
+
+
 class HermesOneshot(unittest.TestCase):
     def execute(self, *, result=None, tool_result='{"exit_code":0}', incomplete=False,
                 exception=None, callback_events=None, native_code=0, cleanup_error=None):
@@ -85,6 +98,65 @@ class HermesOneshot(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertEqual(parser.result(), 'verified final')
                 self.assertNotIn('ordinary tool output', output)
+
+    def read_page(self, result, *, start_name='read_file', complete_name='read_file'):
+        args = {'path': 'synthetic.txt', 'offset': 2, 'limit': 2}
+        return self.execute(callback_events=[
+            ('start', ('page', start_name, args)),
+            ('complete', ('page', complete_name, args, json.dumps(result))),
+            ('start', ('later', 'terminal', {})),
+            ('complete', ('later', 'terminal', {}, 'ordinary tool output')),
+        ])
+
+    def test_read_file_pages_have_complete_numbered_content(self):
+        for page in (read_file_page(), read_file_page(content='2|alpha\n3|\n4|')):
+            with self.subTest(page=page):
+                code, parser, output = self.read_page(page)
+                self.assertEqual(code, 0)
+                self.assertEqual(parser.result(), 'verified final')
+                self.assertEqual(parser.tool_evidence()['tools_completed'], 2)
+                for private in ('alpha', 'read_file', 'synthetic.txt', 'Use offset='):
+                    self.assertNotIn(private, output)
+
+    def test_read_file_page_lookalikes_fail(self):
+        page = read_file_page()
+        for bad in (
+            {key: value for key, value in page.items() if key != 'hint'},
+            read_file_page(content=''), read_file_page(content=[]),
+            read_file_page(content='2|alpha'), read_file_page(content='2|alpha\n4|beta'),
+            read_file_page(content='2|alpha\n3|beta\n4|extra'),
+            read_file_page(content='2|alpha\n3|beta... [truncated]'),
+            read_file_page(content='2|alpha\n3|... [OUTPUT TRUNCATED - 12 chars omitted out of 30 total] ...'),
+            read_file_page(hint='Use offset=5 to continue reading (showing 2-3 of 5 lines)'),
+            read_file_page(total_lines='5'), read_file_page(total_lines=3), read_file_page(file_size=True),
+            read_file_page(file_size=0), read_file_page(is_binary=0), read_file_page(is_image=True),
+            read_file_page(truncated='true'), read_file_page(truncated_by='bytes', next_offset=4),
+            read_file_page(_warning=[]),
+        ):
+            with self.subTest(result=bad):
+                code, parser, _ = self.read_page(bad)
+                self.assertEqual(code, 1)
+                with self.assertRaises(JobError):
+                    parser.result()
+
+    def test_read_file_page_requires_matching_dispatched_names(self):
+        for start, end in (('terminal', 'terminal'), ('terminal', 'read_file'),
+                           ('read_file', 'terminal'), (None, 'read_file'), ('read_file', [])):
+            with self.subTest(start=start, end=end):
+                code, parser, _ = self.read_page(read_file_page(), start_name=start, complete_name=end)
+                self.assertEqual(code, 1)
+                with self.assertRaises(JobError):
+                    parser.result()
+
+    def test_read_file_page_does_not_override_explicit_failure(self):
+        for flags in ({'error': 'denied'}, {'is_error': True}, {'failed': True},
+                      {'is_error': False, 'isError': True}, {'partial': True}, {'interrupted': True},
+                      {'success': False}, {'completed': False}, {'exit_code': 1}):
+            with self.subTest(flags=flags):
+                code, parser, _ = self.read_page(read_file_page(**flags))
+                self.assertEqual(code, 1)
+                with self.assertRaises(JobError):
+                    parser.result()
 
     def test_absent_malformed_and_truncated_tool_results_fail(self):
         values = (None, [], 0, {}, '', '  ', 'null', '[1]', '{"exit_code":',
@@ -334,3 +406,39 @@ class HermesOneshot(unittest.TestCase):
                 parse(*events)
         with self.assertRaises(JobError):
             EventParser('hermes').feed(b'{"type":"result","exit_code":0,', eof=True)
+
+    def test_native_tool_completion_outcome_markers_are_sticky(self):
+        start = {'type': 'tool_use', 'tool_id': 'first'}
+        done = {'type': 'tool_result', 'tool_id': 'first', 'is_error': False}
+        later_start = {'type': 'tool_execution_start', 'id': 'later'}
+        later_done = {'type': 'tool_execution_end', 'id': 'later', 'isError': False}
+        final = {'type': 'result', 'exit_code': 0, 'text': 'verified final'}
+        flags = ('truncated', 'partial', 'failed', 'interrupted')
+
+        def parse(completion):
+            parser = EventParser('hermes')
+            events = (start, completion, later_start, later_done, final)
+            parser.feed('\n'.join(map(json.dumps, events)).encode(), eof=True)
+            return parser
+
+        clean = parse(dict(done, isError=False, **dict.fromkeys(flags, False)))
+        self.assertEqual(clean.result(), 'verified final')
+        self.assertEqual(clean.tool_evidence()['tools_failed'], 0)
+        for flag in flags:
+            for value in (True, 'false', 0, None, [], {}):
+                with self.subTest(flag=flag, value=value):
+                    parser = parse(dict(done, **{flag: value}))
+                    with self.assertRaises(JobError) as caught:
+                        parser.result()
+                    explicit_failure = flag == 'failed' and value is True
+                    self.assertEqual(caught.exception.code,
+                                     'REQUIRED_TOOL_FAILED' if explicit_failure else 'TOOL_EVIDENCE_INCOMPLETE')
+                    self.assertEqual(parser.tool_evidence()['tools_failed'], int(explicit_failure))
+        with self.assertRaises(JobError) as caught:
+            parse(dict(done, **read_file_page(), name='read_file')).result()
+        self.assertEqual(caught.exception.code, 'TOOL_EVIDENCE_INCOMPLETE')
+
+        duplicate = b'{"type":"tool_result","tool_id":"first","is_error":false,"truncated":true,"truncated":false}'
+        parser = EventParser('hermes')
+        with self.assertRaises(JobError):
+            parser.feed(json.dumps(start).encode() + b'\n' + duplicate, eof=True)

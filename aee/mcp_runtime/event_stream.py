@@ -19,7 +19,8 @@ class Oversize:
 KEYS = frozenset({'type', 'subtype', 'is_error', 'result', 'num_turns', 'item',
                   'text', 'status', 'exit_code', 'message', 'role', 'content',
                   'stopReason', 'errorMessage', 'aborted', 'isError'})
-_HERMES_KEYS = KEYS | {'tool_id', 'id', 'failed', 'partial', 'interrupted', 'truncated'}
+_HERMES_INCOMPLETE_FLAGS = ('failed', 'partial', 'interrupted', 'truncated')
+_HERMES_KEYS = KEYS | {'tool_id', 'id', *_HERMES_INCOMPLETE_FLAGS}
 _HERMES_TOOL_LIMIT = 4096
 _NUMBER = re.compile(r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z')
 
@@ -367,10 +368,12 @@ class EventParser:
             if end:
                 self.tools_completed += 1
                 flags = [event[key] for key in ('is_error', 'isError') if key in event]
-                if any(flag is True for flag in flags):
+                if event.get('failed') is True or any(flag is True for flag in flags):
                     self.tools_failed += 1
                     self.error = JobError('REQUIRED_TOOL_FAILED', 'Hermes reported failed required operation')
-                if not flags or any(flag is not False for flag in flags):
+                # The native event envelope does not establish read_file pagination.
+                if (not flags or any(flag is not False for flag in flags)
+                        or any(event.get(key, False) is not False for key in _HERMES_INCOMPLETE_FLAGS)):
                     self.error = self.error or JobError('TOOL_EVIDENCE_INCOMPLETE',
                                                         'Hermes tool result lacks successful completion evidence')
             else:
@@ -387,7 +390,7 @@ class EventParser:
             code = event.get('exit_code')
             if (self.hermes_result_seen or type(code) is not int or code != 0
                     or any(event.get(flag, False) is not False for flag in
-                           ('is_error', 'isError', 'failed', 'partial', 'interrupted', 'truncated'))):
+                           ('is_error', 'isError', *_HERMES_INCOMPLETE_FLAGS))):
                 self.error = self.error or JobError('EXECUTION_FAILED', 'Hermes reported an invalid or failed result')
             elif not all(self.hermes_pairs.values()):
                 self.error = self.error or JobError('TOOL_EVIDENCE_INCOMPLETE',
