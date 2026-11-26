@@ -106,8 +106,13 @@ A3_CODEX_MAX_OUTPUT_FILE = int(os.getenv("A3_CODEX_MAX_OUTPUT_FILE", "65536"))
 # Explicit Secure MCP policy can replace per-job gates for approved transport principals.
 # Agents come from the generic adapter registry (multi-agent recovery work
 # order: codex is an adapter, not the mandatory sole backend).
-from aee.mcp_runtime.store import AGENT_NAMES as A3_ALLOWED_AGENTS, ACTIVE as ACTIVE_STATES
+from aee.mcp_runtime.job_identity import JOB_ID
+from aee.mcp_runtime.store import (AGENT_NAMES as A3_ALLOWED_AGENTS, ACTIVE as ACTIVE_STATES,
+                                   TERMINAL as TERMINAL_STATES)
 A3_ALLOWED_MODES = {"read_only", "write", "autonomous"}
+AEE_DEFAULT_DISPATCH_MODE = os.getenv("AEE_DEFAULT_DISPATCH_MODE", "read_only").strip()
+if AEE_DEFAULT_DISPATCH_MODE not in A3_ALLOWED_MODES:
+    raise ValueError("Invalid AEE_DEFAULT_DISPATCH_MODE")
 from aee.mcp_runtime.authorization import Authority, authenticated_transport, digest as auth_digest
 from aee.mcp_runtime.trusted_dispatch import (TrustedDispatch, VerifiedSecureMCP,
     secure_mcp_transport, check_execution, POLICY as TRUSTED_POLICY)
@@ -753,6 +758,93 @@ for _env, _field, _value in (
 EXECUTION_POLICY = BudgetPolicy(os.getenv('AEE_EXECUTION_POLICY'), legacy=_LEGACY_BUDGET)
 
 
+# ---------------------------------------------------------------------------
+# Terminal notification hook (operator-opt-in, host integration)
+#
+# On AEE_DEPLOYMENT_PROFILE=os-native hosts the gateway runs without the
+# legacy TaskManager/dispatcher notification stack, so a finished job is
+# visible only by polling aee_job_status. This hook lets the operator opt in
+# (AEE_TELEGRAM_TERMINAL_NOTIFY=1) to push terminal metadata through the
+# host's own messaging CLI — by default the local `hermes send` command,
+# which re-resolves its own platform credentials outside this process.
+#
+# Fail-soft by design: notification errors are logged and swallowed so they
+# can never alter the job terminal state machine. No chat identifiers or
+# secrets are hardcoded: target and command come from operator env.
+# ---------------------------------------------------------------------------
+
+# A running durable notifier owns terminal delivery for this process.
+_DURABLE_JOB_NOTIFIER_ACTIVE = False
+AEE_TELEGRAM_TERMINAL_NOTIFY = (
+    os.getenv("AEE_TELEGRAM_TERMINAL_NOTIFY", "").strip().lower()
+    in {"1", "true", "yes", "on"})
+AEE_TERMINAL_NOTIFY_COMMAND = os.getenv(
+    "AEE_TERMINAL_NOTIFY_COMMAND", "hermes").strip()
+AEE_TELEGRAM_NOTIFY_TARGET = os.getenv(
+    "AEE_TERMINAL_NOTIFY_TARGET", "").strip()
+
+
+AEE_TERMINAL_NOTIFY_HERMES_HOME = os.getenv("AEE_TERMINAL_NOTIFY_HERMES_HOME", "").strip()
+_TERMINAL_NOTIFY_ERROR_CODES = frozenset({
+    "EXECUTION_FAILED", "EXECUTION_CANCELLED", "EXECUTION_TIMEOUT",
+    "EXECUTION_IDLE_TIMEOUT", "REQUIRED_TOOL_FAILED", "TOOL_EVIDENCE_INCOMPLETE",
+    "OUTPUT_LIMIT_EXCEEDED", "RESOURCE_LIMIT_EXCEEDED", "TURN_BUDGET_EXHAUSTED",
+    "ADAPTER_UNSUPPORTED", "EXECUTOR_IDENTITY_MISMATCH", "BROKER_UNAVAILABLE",
+})
+
+
+def _notify_terminal(
+    job_id: str, status: str, exit_code: Optional[int],
+    error_code: Optional[str] = None, agent: Optional[str] = None,
+) -> None:
+    """Send bounded terminal metadata after persistence, with fixed diagnostics."""
+    from aee._notification_guard import notifications_disabled
+
+    if (not AEE_TELEGRAM_TERMINAL_NOTIFY or _DURABLE_JOB_NOTIFIER_ACTIVE
+            or notifications_disabled()):
+        return
+    if (not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id)
+            or not isinstance(status, str) or status not in TERMINAL_STATES):
+        log.info("event=terminal_notify_skipped reason=invalid_metadata")
+        return
+    target = AEE_TELEGRAM_NOTIFY_TARGET
+    if not target:
+        log.info("event=terminal_notify_skipped job_id=%s reason=no_target", job_id)
+        return
+    try:
+        agent = agent if isinstance(agent, str) and agent in A3_ALLOWED_AGENTS else "unknown"
+        if type(exit_code) is not int or not -(2**31) <= exit_code < 2**31:
+            exit_code = "none"
+        text = f"AEE job {job_id}: {status} (exit_code={exit_code}, agent={agent})"
+        if status != "completed":
+            if not isinstance(error_code, str) or error_code not in _TERMINAL_NOTIFY_ERROR_CODES:
+                error_code = "EXECUTION_FAILED"
+            text += f" | error_code={error_code}"
+        # Match the durable sender's basic process environment. Select a sender
+        # profile explicitly when needed, independently of the gateway profile.
+        env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR")
+               if k in os.environ}
+        if AEE_TERMINAL_NOTIFY_HERMES_HOME:
+            if not os.path.isabs(AEE_TERMINAL_NOTIFY_HERMES_HOME):
+                log.info("event=terminal_notify_skipped job_id=%s reason=invalid_sender_home", job_id)
+                return
+            env["HERMES_HOME"] = AEE_TERMINAL_NOTIFY_HERMES_HOME
+        argv = [AEE_TERMINAL_NOTIFY_COMMAND, "send", "-t", target,
+                "-s", "AEE job terminal"]
+        result = subprocess.run(argv, input=redact(text)[:400], text=True, env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        if result.returncode == 0:
+            log.info("event=terminal_notify_sender_succeeded job_id=%s status=%s", job_id, status)
+        else:
+            log.info("event=terminal_notify_failed job_id=%s reason=sender_exit returncode=%d",
+                     job_id, result.returncode)
+    except subprocess.TimeoutExpired:
+        log.info("event=terminal_notify_failed job_id=%s reason=timeout", job_id)
+    except OSError:
+        log.info("event=terminal_notify_failed job_id=%s reason=sender_os_error", job_id)
+    except Exception:  # noqa: BLE001 — must never break the worker
+        log.info("event=terminal_notify_failed job_id=%s reason=sender_exception", job_id)
+
 
 def _codex_executable() -> str:
     return resolve_codex(A3_CODEX_BIN).executable
@@ -802,6 +894,7 @@ def run_codex_job(job_id: str, task: str, working_directory: str, *, cancel_even
                          truncated=result.truncated, execution=execution)
         log.info("event=job_completed job_id=%s duration_ms=%d", job_id,
                  int((time.monotonic()-worker_started)*1000))
+        _notify_terminal(job_id, "completed", result.exit_code, agent="codex")
     except _JobError as error:
         log.warning("event=job_failed job_id=%s error_code=%s duration_ms=%d", job_id, error.code,
                     int((time.monotonic()-worker_started)*1000))
@@ -816,6 +909,8 @@ def run_codex_job(job_id: str, task: str, working_directory: str, *, cancel_even
         fields = {'execution': failure_execution} if isinstance(failure_execution, dict) else {}
         JOB_STORE.update(job_id, status=status, finished_at=_now_iso(), exit_code=error.exit_code,
                          error_code=error.code, error=redact(error.message), **fields)
+        _notify_terminal(job_id, status, error.exit_code, error_code=error.code,
+                         agent="codex")
     except Exception as exc:
         # D1 minimum exception instrumentation: journal-only bounded class name
         # and sanitized errno. Never logs str(exc), repr(exc), or any payload.
@@ -835,6 +930,8 @@ def run_codex_job(job_id: str, task: str, working_directory: str, *, cancel_even
         )
         JOB_STORE.update(job_id, status="failed", finished_at=_now_iso(),
                          error_code="EXECUTION_FAILED", error="Isolated executor failed")
+        _notify_terminal(job_id, "failed", None, error_code="EXECUTION_FAILED",
+                         agent="codex")
     finally:
         if broker_socket is not None:
             try:
@@ -856,6 +953,7 @@ def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_even
     """
     worker_started = time.monotonic()
     execution = None
+    agent_name = None
     spool_store = spool = None
     try:
         record = JOB_STORE.get(job_id)
@@ -913,6 +1011,7 @@ def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_even
         JOB_STORE.update(job_id, **fields)
         log.info("event=job_completed job_id=%s duration_ms=%d", job_id,
                  int((time.monotonic() - worker_started) * 1000))
+        _notify_terminal(job_id, "completed", outcome["exit_code"], agent=spec.name)
     except _JobError as error:
         log.warning("event=job_failed job_id=%s error_code=%s duration_ms=%d", job_id, error.code,
                     int((time.monotonic() - worker_started) * 1000))
@@ -934,6 +1033,8 @@ def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_even
         fields.update(status=status, finished_at=_now_iso(), exit_code=error.exit_code,
                       error_code=error.code, error=redact(error.message))
         JOB_STORE.update(job_id, **compact_adapter_terminal(record, fields))
+        _notify_terminal(job_id, status, error.exit_code, error_code=error.code,
+                         agent=agent_name)
     except Exception as exc:
         safe_type = type(exc).__name__[:64]
         if not (safe_type.isascii() and safe_type.isidentifier()):
@@ -951,6 +1052,8 @@ def run_agent_job(job_id: str, task: str, working_directory: str, *, cancel_even
             'status': 'failed', 'finished_at': _now_iso(), 'error_code': 'EXECUTION_FAILED',
             'error': 'Isolated executor failed', 'execution': execution})
         JOB_STORE.update(job_id, **fields)
+        _notify_terminal(job_id, "failed", None, error_code="EXECUTION_FAILED",
+                         agent=agent_name)
     finally:
         if spool is not None:
             spool.close()
@@ -1163,6 +1266,7 @@ async def status_route(request):
         "auth_required": AEE_MCP_REQUIRE_AUTH,
         "allowed_roots": AEE_MCP_ALLOWED_ROOTS,
         "dispatch_modes": sorted(A3_ALLOWED_MODES),
+        "default_dispatch_mode": AEE_DEFAULT_DISPATCH_MODE,
         "autonomous": {"profile": "os-native", "authorization": (TRUSTED_POLICY if TrustedDispatch.configured() is not None
                                                                          else "single-job-capability"),
                        "mandatory_directory_allowlist": False,
@@ -1215,6 +1319,7 @@ async def aee_status() -> str:
             "localhost_only": AEE_MCP_HOST == "127.0.0.1",
             "auth_required": AEE_MCP_REQUIRE_AUTH,
             "deployment_profile": AEE_DEPLOYMENT_PROFILE,
+            "default_dispatch_mode": AEE_DEFAULT_DISPATCH_MODE,
             "trusted_dispatch": (TrustedDispatch.configured().status()
                                  if TrustedDispatch.configured() is not None else None),
         },
@@ -1264,7 +1369,7 @@ async def aee_dispatch(
     agent: str,
     working_directory: str,
     task: Optional[str] = None,
-    mode: Literal["read_only", "write", "autonomous"] = "read_only",
+    mode: Literal["read_only", "write", "autonomous"] = AEE_DEFAULT_DISPATCH_MODE,
     prompt: Optional[str] = None,
     metadata: Optional[dict] = None,
     execution_profile: Optional[str] = None,
@@ -1286,7 +1391,9 @@ async def aee_dispatch(
     adapter (call aee_agents for the live registry set).
 
     mode decides the agent's permission boundary:
-    * 'read_only' (default): the agent runs inside its native read-only
+    The default mode is operator-configured by AEE_DEFAULT_DISPATCH_MODE
+    (read_only when unset); explicit mode values always take precedence.
+    * 'read_only': the agent runs inside its native read-only
       boundary (codex --sandbox read-only; claude --permission-mode plan
       plus restricted safe-mode Read/Glob/Grep tool allowlist and empty MCP).
       Claude plan mode alone does not enforce read-only.
@@ -1613,10 +1720,12 @@ def main() -> None:
         """Uvicorn server with graceful shutdown on SIGTERM/SIGINT."""
 
         async def startup(self, sockets=None):
+            global _DURABLE_JOB_NOTIFIER_ACTIVE
             await super().startup(sockets=sockets)
             if self.started:
                 from aee.mcp_runtime.job_notifications import start_job_notifier
                 self.job_notifier = start_job_notifier(JOB_STORE._root)
+                _DURABLE_JOB_NOTIFIER_ACTIVE = self.job_notifier is not None
                 from aee.mcp_runtime.readiness import notify
                 notify("READY=1")
 

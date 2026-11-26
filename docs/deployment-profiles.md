@@ -100,6 +100,14 @@ The report contains resolution facts only; it never prints secret values.
 
 ## Trusted dispatch onboarding (write/autonomous)
 
+The optional `AEE_DEFAULT_DISPATCH_MODE` environment variable selects the mode
+used when an MCP caller omits `mode` (`read_only` when unset). Supported values
+are `read_only`, `write`, and `autonomous`; an invalid value refuses startup.
+Selecting `autonomous` does not grant authority: provision the trusted policy
+below before enabling that default. Explicit per-job modes retain their native
+boundaries. `aee_status`, `/status`, and the MCP tool schema report the configured
+default. A connector that caches tool schemas may need its tools refreshed.
+
 Write and autonomous dispatch are enabled only through
 `scripts/provision_trusted_dispatch.py`, which writes a
 `aee-secure-mcp-trusted-dispatch-v1` policy and re-validates it against the
@@ -135,6 +143,44 @@ return unconfigured — write/autonomous admission then fails closed instead
 of running on a degraded policy.
 
 ## Installation and rollback
+
+### Hermes builds without stdin or JSONL CLI flags
+
+The optional `deploy/hermes-aee` wrapper adapts a compatible Hermes oneshot
+runtime to the gateway's stdin and JSONL contract. Set
+`A3_ADAPTER_HERMES_BIN` to the absolute wrapper path and retain the
+`hermes-aee` filename. Its `/usr/bin/env python3` shebang needs a gateway
+service `PATH` with trusted absolute entries. Select the interpreter that
+can import `hermes_cli.main`, `hermes_cli.config`, `hermes_cli.oneshot`, and
+`run_agent` directly. The help probe runs from `/` and the worker runs from
+the job directory. Both must resolve the same interpreter and module
+installation.
+
+Wrapper help checks module discovery without loading the Hermes profile.
+On launch, the wrapper checks the oneshot, agent, tool callback, terminal
+configuration, and cleanup APIs before inference. It requires the local
+terminal backend and sets `TERMINAL_CWD` in the worker to the job directory.
+An accepted run needs a complete native run record, a nonblank final answer,
+and valid, paired callbacks for every observed tool. The wrapper emits
+stream-local tool IDs and error indicators.
+
+A qualified native Hermes CLI can also be selected by absolute path or by
+normal PATH discovery. The native command uses
+`chat --yolo --toolsets hermes-cli --query-file - --format stream-json`.
+Verify that the installed build accepts those values and emits the Hermes
+event contract used by the gateway. Tool starts and results must pair by
+`tool_id` or `id`, each tool result must carry a boolean `is_error` or
+`isError`, and the final `result` must have integer `exit_code: 0` and
+nonblank `text`.
+
+A successful help probe reports advertised CLI flags. Wrapper preflight
+checks callable compatibility and the selected terminal backend at launch.
+Before allowing Hermes in trusted dispatch, qualify the selected route on
+each destination host with its service identity, interpreter, provider,
+working directory, tool evidence, and cleanup behavior. These checks apply
+to the autonomous route. Hermes `read_only` and `write` remain unsupported.
+
+### Gateway installer
 
 The installer (`scripts/install_aee_gateway.py`, wrapper
 `scripts/install-aee-gateway.sh`) never acquires privileges: the os-native
@@ -204,3 +250,44 @@ fits relative to tooling, provenance and production admission — see
 system-account and sandbox qualification details see
 [canonical MCP host setup](deployment.md) and the
 [security model](security-model.md).
+
+When the [durable job notifier](job-telegram-notifications.md) starts, it owns
+terminal delivery for that gateway process. Use one sender per job store,
+including across separate gateway processes or an external notifier. The
+legacy terminal hook is off by default. Its opt-in settings belong in the
+private gateway service environment.
+
+```dotenv
+# Optional settings for the private gateway service environment.
+# AEE_DEFAULT_DISPATCH_MODE=read_only
+# A3_ADAPTER_HERMES_BIN=/absolute/path/to/deploy/hermes-aee
+# AEE_TELEGRAM_TERMINAL_NOTIFY=0
+# AEE_TERMINAL_NOTIFY_TARGET=telegram:<chat_id>
+# AEE_TERMINAL_NOTIFY_COMMAND=hermes
+# AEE_TERMINAL_NOTIFY_HERMES_HOME=/absolute/path/to/sender-profile
+```
+
+An enabled legacy hook requires a recipient and a sender that implements
+`send -t <target> -s "AEE job terminal"` with the body read from stdin.
+The body contains job ID, terminal status, agent, exit code, and a fixed
+failure code when applicable. Detailed results remain in AEE. The sender
+receives basic shell and locale variables and an explicitly configured
+`HERMES_HOME` if supplied. Use an absolute profile path to select the
+sender's credentials. If omitted, the sender resolves its default profile.
+
+The hook attempts the send after the terminal result is sealed. A sender
+zero exit records local sender success. A delivery receipt is required for
+confirmation. Legacy attempts can delay worker cleanup by up to the
+30-second sender timeout, and the hook leaves no durable receipt.
+Verification uses the shared notification suppression guard.
+
+For a planned handover, disable legacy delivery and let outstanding legacy
+attempts finish before enabling the durable notifier. Set its existing
+`enabled_at` to a timezone-aware finish-time cutoff strictly later than the
+last job eligible for legacy delivery. Jobs finishing at or after the cutoff
+are eligible for durable delivery. Keep the cutoff and the
+`<job-store>/notifications/` receipt directory across restarts. The durable
+notifier uses its lock and receipts to deduplicate polling and skips sent,
+unknown, and suppressed receipts. Interrupted and ambiguous attempts become
+unknown, and only confirmed sender launch failures are retried. An earlier
+cutoff can send an already-notified legacy job again.

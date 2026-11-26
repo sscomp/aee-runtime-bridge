@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -41,6 +42,7 @@ from .executor import final_agent_message as _codex_final_message
 
 VERSION_PROBE_TIMEOUT = 20
 _VERSION_ENV = {"HOME": os.environ.get("HOME", ""), "PATH": os.environ.get("PATH", "")}
+_HERMES_WRAPPER_NAME = "hermes-aee"
 
 
 @dataclass(frozen=True)
@@ -254,7 +256,10 @@ class _HermesAdapter(AdapterSpec):
                    mode: str = "read_only") -> List[str]:
         if mode != "autonomous":
             raise NotImplementedError  # existing constrained-mode mapping remains unsupported
-        return [executable, "chat", "--yolo", "--toolsets", "hermes-cli",
+        # The local oneshot wrapper has its own stdin/JSONL interface.
+        # Keep the upstream toolset selection for the native Hermes CLI.
+        native_options = [] if Path(executable).name == _HERMES_WRAPPER_NAME else ["--toolsets", "hermes-cli"]
+        return [executable, "chat", "--yolo", *native_options,
                 "--query-file", "-", "--format", "stream-json"]
 
 
@@ -525,15 +530,25 @@ _AUTONOMOUS_FLAGS = {
 
 
 def verify_autonomous_capabilities(agent, executable):
+    """Check advertised CLI flags for the selected mapping."""
     args = ['exec', '--help'] if agent == 'codex' else ['chat', '--help'] if agent == 'hermes' else ['--help']
     try:
         result = run_bounded([executable, *args], env=_VERSION_ENV, cwd='/',
                              limits=Limits(timeout=20, stdout_bytes=65536, stderr_bytes=8192))
         text = result.stdout.decode('utf-8', 'replace')
-        if result.returncode or any(flag not in text for flag in _AUTONOMOUS_FLAGS.get(agent, ())):
-            raise ValueError('missing native capabilities')
         if agent not in _AUTONOMOUS_FLAGS:
             raise ValueError('unregistered autonomous mapping')
+        required = _AUTONOMOUS_FLAGS[agent]
+        if agent == 'hermes' and Path(executable).name != _HERMES_WRAPPER_NAME:
+            required += ('--toolsets',)
+        if result.returncode:
+            raise ValueError('help probe failed')
+        if agent == 'hermes':
+            if any(not re.search(r'(?<![\w-])' + re.escape(flag) + r'(?![\w-])', text)
+                   for flag in required):
+                raise ValueError('missing advertised Hermes flag')
+        elif any(flag not in text for flag in required):
+            raise ValueError('missing native capabilities')
     except (OSError, ValueError, JobError):
         raise JobError('ADAPTER_UNSUPPORTED', 'Installed CLI lacks verified headless autonomous flags') from None
 
@@ -545,7 +560,9 @@ def autonomous_capability(agent):
         return {'autonomous_supported': False, 'reason': exc.code}
     try:
         verify_autonomous_capabilities(agent, executable)
-        return {'autonomous_supported': True, 'reason': 'native flags verified; provider readiness requires real job'}
+        reason = ('Hermes CLI flags advertised; host qualification required' if agent == 'hermes'
+                  else 'native flags verified; provider readiness requires real job')
+        return {'autonomous_supported': True, 'reason': reason}
     except JobError as exc:
         return {'autonomous_supported': False, 'reason': exc.code}
 
