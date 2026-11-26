@@ -50,9 +50,11 @@ def kill_group(process):
     process.wait(timeout=5)
 
 
-def run_bounded(argv, *, env, stdin=b"", limits=Limits(), cwd=None, on_start=None, cancel_event=None):
+def run_bounded(argv, *, env, stdin=b"", limits=Limits(), cwd=None, on_start=None,
+                cancel_event=None, stdin_prefix=b""):
     if len(stdin) > 32000:
         raise JobError("INVALID_TASK", "Task input exceeds byte limit")
+    stdin = stdin_prefix + stdin
     deadline = time.monotonic() + limits.timeout
     process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, env=env, cwd=cwd,
@@ -146,10 +148,12 @@ def run_bounded(argv, *, env, stdin=b"", limits=Limits(), cwd=None, on_start=Non
 
 
 def run_streamed(argv, *, env, stdin, budget, spool, parser, cwd=None,
-                 on_start=None, cancel_event=None, redact=lambda x: x, cwd_fd=None):
+                 on_start=None, cancel_event=None, redact=lambda x: x, cwd_fd=None,
+                 stdin_prefix=b''):
     """Generic-adapter runner. Legacy approved broker contract stays explicit."""
     if len(stdin) > 32000:
         raise JobError('INVALID_TASK', 'Task input exceeds byte limit')
+    stdin = stdin_prefix + stdin
     deadline = time.monotonic() + budget.wall_timeout_seconds
     last_progress = time.monotonic()
     process = None

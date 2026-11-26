@@ -1273,6 +1273,12 @@ async def aee_dispatch(
 ) -> str:
     """Dispatch a bounded job to a registered agent adapter on this node.
 
+    Put the complete executable instructions and acceptance checks in task;
+    a test title alone is not an executable specification. prompt is a legacy
+    instruction alias. When both differ, both are retained in task order.
+    This launches a local worker; it must execute here, not redispatch the
+    same work to this gateway (one active job is allowed).
+
     Supported agents run local CLIs under the OS-identity execution
     model: the Codex adapter runs the Codex CLI and the Claude adapter
     runs the Claude Code CLI, both as this gateway's own OS user — no
@@ -1305,7 +1311,10 @@ async def aee_dispatch(
     jobs through aee_job_cancel.
     """
     # Back-compat: A1 callers passed `prompt` + optional `metadata`.
-    task = task or prompt or ""
+    if task and prompt and task != prompt:
+        task = task + "\n\n" + prompt
+    else:
+        task = task or prompt or ""
     try:
         data = await asyncio.to_thread(
             dispatch_job, agent, task, working_directory, mode, execution_profile, model, reasoning_effort,

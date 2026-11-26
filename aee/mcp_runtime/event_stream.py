@@ -8,6 +8,7 @@ import json
 import re
 from dataclasses import dataclass
 from .store import JobError, output_limit_context
+from .codex_diagnostics import ignored_startup_config_notice
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,8 @@ class EventParser:
         self.events = 0
         self.tools_started = self.tools_completed = self.tools_failed = 0
         self.error = None
+        self.turn_seen = False
+        self.startup_config_notices = 0
         self.in_array = False
         self.array_done = False
         self.seen_root = False
@@ -271,6 +274,7 @@ class EventParser:
                 self.tools_completed += 1
                 if e.get('is_error') is True or e.get('isError') is True: self.tools_failed += 1
         if t in {'turn.started', 'agent_start'}:
+            self.turn_seen = True
             self.completed = False
             self.final = None
         if self.agent == 'claude':
@@ -311,6 +315,8 @@ class EventParser:
                     if type(item.get('exit_code')) is not int:
                         self.error = JobError('REQUIRED_TOOL_FAILED',
                                               'Codex reported a command outcome with no measurable exit code')
+                elif ignored_startup_config_notice(item, turn_seen=self.turn_seen):
+                    self.startup_config_notices += 1
                 elif item.get('type') == 'error' or (isinstance(item.get('status'), str) and
                                                      item.get('status') in {'failed', 'declined'}):
                     self.error = JobError('REQUIRED_TOOL_FAILED', 'Codex reported failed required operation')
@@ -354,10 +360,13 @@ class EventParser:
                 self.completed = True
 
     def tool_evidence(self):
-        return {'schema': 'aee-adapter-tool-events-v1', 'agent': self.agent,
+        evidence = {'schema': 'aee-adapter-tool-events-v1', 'agent': self.agent,
                 'events_observed': self.events, 'tools_started': self.tools_started,
                 'tools_completed': self.tools_completed, 'tools_failed': self.tools_failed,
                 'scope': 'native structured events; counts only'}
+        if self.startup_config_notices:
+            evidence['startup_config_notices'] = self.startup_config_notices
+        return evidence
 
     def result(self):
         if self.error:
