@@ -19,12 +19,17 @@ class Oversize:
 KEYS = frozenset({'type', 'subtype', 'is_error', 'result', 'num_turns', 'item',
                   'text', 'status', 'exit_code', 'message', 'role', 'content',
                   'stopReason', 'errorMessage', 'aborted', 'isError'})
+_HERMES_KEYS = KEYS | {'tool_id', 'id', 'failed', 'partial', 'interrupted', 'truncated'}
+_HERMES_TOOL_LIMIT = 4096
 _NUMBER = re.compile(r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z')
 
 
 class EventParser:
     def __init__(self, agent, result_bytes=16384, capture_bytes=65536):
         self.agent, self.limit = agent, result_bytes
+        self.keys = _HERMES_KEYS if agent == 'hermes' else KEYS
+        self.hermes_pairs = {}
+        self.hermes_result_seen = False
         self.capture = max(result_bytes, capture_bytes)
         self.decoder = codecs.getincrementaldecoder('utf-8')('strict')
         self.stack = []
@@ -178,7 +183,7 @@ class EventParser:
         if not self.stack or self.stack[-1].get('root_array'):
             return True
         f = self.stack[-1]
-        return f['keep'] and (f['kind'] == '[' or f['key'] in KEYS)
+        return f['keep'] and (f['kind'] == '[' or f['key'] in self.keys)
 
     def _value(self, value, string=False):
         if self.stack:
@@ -186,7 +191,7 @@ class EventParser:
             if f['kind'] == '{' and f['state'] in {'key', 'key_or_end'}:
                 if not string:
                     self.fail()
-                f['key'] = value if isinstance(value, str) and value in KEYS else None
+                f['key'] = value if isinstance(value, str) and value in self.keys else None
                 if f['key'] in f['value']:
                     self.fail('Duplicate projected JSON field')
                 f['state'] = 'colon'
@@ -268,7 +273,7 @@ class EventParser:
                     if t == 'user' and part.get('type') == 'tool_result':
                         self.tools_completed += 1
                         if part.get('is_error') is True: self.tools_failed += 1
-        elif self.agent in {'hermes', 'pi'}:
+        elif self.agent == 'pi':
             if t in {'tool_use', 'tool_execution_start'}: self.tools_started += 1
             if t in {'tool_result', 'tool_execution_end'}:
                 self.tools_completed += 1
@@ -323,16 +328,7 @@ class EventParser:
                 if item.get('type') == 'agent_message':
                     self._answer(item.get('text'))
         elif self.agent == 'hermes':
-            if t in {'tool_use', 'tool_result', 'text', 'result'}:
-                self.progress += 1
-            if t == 'tool_result' and e.get('is_error') is True:
-                self.error = JobError('REQUIRED_TOOL_FAILED', 'Hermes reported failed required operation')
-            if t == 'result':
-                if e.get('exit_code') != 0:
-                    self.error = JobError('EXECUTION_FAILED', 'Hermes reported failed execution')
-                else:
-                    self._answer(e.get('text'))
-                    self.completed = True
+            self._hermes_event(t, e)
         elif self.agent == 'pi':
             if t in {'message_end', 'tool_execution_end', 'agent_settled'}:
                 self.progress += 1
@@ -358,6 +354,48 @@ class EventParser:
                 if e.get('aborted') is True:
                     self.error = JobError('EXECUTION_FAILED', 'Pi aborted execution')
                 self.completed = True
+
+    def _hermes_event(self, event_type, event):
+        start = event_type in {'tool_use', 'tool_execution_start'}
+        end = event_type in {'tool_result', 'tool_execution_end'}
+        if start or end or event_type in {'text', 'result'}:
+            self.progress += 1
+        if start or end:
+            tool_id = event.get('tool_id', event.get('id'))
+            has_id = (isinstance(tool_id, str) and len(tool_id) <= 256 and bool(tool_id.strip())
+                      and event.get('id', tool_id) == tool_id)
+            if end:
+                self.tools_completed += 1
+                flags = [event[key] for key in ('is_error', 'isError') if key in event]
+                if any(flag is True for flag in flags):
+                    self.tools_failed += 1
+                    self.error = JobError('REQUIRED_TOOL_FAILED', 'Hermes reported failed required operation')
+                if not flags or any(flag is not False for flag in flags):
+                    self.error = self.error or JobError('TOOL_EVIDENCE_INCOMPLETE',
+                                                        'Hermes tool result lacks successful completion evidence')
+            else:
+                self.tools_started += 1
+            paired = (not self.hermes_result_seen and has_id
+                      and (tool_id not in self.hermes_pairs and len(self.hermes_pairs) < _HERMES_TOOL_LIMIT
+                           if start else self.hermes_pairs.get(tool_id) is False))
+            if paired:
+                self.hermes_pairs[tool_id] = end
+            else:
+                self.error = self.error or JobError('TOOL_EVIDENCE_INCOMPLETE',
+                                                    'Hermes tool events are missing or unpaired')
+        if event_type == 'result':
+            code = event.get('exit_code')
+            if (self.hermes_result_seen or type(code) is not int or code != 0
+                    or any(event.get(flag, False) is not False for flag in
+                           ('is_error', 'isError', 'failed', 'partial', 'interrupted', 'truncated'))):
+                self.error = self.error or JobError('EXECUTION_FAILED', 'Hermes reported an invalid or failed result')
+            elif not all(self.hermes_pairs.values()):
+                self.error = self.error or JobError('TOOL_EVIDENCE_INCOMPLETE',
+                                                    'Hermes tool events are missing or unpaired')
+            else:
+                self._answer(event.get('text'))
+                self.completed = True
+            self.hermes_result_seen = True
 
     def tool_evidence(self):
         evidence = {'schema': 'aee-adapter-tool-events-v1', 'agent': self.agent,

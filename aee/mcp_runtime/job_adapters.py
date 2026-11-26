@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -529,6 +530,7 @@ _AUTONOMOUS_FLAGS = {
 
 
 def verify_autonomous_capabilities(agent, executable):
+    """Check advertised CLI flags for the selected mapping."""
     args = ['exec', '--help'] if agent == 'codex' else ['chat', '--help'] if agent == 'hermes' else ['--help']
     try:
         result = run_bounded([executable, *args], env=_VERSION_ENV, cwd='/',
@@ -539,7 +541,13 @@ def verify_autonomous_capabilities(agent, executable):
         required = _AUTONOMOUS_FLAGS[agent]
         if agent == 'hermes' and Path(executable).name != _HERMES_WRAPPER_NAME:
             required += ('--toolsets',)
-        if result.returncode or any(flag not in text for flag in required):
+        if result.returncode:
+            raise ValueError('help probe failed')
+        if agent == 'hermes':
+            if any(not re.search(r'(?<![\w-])' + re.escape(flag) + r'(?![\w-])', text)
+                   for flag in required):
+                raise ValueError('missing advertised Hermes flag')
+        elif any(flag not in text for flag in required):
             raise ValueError('missing native capabilities')
     except (OSError, ValueError, JobError):
         raise JobError('ADAPTER_UNSUPPORTED', 'Installed CLI lacks verified headless autonomous flags') from None
@@ -552,7 +560,9 @@ def autonomous_capability(agent):
         return {'autonomous_supported': False, 'reason': exc.code}
     try:
         verify_autonomous_capabilities(agent, executable)
-        return {'autonomous_supported': True, 'reason': 'native flags verified; provider readiness requires real job'}
+        reason = ('Hermes CLI flags advertised; host qualification required' if agent == 'hermes'
+                  else 'native flags verified; provider readiness requires real job')
+        return {'autonomous_supported': True, 'reason': reason}
     except JobError as exc:
         return {'autonomous_supported': False, 'reason': exc.code}
 
