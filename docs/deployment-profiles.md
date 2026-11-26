@@ -146,23 +146,39 @@ of running on a degraded policy.
 
 ### Hermes builds without stdin or JSONL CLI flags
 
-For an installed Hermes build that exposes `hermes_cli.oneshot.run_oneshot`,
-the optional `deploy/hermes-aee` wrapper provides the gateway's stdin/JSONL
-contract. Set `A3_ADAPTER_HERMES_BIN` to its absolute path and keep the
-`hermes-aee` filename in the configured path. The gateway service's `PATH`
-must resolve `python3` to the interpreter with Hermes installed. The help probe
-checks module discovery without loading the Hermes profile. A qualified native
-`hermes` CLI can be selected through the same setting or normal PATH discovery
-and uses `--toolsets hermes-cli` along with its stdin/JSONL flags.
+The optional `deploy/hermes-aee` wrapper adapts a compatible Hermes oneshot
+runtime to the gateway's stdin and JSONL contract. Set
+`A3_ADAPTER_HERMES_BIN` to the absolute wrapper path and retain the
+`hermes-aee` filename. Its `/usr/bin/env python3` shebang needs a gateway
+service `PATH` with trusted absolute entries. Select the interpreter that
+can import `hermes_cli.main`, `hermes_cli.config`, `hermes_cli.oneshot`, and
+`run_agent` directly. The help probe runs from `/` and the worker runs from
+the job directory. Both must resolve the same interpreter and module
+installation.
 
-The wrapper uses actual Hermes tool callbacks and the native completed run
-record. It refuses partial runs, failed tools and incomplete callbacks.
-The worker pins `TERMINAL_CWD` to the job's launch directory and requires a local
-terminal backend; it does not modify shared Hermes configuration. This is an
-autonomous-only integration: constrained `read_only` and `write` mappings remain
-unsupported. A successful help probe verifies CLI discovery and flag shape.
-Provision `hermes` in the trusted agent policy after the operator qualifies
-the installed Hermes build, provider, and local terminal backend on the host.
+Wrapper help checks module discovery without loading the Hermes profile.
+On launch, the wrapper checks the oneshot, agent, tool callback, terminal
+configuration, and cleanup APIs before inference. It requires the local
+terminal backend and sets `TERMINAL_CWD` in the worker to the job directory.
+An accepted run needs a complete native run record, a nonblank final answer,
+and valid, paired callbacks for every observed tool. The wrapper emits
+stream-local tool IDs and error indicators.
+
+A qualified native Hermes CLI can also be selected by absolute path or by
+normal PATH discovery. The native command uses
+`chat --yolo --toolsets hermes-cli --query-file - --format stream-json`.
+Verify that the installed build accepts those values and emits the Hermes
+event contract used by the gateway. Tool starts and results must pair by
+`tool_id` or `id`, each tool result must carry a boolean `is_error` or
+`isError`, and the final `result` must have integer `exit_code: 0` and
+nonblank `text`.
+
+A successful help probe reports advertised CLI flags. Wrapper preflight
+checks callable compatibility and the selected terminal backend at launch.
+Before allowing Hermes in trusted dispatch, qualify the selected route on
+each destination host with its service identity, interpreter, provider,
+working directory, tool evidence, and cleanup behavior. These checks apply
+to the autonomous route. Hermes `read_only` and `write` remain unsupported.
 
 ### Gateway installer
 
@@ -236,9 +252,10 @@ system-account and sandbox qualification details see
 [security model](security-model.md).
 
 When the [durable job notifier](job-telegram-notifications.md) starts, it owns
-terminal delivery for that gateway process. The legacy terminal hook remains
-available for hosts without a running durable notifier. Its opt-in settings
-belong in the private gateway service environment. The default is off.
+terminal delivery for that gateway process. Use one sender per job store,
+including across separate gateway processes or an external notifier. The
+legacy terminal hook is off by default. Its opt-in settings belong in the
+private gateway service environment.
 
 ```dotenv
 # Optional settings for the private gateway service environment.
@@ -247,9 +264,30 @@ belong in the private gateway service environment. The default is off.
 # AEE_TELEGRAM_TERMINAL_NOTIFY=0
 # AEE_TERMINAL_NOTIFY_TARGET=telegram:<chat_id>
 # AEE_TERMINAL_NOTIFY_COMMAND=hermes
+# AEE_TERMINAL_NOTIFY_HERMES_HOME=/absolute/path/to/sender-profile
 ```
 
-An enabled legacy hook requires a recipient. The configured messaging CLI
-resolves its own credentials and receives the bounded notice on stdin. An
-unavailable sender cannot change a terminal job state. Verification uses the
-shared notification suppression guard.
+An enabled legacy hook requires a recipient and a sender that implements
+`send -t <target> -s "AEE job terminal"` with the body read from stdin.
+The body contains job ID, terminal status, agent, exit code, and a fixed
+failure code when applicable. Detailed results remain in AEE. The sender
+receives basic shell and locale variables and an explicitly configured
+`HERMES_HOME` if supplied. Use an absolute profile path to select the
+sender's credentials. If omitted, the sender resolves its default profile.
+
+The hook attempts the send after the terminal result is sealed. A sender
+zero exit records local sender success. A delivery receipt is required for
+confirmation. Legacy attempts can delay worker cleanup by up to the
+30-second sender timeout, and the hook leaves no durable receipt.
+Verification uses the shared notification suppression guard.
+
+For a planned handover, disable legacy delivery and let outstanding legacy
+attempts finish before enabling the durable notifier. Set its existing
+`enabled_at` to a timezone-aware finish-time cutoff strictly later than the
+last job eligible for legacy delivery. Jobs finishing at or after the cutoff
+are eligible for durable delivery. Keep the cutoff and the
+`<job-store>/notifications/` receipt directory across restarts. The durable
+notifier uses its lock and receipts to deduplicate polling and skips sent,
+unknown, and suppressed receipts. Interrupted and ambiguous attempts become
+unknown, and only confirmed sender launch failures are retried. An earlier
+cutoff can send an already-notified legacy job again.
